@@ -263,7 +263,20 @@ static NSString *gen_ffn_fused_dynamic(void) {
     // SiLU + gate
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sig = sigmoid(x=h1)[name=string(\"sg\")];\n", HIDDEN, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> silu = mul(x=h1,y=sig)[name=string(\"si\")];\n", HIDDEN, SEQ];
+#if SWIGLU_CLAMP
+    // SwiGLU clamping (V4 §4.2.3): cap the gate (SiLU) upper bound at 10 and clamp
+    // the linear component (h3) to [-10,10] before the product. The CPU backward
+    // (train.m) applies the matching zero-gradient masks. Inert wherever |h1|,|h3|
+    // stay < 10 (e.g. the R0 rung), so R0 stays bit-identical with the knob on.
+    [m appendString:@"        fp16 cl_hi = const()[name=string(\"cl_hi\"), val=fp16(10.0)];\n"];
+    [m appendString:@"        fp16 cl_lo = const()[name=string(\"cl_lo\"), val=fp16(-10.0)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> siluc = minimum(x=silu,y=cl_hi)[name=string(\"siluc\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h3hi = minimum(x=h3,y=cl_hi)[name=string(\"h3hi\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h3c = maximum(x=h3hi,y=cl_lo)[name=string(\"h3c\")];\n", HIDDEN, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gate = mul(x=siluc,y=h3c)[name=string(\"gt\")];\n", HIDDEN, SEQ];
+#else
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gate = mul(x=silu,y=h3)[name=string(\"gt\")];\n", HIDDEN, SEQ];
+#endif
 
     // gate @ W2: W2 is [DIM, HIDDEN] stored as-is, transpose inside kernel
     [m appendFormat:@"        tensor<int32, [4]> rg = const()[name=string(\"rg\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", HIDDEN, SEQ];

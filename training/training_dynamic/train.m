@@ -731,7 +731,8 @@ int main(int argc, char *argv[]) {
                 io_read_dyn(dk.ffnBwdW2t->ioOut, dsilu, HIDDEN, SEQ);
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
 
-                // SiLU derivative (vectorized)
+                // SiLU derivative (vectorized). gate = silu(h1) * h3, so:
+                //   dh3 = dsilu * silu ;  dh1 = dsilu * h3 * silu'(h1)
                 t0 = mach_absolute_time();
                 {
                     int n = HIDDEN*SEQ;
@@ -740,6 +741,30 @@ int main(int argc, char *argv[]) {
                     vvexpf(silu_tmp, silu_tmp, &n);
                     vDSP_vsadd(silu_tmp, 1, &one, silu_tmp, 1, (vDSP_Length)n);
                     vvrecf(silu_tmp, silu_tmp, &n);  // sig
+#if SWIGLU_CLAMP
+                    // SwiGLU clamp backward (V4 §4.2.3): gate = min(silu,10) *
+                    // clamp(h3,-10,10). Clamped regions pass zero gradient, so
+                    //   dh3 = dsilu * min(silu,10)      * [|h3| < 10]
+                    //   dh1 = dsilu * clamp(h3,-10,10)  * [silu < 10] * silu'(h1)
+                    vDSP_vmul(ac->h1, 1, silu_tmp, 1, gate_buf, 1, (vDSP_Length)n);  // gate_buf = silu
+                    // silu'(h1) = sig*(1 + h1*(1-sig)) -> silu_tmp2
+                    vDSP_vsadd(silu_tmp, 1, &minus1, silu_tmp2, 1, (vDSP_Length)n);
+                    vDSP_vneg(silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
+                    vDSP_vmul(ac->h1, 1, silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
+                    vDSP_vsadd(silu_tmp2, 1, &one, silu_tmp2, 1, (vDSP_Length)n);
+                    vDSP_vmul(silu_tmp, 1, silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n); // silu'(h1)
+                    for (int j = 0; j < n; j++) {
+                        float s = gate_buf[j];                              // silu
+                        float siluc = s < 10.0f ? s : 10.0f;               // gate cap
+                        float gatemask = s < 10.0f ? 1.0f : 0.0f;
+                        float h3v = ac->h3[j];
+                        float h3c = h3v > 10.0f ? 10.0f : (h3v < -10.0f ? -10.0f : h3v);
+                        float linmask = (h3v < 10.0f && h3v > -10.0f) ? 1.0f : 0.0f;
+                        float d = dsilu[j];
+                        dh3[j] = d * siluc * linmask;
+                        dh1[j] = d * h3c * gatemask * silu_tmp2[j];
+                    }
+#else
                     vDSP_vmul(ac->h1, 1, silu_tmp, 1, dh3, 1, (vDSP_Length)n);
                     vDSP_vmul(dsilu, 1, dh3, 1, dh3, 1, (vDSP_Length)n);
                     vDSP_vsadd(silu_tmp, 1, &minus1, silu_tmp2, 1, (vDSP_Length)n);
@@ -749,6 +774,7 @@ int main(int argc, char *argv[]) {
                     vDSP_vmul(silu_tmp, 1, silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
                     vDSP_vmul(dsilu, 1, ac->h3, 1, dh1, 1, (vDSP_Length)n);
                     vDSP_vmul(dh1, 1, silu_tmp2, 1, dh1, 1, (vDSP_Length)n);
+#endif
                 }
                 t_silu += tb_ms(mach_absolute_time() - t0);
 
