@@ -27,10 +27,12 @@ which rescales every probability and adds a `dL/dsink` path; that cannot be
 expressed through the existing kernels. So, `#if ATTN_SINK`, the attention core is
 recomputed on CPU from the kernel's own Q/K/V outputs:
 
-- **Forward** (`cpu_ops.h attn_sink_forward`, called in `train.m forward_hidden`):
-  overwrites `attn_out` with the sink softmax. Q/K/V (incl. partial RoPE) still
-  come from the ANE kernel — only the softmax+`·V` is redone on CPU.
-- **Backward** (`cpu_ops.h attn_sink_backward`, in `train.m` under `#if ATTN_SINK`):
+- **Forward** (`cpu_ops.h attn_cpu_forward`, called in `train.m forward_hidden`
+  under `#if ATTN_CPU`): overwrites `attn_out` with the sink softmax. Q/K/V (incl.
+  partial RoPE) still come from the ANE kernel — only the softmax+`·V` is redone
+  on CPU. (This same CPU core also carries QK-norm, issue #7; the sink is selected
+  by passing its `sink_h` pointer, with the QK-norm gains NULL.)
+- **Backward** (`cpu_ops.h attn_cpu_backward`, in `train.m` under `#if ATTN_CPU`):
   replaces the `sdpaBwd1/2` + GQA-reduce block. From `da = dL/d(attn_out)` it
   produces GQA-reduced `dQ[Q_DIM]`, `dK[KV_DIM]`, `dV[KV_DIM]` and accumulates the
   per-head `dL/dsink`. The standard `rope_backward_inplace` then runs as before.
@@ -64,13 +66,14 @@ requires the CPU sink forward *and* its backward — including `dQ/dK/dV` and
 `dsink` — to be self-consistent, or the loss would plateau/diverge. It converges
 slightly *below* baseline because the learnable per-head sink is an extra DOF.
 
-**Active-sink backward — finite differences** (`test_attn_sink.c`, GQA 4/2,
+**Active-sink backward — finite differences** (`test_attn_cpu.c`, GQA 4/2,
 hd=8, seq=5): analytic vs central-difference over `Q`, `K`, `V`, **and `sink`**:
-max `|analytic − numerical| = 1.24e-03` — the decisive check that the per-head
-sink gradient (which R0's behavioral collapse alone cannot isolate) is correct.
+max `|analytic − numerical| = 2.37e-04` (sink-only case) — the decisive check
+that the per-head sink gradient (which R0's behavioral collapse alone cannot
+isolate) is correct. The same test covers the QK-norm and combined cases.
 
 ```bash
-cc -O2 -o /tmp/t training/training_dynamic/test_attn_sink.c -lm && /tmp/t
+cc -O2 -o /tmp/t training/training_dynamic/test_attn_cpu.c -lm && /tmp/t
 cd training/training_dynamic && make MODEL=gen_r0_overfit EXTRA=-DATTN_SINK=1
 ./train --scratch --overfit --data r0_synthetic.bin --steps 400 --accum 1 --wd 0 --lr 2e-3 --warmup 10
 # baseline (knob off): make MODEL=gen_r0_overfit && ./train --scratch --overfit ... → 0.0156

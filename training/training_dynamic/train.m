@@ -108,6 +108,9 @@ static void save_checkpoint(const char *path, int step, int total_steps, float l
 #if ATTN_SINK
                             , float *attn_sink, AdamState *asink
 #endif
+#if QK_NORM
+                            , float *qnorm_w, AdamState *aqnorm, float *knorm_w, AdamState *aknorm
+#endif
                             ) {
     FILE *f = fopen(path, "wb");
     CkptHdr h = {0};
@@ -144,6 +147,13 @@ static void save_checkpoint(const char *path, int step, int total_steps, float l
     fwrite(attn_sink,4,(size_t)NLAYERS*HEADS,f);
     fwrite(asink->m,4,(size_t)NLAYERS*HEADS,f); fwrite(asink->v,4,(size_t)NLAYERS*HEADS,f);
 #endif
+#if QK_NORM
+    // Per-layer Q/K RMSNorm gains + Adam state, appended (issue #7).
+    fwrite(qnorm_w,4,(size_t)NLAYERS*HD,f);
+    fwrite(aqnorm->m,4,(size_t)NLAYERS*HD,f); fwrite(aqnorm->v,4,(size_t)NLAYERS*HD,f);
+    fwrite(knorm_w,4,(size_t)NLAYERS*HD,f);
+    fwrite(aknorm->m,4,(size_t)NLAYERS*HD,f); fwrite(aknorm->v,4,(size_t)NLAYERS*HD,f);
+#endif
     fclose(f);
 }
 
@@ -153,6 +163,9 @@ static bool load_checkpoint(const char *path, int *step, int *total_steps, float
                              float *embed, AdamState *aembed
 #if ATTN_SINK
                              , float *attn_sink, AdamState *asink
+#endif
+#if QK_NORM
+                             , float *qnorm_w, AdamState *aqnorm, float *knorm_w, AdamState *aknorm
 #endif
                              ) {
     FILE *f = fopen(path, "rb");
@@ -184,6 +197,12 @@ static bool load_checkpoint(const char *path, int *step, int *total_steps, float
 #if ATTN_SINK
     fread(attn_sink,4,(size_t)NLAYERS*HEADS,f);
     fread(asink->m,4,(size_t)NLAYERS*HEADS,f); fread(asink->v,4,(size_t)NLAYERS*HEADS,f);
+#endif
+#if QK_NORM
+    fread(qnorm_w,4,(size_t)NLAYERS*HD,f);
+    fread(aqnorm->m,4,(size_t)NLAYERS*HD,f); fread(aqnorm->v,4,(size_t)NLAYERS*HD,f);
+    fread(knorm_w,4,(size_t)NLAYERS*HD,f);
+    fread(aknorm->m,4,(size_t)NLAYERS*HD,f); fread(aknorm->v,4,(size_t)NLAYERS*HD,f);
 #endif
     fclose(f);
     return true;
@@ -268,9 +287,10 @@ static void forward_hidden(
     DynLayerKernels *dk, PerLayerSurfaces *pls, PerLayerRequests *plr,
     LayerWeights *lw, const float *rms_final, LayerActs *acts,
     float *x_cur, float *xnorm_buf, float *x_final, float res_alpha,
-    const float *attn_sink, dispatch_group_t dw_grp, FwdTiming *tm)
+    const float *attn_sink, const float *qnorm_w, const float *knorm_w,
+    dispatch_group_t dw_grp, FwdTiming *tm)
 {
-    (void)attn_sink;
+    (void)attn_sink; (void)qnorm_w; (void)knorm_w;
     uint64_t t0;
     double r_rms = 0, r_ane = 0, r_io = 0, r_wait = 0;
     for (int L = 0; L < NLAYERS; L++) {
@@ -307,13 +327,17 @@ static void forward_hidden(
         IOSurfaceUnlock(dk->sdpaFwd->ioOut, kIOSurfaceLockReadOnly, NULL);
         r_io += tb_ms(mach_absolute_time() - t0);
 
-#if ATTN_SINK
-        // Re-run the attention core on CPU with a learnable per-head sink logit in
-        // the softmax denominator (issue #8). The ANE kernel computed Q/K/V (which
-        // we keep), but its softmax has no sink term; overwrite attn_out with the
-        // sink version. Backward bypasses sdpaBwd1/2 (see attn_sink_backward).
+#if ATTN_CPU
+        // Re-run the attention core on CPU for the knobs the ANE softmax kernel
+        // can't express: the per-head sink logit (#8) and/or QK-norm before the
+        // scores (#7). Q/K/V from the kernel are kept; attn_out is overwritten.
+        // Backward bypasses sdpaBwd1/2 (see attn_cpu_backward). Each knob is
+        // NULL when off, so this stays exact baseline attention unless one is on.
         t0 = mach_absolute_time();
-        attn_sink_forward(ac->attn_out, ac->Q, ac->K, ac->V, attn_sink + L*HEADS, SEQ);
+        attn_cpu_forward(ac->attn_out, ac->Q, ac->K, ac->V,
+                         ATTN_SINK ? attn_sink + L*HEADS : NULL,
+                         QK_NORM ? qnorm_w + L*HD : NULL,
+                         QK_NORM ? knorm_w + L*HD : NULL, SEQ);
         r_rms += tb_ms(mach_absolute_time() - t0);
 #endif
 
@@ -374,7 +398,8 @@ static float eval_val_loss(
     const float *embed, const float *cembed, int CV, const VocabMap *vm,
     const uint16_t *vdata, size_t vntok, int nbatches,
     LayerActs *acts, float *x_cur, float *xnorm_buf, float *x_final,
-    float *logits, float res_alpha, const float *attn_sink, dispatch_group_t dw_grp)
+    float *logits, float res_alpha, const float *attn_sink,
+    const float *qnorm_w, const float *knorm_w, dispatch_group_t dw_grp)
 {
     if (!vdata || vntok < (size_t)(SEQ + 1) || nbatches < 1) return 0.0f;
     size_t maxpos = vntok - SEQ - 1;
@@ -387,7 +412,8 @@ static float eval_val_loss(
         for (int t = 0; t < SEQ; t++) targets[t] = vm->full_to_compact[tg[t]];
         embed_lookup(x_cur, embed, in, DIM, SEQ);
         forward_hidden(dk, pls, plr, lw, rms_final, acts,
-                       x_cur, xnorm_buf, x_final, res_alpha, attn_sink, dw_grp, NULL);
+                       x_cur, xnorm_buf, x_final, res_alpha,
+                       attn_sink, qnorm_w, knorm_w, dw_grp, NULL);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
         int nv = 0;
@@ -478,10 +504,25 @@ int main(int argc, char *argv[]) {
         // key, active from step 0 (no warm-up needed for the R0 gate). AdamW like
         // the other per-element bias/norm params. attn_sink stays allocated even
         // when the knob is off (passed to forward_hidden, used only #if ATTN_SINK).
+        // The grad arrays (gsink/gqnorm/gknorm) are always declared — they appear in
+        // the backward call's compile-time ternaries (`KNOB ? g... : NULL`) for
+        // every build — but the optimizer/checkpoint only touch them #if KNOB, and
+        // attn_cpu_backward only writes them when its matching pointer is non-NULL.
         float *attn_sink = (float*)calloc((size_t)NLAYERS*HEADS, 4);
-#if ATTN_SINK
         float *gsink = (float*)calloc((size_t)NLAYERS*HEADS, 4);
+#if ATTN_SINK
         AdamState asink = adam_alloc((size_t)NLAYERS*HEADS);
+#endif
+        // Q/KV RMSNorm (issue #7): per-layer, per-head_dim gain on Q and K, applied
+        // just before the scores (post-RoPE). Init 1.0 (active from step 0).
+        float *qnorm_w = (float*)malloc((size_t)NLAYERS*HD*4);
+        float *knorm_w = (float*)malloc((size_t)NLAYERS*HD*4);
+        for (size_t i=0;i<(size_t)NLAYERS*HD;i++){ qnorm_w[i]=1.0f; knorm_w[i]=1.0f; }
+        float *gqnorm = (float*)calloc((size_t)NLAYERS*HD, 4);
+        float *gknorm = (float*)calloc((size_t)NLAYERS*HD, 4);
+#if QK_NORM
+        AdamState aqnorm = adam_alloc((size_t)NLAYERS*HD);
+        AdamState aknorm = adam_alloc((size_t)NLAYERS*HD);
 #endif
 
         double cum_train=0, cum_wall=0; int cum_steps=0;
@@ -493,6 +534,9 @@ int main(int argc, char *argv[]) {
                 lw, la, rms_final, &arms_final, embed, &aembed
 #if ATTN_SINK
                 , attn_sink, &asink
+#endif
+#if QK_NORM
+                , qnorm_w, &aqnorm, knorm_w, &aknorm
 #endif
                 );
             if (resuming) printf("[RESUMED step %d, loss=%.4f]\n", start_step, resume_loss);
@@ -705,7 +749,8 @@ int main(int argc, char *argv[]) {
             if (val_data && (step % val_every == 0)) {
                 float vl = eval_val_loss(&dk, pls, plr, lw, rms_final, embed, cembed,
                     CV, &vm, val_data, val_ntokens, val_batches,
-                    acts, x_cur, xnorm_buf, x_final, logits, res_alpha, attn_sink, dw_grp);
+                    acts, x_cur, xnorm_buf, x_final, logits, res_alpha,
+                    attn_sink, qnorm_w, knorm_w, dw_grp);
                 printf("  [val] step=%d val_loss=%.4f\n", step, vl);
             }
 
@@ -725,7 +770,8 @@ int main(int argc, char *argv[]) {
 
             // ===== FORWARD (shared with validation; see forward_hidden) =====
             forward_hidden(&dk, pls, plr, lw, rms_final, acts,
-                           x_cur, xnorm_buf, x_final, res_alpha, attn_sink, dw_grp, &ft);
+                           x_cur, xnorm_buf, x_final, res_alpha,
+                           attn_sink, qnorm_w, knorm_w, dw_grp, &ft);
 
             // Classifier + loss (CPU)
             t0 = mach_absolute_time();
@@ -883,16 +929,23 @@ int main(int argc, char *argv[]) {
                     free(capt_do); free(capt_attn);
                 });
 
-#if ATTN_SINK
-                // CPU attention-sink backward (issue #8). da_buf = d/d(attn_out)
-                // from wotBwd above; ac->Q/K/V are the same RoPE'd activations the
-                // sink forward consumed. Produces GQA-reduced dq[Q_DIM],
-                // dk_buf[KV_DIM], dv[KV_DIM] directly and accumulates the per-head
-                // sink gradient into gsink (zeroed with the other grads each step),
-                // bypassing the ANE sdpaBwd1/2 kernels (whose softmax has no sink).
+#if ATTN_CPU
+                // CPU attention backward for the sink (#8) and/or QK-norm (#7).
+                // da_buf = d/d(attn_out) from wotBwd above; ac->Q/K/V are the same
+                // post-RoPE activations the CPU forward consumed. Produces
+                // GQA-reduced dq[Q_DIM], dk_buf[KV_DIM], dv[KV_DIM] directly (dq/dk
+                // are w.r.t. post-RoPE Q/K, so rope_backward_inplace below still
+                // applies) and accumulates the sink / QK-norm-gain gradients (each
+                // zeroed with the other grads per step). Bypasses sdpaBwd1/2.
                 t0 = mach_absolute_time();
-                attn_sink_backward(da_buf, ac->Q, ac->K, ac->V, attn_sink + L*HEADS,
-                                   dq, dk_buf, dv, gsink + L*HEADS, SEQ);
+                attn_cpu_backward(da_buf, ac->Q, ac->K, ac->V,
+                                  ATTN_SINK ? attn_sink + L*HEADS : NULL,
+                                  QK_NORM ? qnorm_w + L*HD : NULL,
+                                  QK_NORM ? knorm_w + L*HD : NULL,
+                                  dq, dk_buf, dv,
+                                  ATTN_SINK ? gsink + L*HEADS : NULL,
+                                  QK_NORM ? gqnorm + L*HD : NULL,
+                                  QK_NORM ? gknorm + L*HD : NULL, SEQ);
                 t_rms_bwd += tb_ms(mach_absolute_time() - t0);
 #else
                 // GQA: tile K,V from KV_DIM → Q_DIM for SDPA backward
@@ -1047,6 +1100,9 @@ int main(int argc, char *argv[]) {
 #if ATTN_SINK
                 for(int i=0;i<NLAYERS*HEADS;i++) gsink[i]*=gsc;
 #endif
+#if QK_NORM
+                for(int i=0;i<NLAYERS*HD;i++){ gqnorm[i]*=gsc; gknorm[i]*=gsc; }
+#endif
                 vocab_scatter_grads(gembed, gcembed, &vm, DIM);
                 for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed[i]*=gsc;
 
@@ -1084,6 +1140,10 @@ int main(int argc, char *argv[]) {
                   vDSP_dotpr(gembed,1,gembed,1,&s,(vDSP_Length)(VOCAB*DIM)); grad_norm_sq+=s;
 #if ATTN_SINK
                   vDSP_dotpr(gsink,1,gsink,1,&s,(vDSP_Length)(NLAYERS*HEADS)); grad_norm_sq+=s;
+#endif
+#if QK_NORM
+                  vDSP_dotpr(gqnorm,1,gqnorm,1,&s,(vDSP_Length)(NLAYERS*HD)); grad_norm_sq+=s;
+                  vDSP_dotpr(gknorm,1,gknorm,1,&s,(vDSP_Length)(NLAYERS*HD)); grad_norm_sq+=s;
 #endif
                 }
                 float grad_norm = sqrtf(grad_norm_sq);
@@ -1125,6 +1185,10 @@ int main(int argc, char *argv[]) {
                     vDSP_vsmul(gembed,1,&clip_scale,gembed,1,(vDSP_Length)(VOCAB*DIM));
 #if ATTN_SINK
                     vDSP_vsmul(gsink,1,&clip_scale,gsink,1,(vDSP_Length)(NLAYERS*HEADS));
+#endif
+#if QK_NORM
+                    vDSP_vsmul(gqnorm,1,&clip_scale,gqnorm,1,(vDSP_Length)(NLAYERS*HD));
+                    vDSP_vsmul(gknorm,1,&clip_scale,gknorm,1,(vDSP_Length)(NLAYERS*HD));
 #endif
                 }
 
@@ -1190,6 +1254,11 @@ int main(int argc, char *argv[]) {
                 // Sink logits are bias-like scalars → AdamW with no weight decay.
                 adam_update(attn_sink, gsink, &asink, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
 #endif
+#if QK_NORM
+                // RMSNorm gains → AdamW, no weight decay (like the other norm gains).
+                adam_update(qnorm_w, gqnorm, &aqnorm, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
+                adam_update(knorm_w, gknorm, &aknorm, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
+#endif
                 free(cembed);
                 cembed = vocab_compact_embed(embed, &vm, DIM);
 
@@ -1209,6 +1278,10 @@ int main(int argc, char *argv[]) {
 #if ATTN_SINK
                 memset(gsink, 0, (size_t)NLAYERS*HEADS*4);
 #endif
+#if QK_NORM
+                memset(gqnorm, 0, (size_t)NLAYERS*HD*4);
+                memset(gknorm, 0, (size_t)NLAYERS*HD*4);
+#endif
                 memset(gembed, 0, (size_t)VOCAB*DIM*4);
                 memset(gcembed, 0, (size_t)CV*DIM*4);
 
@@ -1221,6 +1294,9 @@ int main(int argc, char *argv[]) {
                         lw, la, rms_final, &arms_final, embed, &aembed
 #if ATTN_SINK
                         , attn_sink, &asink
+#endif
+#if QK_NORM
+                        , qnorm_w, &aqnorm, knorm_w, &aknorm
 #endif
                         );
                     printf("  [ckpt saved, best_loss=%.4f]\n", best_loss);

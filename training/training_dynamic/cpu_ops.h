@@ -279,21 +279,35 @@ static void embed_backward(float *d_embed, const float *dx, const uint16_t *toke
 // and absorbs the sink's effect on the softmax normalizer, which the ANE backward
 // kernels cannot. GQA: q-head h reads kv-head (h % KV_HEADS); causal.
 // FD-verified fwd+bwd (training/training_dynamic/test_attn_sink derivation). =====
-static void attn_sink_forward(float *attn_out, const float *Q, const float *K,
-                              const float *V, const float *sink_h, int seq) {
+// Unified CPU attention core for the V4 knobs that the ANE softmax kernels can't
+// express (issue #8 sink + issue #7 QK-norm). Runs the score/softmax/·V on CPU
+// from the kernel's own (post-RoPE) Q/K/V. All knobs optional via NULL pointers:
+//   sink_h[HEADS]   — per-head learnable sink logit in the softmax denominator
+//   gq[HD], gk[HD]  — per-dim RMSNorm gains applied to each (head,pos) Q/K vector
+//                     over head_dim, just before the scores (post-RoPE). NULL = off.
+// With every pointer NULL this is exactly the baseline causal attention.
+static void attn_cpu_forward(float *attn_out, const float *Q, const float *K, const float *V,
+                             const float *sink_h, const float *gq, const float *gk, int seq) {
     float scale = 1.0f/sqrtf((float)HD);
     for (int h=0; h<HEADS; h++) {
         int kvh = h % KV_HEADS;
-        float s = sink_h[h];
+        int have_sink = (sink_h != NULL);
+        float s = have_sink ? sink_h[h] : 0.0f;
         for (int q=0; q<seq; q++) {
-            float sc[SEQ]; float m = s;             // sink logit participates in the max
+            float qn[HD];
+            if (gq) { float ms=0; for(int d=0;d<HD;d++){float v=Q[(h*HD+d)*seq+q]; ms+=v*v;}
+                      float r=sqrtf(ms/HD+NORM_EPS); for(int d=0;d<HD;d++) qn[d]=Q[(h*HD+d)*seq+q]/r*gq[d]; }
+            else    { for(int d=0;d<HD;d++) qn[d]=Q[(h*HD+d)*seq+q]; }
+            float sc[SEQ]; float m = have_sink ? s : -1e30f;   // sink logit joins the max
             for (int j=0; j<=q; j++) {
                 float dot=0;
-                for (int d=0; d<HD; d++) dot += Q[(h*HD+d)*seq+q]*K[(kvh*HD+d)*seq+j];
+                if (gk) { float ms=0; for(int d=0;d<HD;d++){float v=K[(kvh*HD+d)*seq+j]; ms+=v*v;}
+                          float r=sqrtf(ms/HD+NORM_EPS); for(int d=0;d<HD;d++) dot+=qn[d]*(K[(kvh*HD+d)*seq+j]/r*gk[d]); }
+                else    { for(int d=0;d<HD;d++) dot+=qn[d]*K[(kvh*HD+d)*seq+j]; }
                 sc[j]=dot*scale; if (sc[j]>m) m=sc[j];
             }
             float Z=0; for (int j=0;j<=q;j++){ sc[j]=expf(sc[j]-m); Z+=sc[j]; }
-            float inv = 1.0f/(Z + expf(s-m));       // +exp(sink) in the denominator
+            float inv = 1.0f/(Z + (have_sink?expf(s-m):0.0f));  // +exp(sink) in the denominator
             for (int d=0; d<HD; d++) {
                 float acc=0;
                 for (int j=0;j<=q;j++) acc += sc[j]*V[(kvh*HD+d)*seq+j];
@@ -302,48 +316,67 @@ static void attn_sink_forward(float *attn_out, const float *Q, const float *K,
         }
     }
 }
-// da[Q_DIM,seq] = dL/dattn_out -> dQ[Q_DIM], dK[KV_DIM], dV[KV_DIM] (GQA-reduced),
-// dsink[HEADS] (accumulated). Recomputes the softmax (no saved probs).
-static void attn_sink_backward(const float *da, const float *Q, const float *K,
-                               const float *V, const float *sink_h,
-                               float *dQ, float *dK, float *dV, float *dsink, int seq) {
-    float scale = 1.0f/sqrtf((float)HD);
-    memset(dQ, 0, Q_DIM*seq*4); memset(dK, 0, KV_DIM*seq*4); memset(dV, 0, KV_DIM*seq*4);
-    for (int h=0;h<HEADS;h++) {
-        int kvh = h % KV_HEADS; float s = sink_h[h]; float dsh = 0;
-        for (int q=0;q<seq;q++) {
-            float sc[SEQ]; float m=s;
-            for (int j=0;j<=q;j++){
-                float dot=0;
-                for (int d=0;d<HD;d++) dot += Q[(h*HD+d)*seq+q]*K[(kvh*HD+d)*seq+j];
-                sc[j]=dot*scale; if(sc[j]>m)m=sc[j];
-            }
-            float Z=0; for(int j=0;j<=q;j++){ sc[j]=expf(sc[j]-m); Z+=sc[j]; }
-            float esink=expf(s-m), inv=1.0f/(Z+esink);
-            float p[SEQ]; for(int j=0;j<=q;j++) p[j]=sc[j]*inv;
-            float psink = esink*inv;
-            float dp[SEQ];
-            for(int j=0;j<=q;j++){
-                float acc=0;
-                for(int d=0;d<HD;d++){
-                    float dad = da[(h*HD+d)*seq+q];
-                    acc += dad * V[(kvh*HD+d)*seq+j];
-                    dV[(kvh*HD+d)*seq+j] += p[j]*dad;     // GQA: accumulates over q-heads
-                }
-                dp[j]=acc;
-            }
-            float g=0; for(int j=0;j<=q;j++) g += p[j]*dp[j];   // softmax-with-sink reduction
-            dsh += -psink*g;                                   // dL/dsink_h
-            for(int j=0;j<=q;j++){
-                float dscore = p[j]*(dp[j]-g)*scale;
-                for(int d=0;d<HD;d++){
-                    dQ[(h*HD+d)*seq+q] += dscore*K[(kvh*HD+d)*seq+j];
-                    dK[(kvh*HD+d)*seq+j] += dscore*Q[(h*HD+d)*seq+q];
-                }
-            }
-        }
-        dsink[h] += dsh;
+// Backward for attn_cpu_forward. da[Q_DIM,seq]=dL/dattn_out -> dQ[Q_DIM], dK[KV_DIM],
+// dV[KV_DIM] (GQA-reduced), and (when enabled) dsink[HEADS], dgq[HD], dgk[HD] — all
+// accumulated. dQ/dK are w.r.t. the kernel's post-RoPE Q/K, so the caller's
+// rope_backward_inplace still applies unchanged. Recomputes the softmax (no saved
+// probs). The RMSNorm VJP: dL/dx_i = g_i·dy_i/r − x_i·c/(HD·r³), c=Σ_d g_d·dy_d·x_d;
+// dL/dg_d += dy_d·x_d/r (dy = grad w.r.t. the normalized vector).
+static void attn_cpu_backward(const float *da, const float *Q, const float *K, const float *V,
+                              const float *sink_h, const float *gq, const float *gk,
+                              float *dQ, float *dK, float *dV, float *dsink,
+                              float *dgq, float *dgk, int seq) {
+    float scale=1.0f/sqrtf((float)HD);
+    memset(dQ,0,Q_DIM*seq*4); memset(dK,0,KV_DIM*seq*4); memset(dV,0,KV_DIM*seq*4);
+    float *Qn=(float*)malloc(Q_DIM*seq*4), *Kn=(float*)malloc(KV_DIM*seq*4);
+    float *rq=(float*)malloc(HEADS*seq*4), *rk=(float*)malloc(KV_HEADS*seq*4);
+    float *dQn=(float*)calloc(Q_DIM*seq,4), *dKn=(float*)calloc(KV_DIM*seq,4);
+    // Precompute normalized Q,K (or alias) plus the per-(head,pos) rms for the VJP.
+    for (int h=0;h<HEADS;h++) for(int q=0;q<seq;q++){
+        if (gq){ float ms=0; for(int d=0;d<HD;d++){float v=Q[(h*HD+d)*seq+q]; ms+=v*v;}
+                 float r=sqrtf(ms/HD+NORM_EPS); rq[h*seq+q]=r;
+                 for(int d=0;d<HD;d++) Qn[(h*HD+d)*seq+q]=Q[(h*HD+d)*seq+q]/r*gq[d]; }
+        else { for(int d=0;d<HD;d++) Qn[(h*HD+d)*seq+q]=Q[(h*HD+d)*seq+q]; }
     }
+    for (int kvh=0;kvh<KV_HEADS;kvh++) for(int j=0;j<seq;j++){
+        if (gk){ float ms=0; for(int d=0;d<HD;d++){float v=K[(kvh*HD+d)*seq+j]; ms+=v*v;}
+                 float r=sqrtf(ms/HD+NORM_EPS); rk[kvh*seq+j]=r;
+                 for(int d=0;d<HD;d++) Kn[(kvh*HD+d)*seq+j]=K[(kvh*HD+d)*seq+j]/r*gk[d]; }
+        else { for(int d=0;d<HD;d++) Kn[(kvh*HD+d)*seq+j]=K[(kvh*HD+d)*seq+j]; }
+    }
+    for (int h=0;h<HEADS;h++) {
+        int kvh=h%KV_HEADS; int have_sink=(sink_h!=NULL); float s=have_sink?sink_h[h]:0.0f; float dsh=0;
+        for (int q=0;q<seq;q++){
+            float sc[SEQ]; float m=have_sink?s:-1e30f;
+            for(int j=0;j<=q;j++){ float dot=0; for(int d=0;d<HD;d++) dot+=Qn[(h*HD+d)*seq+q]*Kn[(kvh*HD+d)*seq+j];
+                                   sc[j]=dot*scale; if(sc[j]>m)m=sc[j]; }
+            float Z=0; for(int j=0;j<=q;j++){ sc[j]=expf(sc[j]-m); Z+=sc[j]; }
+            float esink=have_sink?expf(s-m):0.0f, inv=1.0f/(Z+esink);
+            float p[SEQ]; for(int j=0;j<=q;j++) p[j]=sc[j]*inv;
+            float psink=esink*inv;
+            float dp[SEQ];
+            for(int j=0;j<=q;j++){ float acc=0; for(int d=0;d<HD;d++){ float dad=da[(h*HD+d)*seq+q];
+                acc+=dad*V[(kvh*HD+d)*seq+j]; dV[(kvh*HD+d)*seq+j]+=p[j]*dad; } dp[j]=acc; }
+            float g=0; for(int j=0;j<=q;j++) g+=p[j]*dp[j];
+            if(have_sink) dsh += -psink*g;
+            for(int j=0;j<=q;j++){ float dscore=p[j]*(dp[j]-g)*scale;
+                for(int d=0;d<HD;d++){ dQn[(h*HD+d)*seq+q]+=dscore*Kn[(kvh*HD+d)*seq+j];
+                                       dKn[(kvh*HD+d)*seq+j]+=dscore*Qn[(h*HD+d)*seq+q]; } }
+        }
+        if(have_sink) dsink[h]+=dsh;
+    }
+    // RMSNorm VJP back to the post-RoPE Q/K (or straight copy when QK-norm is off).
+    if (gq){ for(int h=0;h<HEADS;h++) for(int q=0;q<seq;q++){ float r=rq[h*seq+q]; float c=0;
+        for(int d=0;d<HD;d++) c+=gq[d]*dQn[(h*HD+d)*seq+q]*Q[(h*HD+d)*seq+q];
+        for(int d=0;d<HD;d++){ float xd=Q[(h*HD+d)*seq+q], dy=dQn[(h*HD+d)*seq+q];
+            dQ[(h*HD+d)*seq+q]= gq[d]*dy/r - xd*c/(HD*r*r*r); dgq[d]+= dy*xd/r; } } }
+    else memcpy(dQ,dQn,Q_DIM*seq*4);
+    if (gk){ for(int kvh=0;kvh<KV_HEADS;kvh++) for(int j=0;j<seq;j++){ float r=rk[kvh*seq+j]; float c=0;
+        for(int d=0;d<HD;d++) c+=gk[d]*dKn[(kvh*HD+d)*seq+j]*K[(kvh*HD+d)*seq+j];
+        for(int d=0;d<HD;d++){ float xd=K[(kvh*HD+d)*seq+j], dy=dKn[(kvh*HD+d)*seq+j];
+            dK[(kvh*HD+d)*seq+j]= gk[d]*dy/r - xd*c/(HD*r*r*r); dgk[d]+= dy*xd/r; } } }
+    else memcpy(dK,dKn,KV_DIM*seq*4);
+    free(Qn);free(Kn);free(rq);free(rk);free(dQn);free(dKn);
 }
 
 // RoPE backward (in-place): inverse rotation on dQ/dK gradients

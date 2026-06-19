@@ -51,6 +51,11 @@
 // ROPE_ROTARY_DIMS (every current ladder rung). Mirrors Config.rope_rotary_eff.
 #define ROPE_ROTARY_EFF (HD < ROPE_ROTARY_DIMS ? HD : ROPE_ROTARY_DIMS)
 
+// Knobs whose forward softmax the ANE kernel can't express (sink in the
+// denominator, QK-norm before the scores) share one CPU attention bypass
+// (attn_cpu_forward/backward). Either knob on routes attention through CPU.
+#define ATTN_CPU (ATTN_SINK || QK_NORM)
+
 // Derived weight sizes per layer (GQA-aware)
 #define WQ_SZ (Q_DIM*DIM)
 #define WK_SZ (KV_DIM*DIM)
