@@ -103,8 +103,38 @@ twin comparison: the ANE softmaxes over the **compact** vocab (9205) while the
 MLX twin uses the full 32K — comparable in trend, not identical in absolute loss;
 val also skips the few `data01` tokens absent from the data00 compact set.
 
+## R2 generation — qualitative coherence
+
+Sampling the R2 checkpoint (`ane_r2_small_ckpt.bin`, step 46400, train loss 1.48)
+through the MLX twin, decoded with the 32K SentencePiece tokenizer it trained on.
+The model writes fluent TinyStories prose from a cold prompt:
+
+> **greedy** — *Once upon a time, there was a little girl named Lily. She loved to
+> play outside in the sunshine. One day, she found a shiny rock and decided to play
+> with it. She put it in her pocket and went outside to play…* (coherent; loops on
+> "scary dog… ran away", the usual greedy degeneration.)
+
+> **temp 0.5** — same opening, then *"Look, mommy! I found a shiny rock!" Lily said.
+> Her mom smiled…* — varied and still coherent.
+
+> **temp 0.8 / 1.0** — progressively more inventive and less consistent, but stays
+> **real English words** (`prettyosa`, `healthyChase` are real-token merges, not
+> garbage).
+
+**The compact-vocab mask is load-bearing.** The ANE only trains the 9205 ids
+present in data00; the other ~22.8K LM-head rows keep their init. Restricting
+sampling to the active vocab (`TokenStream.active_vocab`) keeps every temperature
+in-distribution. **Without** the mask (`--no-mask`), even temp 0.8 derails into
+untrained tokens within a clause — *…play outside in herzec. One day… Theater
+«թumpet… 控 ши probabil spielte像lu还exec Somethingmicrosoft* — the Cyrillic / CJK /
+code rows that never appear in TinyStories. This is the derail `lilbro.eval.sample`
+documents, shown directly.
+
+Reproduce: `.venv/bin/python -m lilbro.eval.generate --ckpt
+training/training_dynamic/ane_r2_small_ckpt.bin --temps 0 0.5 0.8 1.0` (add
+`--no-mask` for the contrast).
+
 ## Next
 
 - Let the R2 baseline reach its val knee; add the Muon and (twin-only) MTP arms →
   the R2 ablation matrix (headline tokens-to-target).
-- Generate from the R2 best-loss checkpoint for the qualitative coherence check.

@@ -36,6 +36,18 @@ class TokenStream:
     def max_pos(self, seq: int) -> int:
         return len(self) - seq - 1
 
+    def active_vocab(self) -> np.ndarray:
+        """The sorted set of token ids that occur in this shard.
+
+        This is exactly the ANE trainer's *compact vocab*: ``vocab_map_build``
+        (cpu_ops.h) marks every ``data[i]`` and compacts the LM head to just those
+        rows, so a model trained on this shard only ever learns these ids. It is
+        therefore the right ``allowed_ids`` mask for sampling that model —
+        restricting the softmax to it keeps generation out of the untrained tail
+        (see ``lilbro.eval.sample``). Returned as int64.
+        """
+        return np.unique(np.asarray(self.tokens)).astype(np.int64)
+
     def batch_at(self, positions, seq: int) -> tuple[np.ndarray, np.ndarray]:
         """(x, y) for the given start positions; y is x shifted by one token."""
         positions = np.asarray(positions, dtype=np.int64)

@@ -50,6 +50,15 @@ def test_fixed_val_batches_deterministic(tmp_path):
     assert not np.array_equal(a[0][0], c[0][0])
 
 
+def test_active_vocab_is_sorted_unique_ids(tmp_path):
+    # The sampling mask = the shard's unique ids (== the ANE compact vocab).
+    toks = np.array([5, 5, 1, 9, 1, 3, 9, 9], dtype=np.uint16)
+    ts = TokenStream(write_token_stream(tmp_path / "data00.bin", toks))
+    av = ts.active_vocab()
+    assert av.dtype == np.int64
+    assert np.array_equal(av, [1, 3, 5, 9])
+
+
 def test_val_loss_matches_manual(tmp_path):
     cfg = Config(name="ev", dim=32, n_layers=1, n_heads=2, head_dim=16,
                  seq=16, vocab=256, hidden=64, seed=0)
