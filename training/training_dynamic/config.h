@@ -28,6 +28,29 @@
 #define OPTIMIZER_IS_MUON 0
 #endif
 
+// DeepSeek-V4 ablation knobs (PRD #2). emit_c.py emits these for generated
+// headers; these fallbacks keep the hand-written model headers compiling. Every
+// default is off / identity, so the trainer is the plain transformer until a
+// knob is turned on. ROPE_ROTARY_DIMS defaults to HD (= full RoPE = identity).
+#ifndef QK_NORM
+#define QK_NORM 0
+#endif
+#ifndef ATTN_SINK
+#define ATTN_SINK 0
+#endif
+#ifndef SWIGLU_CLAMP
+#define SWIGLU_CLAMP 0
+#endif
+#ifndef ROPE_ROTARY_DIMS
+#define ROPE_ROTARY_DIMS HD
+#endif
+#ifndef N_HC
+#define N_HC 1
+#endif
+// Dims actually rotated by RoPE: min(HD, ROPE_ROTARY_DIMS). Identity when HD <=
+// ROPE_ROTARY_DIMS (every current ladder rung). Mirrors Config.rope_rotary_eff.
+#define ROPE_ROTARY_EFF (HD < ROPE_ROTARY_DIMS ? HD : ROPE_ROTARY_DIMS)
+
 // Derived weight sizes per layer (GQA-aware)
 #define WQ_SZ (Q_DIM*DIM)
 #define WK_SZ (KV_DIM*DIM)

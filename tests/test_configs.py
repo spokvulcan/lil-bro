@@ -31,6 +31,45 @@ def test_defaults_resolve():
     assert c.ckpt_path == "ane_t_ckpt.bin"
 
 
+def test_v4_knobs_default_off():
+    """Every DeepSeek-V4 ablation knob (PRD #2) defaults to off / identity, so a
+    plain config is bit-for-bit the original transformer."""
+    c = Config(name="t", dim=64, n_layers=2, n_heads=4, seq=32, vocab=256)
+    assert c.qk_norm is False
+    assert c.attn_sink is False
+    assert c.swiglu_clamp is False
+    assert c.rope_rotary_dims == 64
+    assert c.n_hc == 1
+    assert c.mtp_depth == 0
+    # head_dim (16) <= rope_rotary_dims (64) -> full RoPE (identity).
+    assert c.rope_rotary_eff == c.head_dim == 16
+
+
+def test_rope_rotary_eff_partial():
+    """rope_rotary_eff = min(head_dim, rope_rotary_dims): partial only when the
+    head is wider than the rotary budget (e.g. a 128-dim head)."""
+    c = Config(name="big", dim=2048, n_layers=2, n_heads=16, head_dim=128,
+               seq=64, vocab=256, rope_rotary_dims=64)
+    assert c.rope_rotary_eff == 64          # partial: only the last 64 of 128 rotate
+    full = Config(name="sm", dim=128, n_layers=2, n_heads=4, head_dim=32,
+                  seq=64, vocab=256, rope_rotary_dims=64)
+    assert full.rope_rotary_eff == 32       # identity: whole head rotates
+
+
+def test_n_hc_zero_normalizes_to_one():
+    """The PRD spells mHC-off as n_hc in {0, 1}; both mean a single stream."""
+    c = Config(name="t", dim=64, n_layers=2, n_heads=4, seq=32, vocab=256, n_hc=0)
+    assert c.n_hc == 1
+
+
+def test_v4_knobs_round_trip():
+    """A config with every knob flipped on survives dict + JSON round-trips."""
+    c = Config(name="abl", dim=256, n_layers=6, n_heads=8, head_dim=32, seq=256,
+               vocab=32000, hidden=768, qk_norm=True, attn_sink=True,
+               swiglu_clamp=True, rope_rotary_dims=64, n_hc=4, mtp_depth=1)
+    assert config_from_dict(config_to_dict(c)) == c
+
+
 def test_derived_gqa():
     c = Config(name="g", dim=1024, n_layers=4, n_heads=16, kv_heads=8,
                head_dim=128, seq=256, vocab=1000)
@@ -70,6 +109,9 @@ def test_unknown_field_rejected():
     dict(n_heads=6, kv_heads=4),   # 6 % 4 != 0
     dict(head_dim=15),             # odd -> RoPE invalid
     dict(mtp_depth=-1),
+    dict(rope_rotary_dims=0),      # must be > 0
+    dict(rope_rotary_dims=33),     # must be even (RoPE rotates pairs)
+    dict(n_hc=-1),                 # must be >= 0
 ])
 def test_validation_rejects(bad):
     base = dict(name="x", dim=64, n_layers=1, n_heads=4, seq=32, vocab=256)
@@ -108,6 +150,24 @@ def test_two_consumers_identical_dims():
     assert int(d["VOCAB"]) == c.vocab
     assert d["MODEL_NAME"] == f'"{c.name}"'
     assert int(d["MTP_DEPTH"]) == c.mtp_depth
+
+
+def test_v4_knobs_emitted_to_header():
+    """The ANE consumer (C header) carries every V4 knob, off->0 / on->1, so a
+    knob is toggled by emitting a new header — never by hand-editing #defines."""
+    on = Config(name="abl", dim=256, n_layers=6, n_heads=8, head_dim=32, seq=256,
+                vocab=32000, hidden=768, qk_norm=True, attn_sink=False,
+                swiglu_clamp=True, rope_rotary_dims=64, n_hc=4)
+    d = _parse_defines(emit_c_header(on))
+    assert int(d["QK_NORM"]) == 1
+    assert int(d["ATTN_SINK"]) == 0
+    assert int(d["SWIGLU_CLAMP"]) == 1
+    assert int(d["ROPE_ROTARY_DIMS"]) == 64
+    assert int(d["N_HC"]) == 4
+    # default config -> all off / identity
+    off = _parse_defines(emit_c_header(LADDER["r0_overfit"]))
+    assert int(off["QK_NORM"]) == 0 and int(off["ATTN_SINK"]) == 0
+    assert int(off["SWIGLU_CLAMP"]) == 0 and int(off["N_HC"]) == 1
 
 
 def test_emit_is_deterministic():

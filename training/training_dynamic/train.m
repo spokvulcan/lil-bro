@@ -456,6 +456,12 @@ int main(int argc, char *argv[]) {
             printf("Kernels: 10 compiled (sdpaFwd+woFwd, ffnFused, ffnBwdW2t+W13t, wotBwd, sdpaBwd1+2, qBwd+kvBwd)\n");
             printf("Accum %d steps, LR=%g, optimizer=%s\n", accum_steps, max_lr,
                    opt_is_muon ? "muon" : "adamw");
+            // V4 ablation knobs (PRD #2). Printed so a run's config is on the
+            // record; every knob is off/identity by default → plain transformer.
+            printf("V4 knobs: qk_norm=%d attn_sink=%d swiglu_clamp=%d "
+                   "rope_rotary_dims=%d (eff %d of HD=%d) n_hc=%d mtp_depth=%d\n",
+                   QK_NORM, ATTN_SINK, SWIGLU_CLAMP,
+                   ROPE_ROTARY_DIMS, ROPE_ROTARY_EFF, HD, N_HC, MTP_DEPTH);
             double fwd_flops = 2.0*NLAYERS*((double)WQ_SZ + WK_SZ + WV_SZ + WO_SZ + W1_SZ + W2_SZ + W3_SZ) * SEQ;
             double total_flops = 3.0 * fwd_flops;
             printf("FLOPs/step: fwd=%.1fM total=%.1fM\n", fwd_flops/1e6, total_flops/1e6);

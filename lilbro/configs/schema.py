@@ -58,6 +58,15 @@ class Config:
     optimizer: str = "adamw"   # adamw | muon
     mtp_depth: int = 0         # 0 = off; k = predict k extra future tokens
 
+    # --- DeepSeek-V4 architectural-mechanism ablation knobs (PRD #2; all default
+    #     OFF / identity so a default config is bit-for-bit the plain transformer) ---
+    qk_norm: bool = False          # Q/KV RMSNorm before attention scores (issue #7)
+    attn_sink: bool = False        # learnable per-head attention-sink logit (issue #8)
+    swiglu_clamp: bool = False     # clamp SwiGLU linear to [-10,10], gate cap 10 (issue #9)
+    rope_rotary_dims: int = 64     # partial RoPE: rotate min(head_dim, this) dims (issue #10);
+                                   #   identity wherever head_dim <= rope_rotary_dims (all current rungs)
+    n_hc: int = 1                  # mHC residual-stream width (issue #11); 0/1 = off (one stream)
+
     # --- optimization / run ---
     lr: float = 3e-4
     batch_tokens: int = 4096   # tokens per optimizer step; batch_size = batch_tokens // seq
@@ -81,6 +90,9 @@ class Config:
             object.__setattr__(self, "hidden", ((h + 63) // 64) * 64)
         if not self.ckpt_path:
             object.__setattr__(self, "ckpt_path", f"ane_{self.name}_ckpt.bin")
+        # n_hc: accept the PRD's "0 or 1 = off" spelling; normalize to 1 stream.
+        if self.n_hc == 0:
+            object.__setattr__(self, "n_hc", 1)
         self._validate()
 
     def _validate(self) -> None:
@@ -97,6 +109,13 @@ class Config:
                 raise ValueError(f"{nm} must be > 0, got {getattr(self, nm)}")
         if self.head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even for RoPE, got {self.head_dim}")
+        if self.rope_rotary_dims <= 0 or self.rope_rotary_dims % 2 != 0:
+            raise ValueError(
+                f"rope_rotary_dims must be a positive even int (RoPE rotates pairs), "
+                f"got {self.rope_rotary_dims}"
+            )
+        if self.n_hc < 1:
+            raise ValueError(f"n_hc must be >= 1 (0/1 = off), got {self.n_hc}")
 
     # --- derived (never stored; always consistent) ---
     @property
@@ -119,6 +138,13 @@ class Config:
     def res_alpha(self) -> float:
         """Residual scaling applied to both sublayer outputs (matches ANE)."""
         return 1.0 / sqrt(2.0 * self.n_layers)
+
+    @property
+    def rope_rotary_eff(self) -> int:
+        """Dims actually rotated by RoPE: ``min(head_dim, rope_rotary_dims)``.
+        Equals ``head_dim`` (full RoPE, identity vs. the plain model) wherever
+        ``head_dim <= rope_rotary_dims`` — true for every current ladder rung."""
+        return min(self.head_dim, self.rope_rotary_dims)
 
 
 def config_to_dict(cfg: Config) -> dict[str, Any]:
