@@ -276,8 +276,10 @@ static void embed_backward(float *d_embed, const float *dx, const uint16_t *toke
 // Data layout: [DIM, SEQ] channel-first, DIM = nheads * hd
 static void rope_backward_inplace(float *dx, int seq, int dim, int hd) {
     int nheads = dim / hd;
+    int norot = HD - ROPE_ROTARY_EFF;   // partial RoPE (#10): leading dims unrotated
     for (int h = 0; h < nheads; h++) {
         for (int i = 0; i < hd/2; i++) {
+            if (2*i < norot) continue;  // identity rotation -> identity gradient
             float freq = 1.0f / powf(10000.0f, 2.0f * i / (float)hd);
             for (int p = 0; p < seq; p++) {
                 float theta = p * freq;

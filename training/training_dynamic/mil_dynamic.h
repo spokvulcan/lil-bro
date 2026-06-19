@@ -531,13 +531,25 @@ static NSData *get_mask_blob(void) {
 static NSData *g_rope_cos_blob = nil;
 static NSData *g_rope_sin_blob = nil;
 
+// Partial RoPE (#10): rotate only the last ROPE_ROTARY_EFF dims of each head;
+// the leading ROPE_NOROT (= HD - ROPE_ROTARY_EFF) dims are left unrotated by
+// baking an identity rotation (cos=1, sin=0) into their cos/sin entries. The
+// forward MIL is unchanged — it just multiplies by these blobs — so the knob is
+// entirely in blob generation (+ the matching CPU backward). ROPE_NOROT == 0 at
+// every current ladder rung (HD <= 64 = default rope_rotary_dims) → identity.
+#define ROPE_NOROT (HD - ROPE_ROTARY_EFF)
+
 static NSData *get_rope_cos_blob(void) {
     if (!g_rope_cos_blob) {
         _Float16 *buf = (_Float16*)calloc(SEQ * HD, sizeof(_Float16));
         for (int p = 0; p < SEQ; p++)
             for (int i = 0; i < HD/2; i++) {
-                float theta = p / powf(10000.0f, 2.0f * i / (float)HD);
-                _Float16 cv = (_Float16)cosf(theta);
+                _Float16 cv;
+                if (2*i < ROPE_NOROT) cv = (_Float16)1.0f;   // unrotated dim: cos=1
+                else {
+                    float theta = p / powf(10000.0f, 2.0f * i / (float)HD);
+                    cv = (_Float16)cosf(theta);
+                }
                 buf[p * HD + 2*i] = cv;
                 buf[p * HD + 2*i + 1] = cv;
             }
@@ -552,8 +564,12 @@ static NSData *get_rope_sin_blob(void) {
         _Float16 *buf = (_Float16*)calloc(SEQ * HD, sizeof(_Float16));
         for (int p = 0; p < SEQ; p++)
             for (int i = 0; i < HD/2; i++) {
-                float theta = p / powf(10000.0f, 2.0f * i / (float)HD);
-                _Float16 sv = (_Float16)sinf(theta);
+                _Float16 sv;
+                if (2*i < ROPE_NOROT) sv = (_Float16)0.0f;   // unrotated dim: sin=0
+                else {
+                    float theta = p / powf(10000.0f, 2.0f * i / (float)HD);
+                    sv = (_Float16)sinf(theta);
+                }
                 buf[p * HD + 2*i] = sv;
                 buf[p * HD + 2*i + 1] = sv;
             }
