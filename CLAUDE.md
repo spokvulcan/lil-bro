@@ -69,3 +69,20 @@ Commits follow Conventional Commits.
 Thesis & results → `README.md` · phasing, ladder & gates → `ROADMAP.md` · full
 spec → `docs/PRD.md` · ANE trainer internals → `training/README.md` · subpackage
 intent → `lilbro/*/README.md`. Issues live in `spokvulcan/lil-bro` (`gh` CLI).
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs live as GitHub issues in `spokvulcan/lil-bro`, via the `gh` CLI.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical triage roles map 1:1 to their label strings (`needs-triage`,
+`needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
