@@ -22,6 +22,12 @@
 #error "No model selected. Build with: make MODEL=qwen3_06b (or stories110m)"
 #endif
 
+// Optimizer default for hand-written model headers that predate the shared
+// config (emit_c.py emits this; --opt overrides it at runtime either way).
+#ifndef OPTIMIZER_IS_MUON
+#define OPTIMIZER_IS_MUON 0
+#endif
+
 // Derived weight sizes per layer (GQA-aware)
 #define WQ_SZ (Q_DIM*DIM)
 #define WK_SZ (KV_DIM*DIM)

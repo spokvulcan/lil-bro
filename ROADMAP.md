@@ -9,10 +9,18 @@ measure whether DeepSeek-V4 ideas improve the *small-dense-model efficiency
 frontier*. MLX is **not** the trainer — it is the correctness oracle + GPU baseline.
 
 **1a — ANE**
-- Parameterize model config (replace compile-time `#define`s in `training/stories_config.h`)
-- Validation/eval harness: `data00` train, `data01` val; periodic val loss; generation sampler
-- Rung 0 gate: overfit one batch (control = dense + AdamW) → loss → ~0
-- Add **Muon** (CPU optimizer swap) and **MTP** behind flags
+- ✅ Parameterize model config — one shared `Config` drives the ANE trainer via a
+  generated header + runtime flags; no hand-edited `#define`s. Fixed-shape MIL
+  graphs mean *dimensions* recompile (cached), but optimizer/lr/accum/data/val are
+  runtime flags (`lilbro/ane_bridge/run.py`; `results/r2_runtime_config.md`).
+- ✅ Validation/eval harness — `data00` train, `data01` val; periodic held-out val
+  loss in `train.m` (`forward_hidden`/`eval_val_loss`); generation sampler from an
+  ANE checkpoint via the MLX twin (`lilbro/ane_bridge/checkpoint.py`).
+- ✅ Rung 0 gate: overfit one batch (control = dense + AdamW) → loss → ~0
+  (`results/r0_overfit.md`).
+- ✅ Add **Muon** (CPU Newton-Schulz, behind `--opt muon`) — verified against the
+  numpy twin by an optimizer step-diff (`results/r2_runtime_config.md`). **MTP**
+  stays twin-only (the ANE has no MTP path) until the ANE MTP op lands.
 
 **1b — MLX**
 - MLX twin of dense + Muon + MTP from the shared config
@@ -28,7 +36,7 @@ frontier*. MLX is **not** the trainer — it is the correctness oracle + GPU bas
 |---|---|---|
 | R0 overfit | 1 layer, d=64, byte-256 vocab, seq=64 | ANE loss → ~0 on one repeated batch — ✅ **GREEN** (`results/r0_overfit.md`) |
 | R1 grad-diff | d=64, 2 layers, MHA + GQA | ANE grads match the torch **fp64** oracle (fp16-scale cosine/rel_l2) — ✅ **GREEN**; caught + fixed a real GQA backward bug (`results/r1_grad_diff.md`) |
-| R2 small | d=256, ~6 layers, 32K vocab, seq=256 | val tracks MLX; coherent stories; **headline ablation here** |
+| R2 small | d=256, 6 layers, 32K vocab, seq=256 | 🟡 instrument shipped (runtime config + held-out val + gen + Muon); AdamW baseline **training on the ANE** — held-out val 9.16→4.66 by step 2000; gate (val tracks MLX; coherent stories) pending the full run + ablation (`results/r2_runtime_config.md`) |
 | R3 110M | d=768, 12 layers, 32K, seq=256 | reproduces upstream; energy verdict |
 
 ### Method invariants

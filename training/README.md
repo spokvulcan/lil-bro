@@ -113,6 +113,23 @@ make MODEL=stories110m         # Stories110M (12L, MHA, 109M)
 ./train --steps 200 --lr 1e-4  # custom steps/lr
 ```
 
+**lil-bro (`training_dynamic/train.m`) additions** — driven from the shared
+`Config` so the ANE trainer and the MLX twin run identical models (see
+`lilbro/ane_bridge/run.py`; `results/r2_runtime_config.md`):
+
+```bash
+# Config-driven: emit header, build (cached per shape), run — no edited #defines
+.venv/bin/python -m lilbro.ane_bridge.run r2_small --steps 60000 --accum 16 --val
+```
+
+- `--opt adamw|muon` — pick the optimizer at runtime (Muon = CPU Newton-Schulz on
+  the 2D matrices; norms/embed stay AdamW). Overrides the header default.
+- `--val-data PATH --val-every N --val-batches K` — periodic held-out validation
+  loss on a fixed evenly-spaced batch set (use the `data01` shard).
+- `--init PATH` / `--dump-grads PATH` / `--dump-weights PATH` — shared-init in,
+  gradients / post-step weights out (R1 grad gate + the optimizer step-diff).
+- `--ckpt PATH` — checkpoint output (defaults to the model header's `CKPT_PATH`).
+
 **CLI flags (`train_large` / `train_large_ane`):**
 - `--steps N` (default 10000)
 - `--lr F` (default 3e-4)

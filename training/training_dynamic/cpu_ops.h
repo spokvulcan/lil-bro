@@ -63,6 +63,66 @@ static void adam_update(float *w, const float *g, AdamState *s, int t, float lr,
     }
 }
 
+// ===== Muon optimizer (CPU-side, matches lilbro/mlx_ref/optim.py exactly) =====
+// Newton-Schulz quintic orthogonalization (Keller Jordan Muon). Computed in
+// float64 — same dtype as the numpy twin — so the ANE Muon update can be diffed
+// against the twin to ~float32 round-off (the only fp32 step is the final write
+// back into the fp32 weight). G is [rows,cols] row-major; the result overwrites
+// Xout [rows,cols]. Internally transposes so the iterated matrix has rows<=cols
+// (identical to the twin's `if X.shape[0] > X.shape[1]: X = X.T`).
+static void newton_schulz5_f64(double *Xout, const double *G, int rows, int cols, int steps) {
+    int transposed = rows > cols;
+    int r = transposed ? cols : rows;   // iterated matrix is [r, c], r<=c
+    int c = transposed ? rows : cols;
+    double *X  = (double*)malloc((size_t)r*c*sizeof(double));
+    if (!transposed)
+        for (size_t i=0;i<(size_t)rows*cols;i++) X[i] = G[i];
+    else
+        for (int i=0;i<rows;i++) for (int j=0;j<cols;j++) X[j*rows + i] = G[i*cols + j];
+
+    double nrm = 0; for (size_t i=0;i<(size_t)r*c;i++) nrm += X[i]*X[i];
+    nrm = sqrt(nrm) + 1e-7;
+    for (size_t i=0;i<(size_t)r*c;i++) X[i] /= nrm;
+
+    const double a=3.4445, b=-4.7750, cc=2.0315;
+    double *A  = (double*)malloc((size_t)r*r*sizeof(double));
+    double *AA = (double*)malloc((size_t)r*r*sizeof(double));
+    double *B  = (double*)malloc((size_t)r*r*sizeof(double));
+    double *BX = (double*)malloc((size_t)r*c*sizeof(double));
+    for (int s=0;s<steps;s++) {
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,   r, r, c, 1.0, X, c, X, c, 0.0, A,  r);
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, r, r, r, 1.0, A, r, A, r, 0.0, AA, r);
+        for (size_t i=0;i<(size_t)r*r;i++) B[i] = b*A[i] + cc*AA[i];
+        cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, r, c, r, 1.0, B, r, X, c, 0.0, BX, c);
+        for (size_t i=0;i<(size_t)r*c;i++) X[i] = a*X[i] + BX[i];
+    }
+
+    if (!transposed)
+        for (size_t i=0;i<(size_t)rows*cols;i++) Xout[i] = X[i];
+    else
+        for (int i=0;i<rows;i++) for (int j=0;j<cols;j++) Xout[i*cols + j] = X[j*rows + i];
+    free(X); free(A); free(AA); free(B); free(BX);
+}
+
+// One Muon update for a 2D weight w[rows,cols] (row-major). `buf` is the
+// persistent SGD-momentum buffer (size rows*cols). Mirrors optim.py Muon.step_param:
+//   buf = mu*buf + g ;  d = g + mu*buf (nesterov) ;  u = NS5(d) ;
+//   scale = max(1, rows/cols)^0.5 ;  w -= lr * u * scale
+static void muon_update(float *w, const float *g, float *buf, int rows, int cols,
+                        float lr, float mu, int nesterov, int ns_steps) {
+    size_t n = (size_t)rows*cols;
+    double *d = (double*)malloc(n*sizeof(double));
+    double *u = (double*)malloc(n*sizeof(double));
+    for (size_t i=0;i<n;i++) {
+        buf[i] = mu*buf[i] + g[i];
+        d[i] = nesterov ? ((double)g[i] + (double)mu*buf[i]) : (double)buf[i];
+    }
+    newton_schulz5_f64(u, d, rows, cols, ns_steps);
+    double scale = sqrt(fmax(1.0, (double)rows/(double)cols));
+    for (size_t i=0;i<n;i++) w[i] -= (float)((double)lr * u[i] * scale);
+    free(d); free(u);
+}
+
 // Cross-entropy loss: operates on logits[V, S] column-major (each column = one token)
 // Avoids transposing by using a per-token temp buffer
 static float cross_entropy_loss(float *dlogits, const float *logits, const uint16_t *targets, int V, int S) {
@@ -90,6 +150,32 @@ static float cross_entropy_loss(float *dlogits, const float *logits, const uint1
     }
     free(col);
     return total_loss / S;
+}
+
+// Cross-entropy loss WITHOUT the gradient (validation). Same softmax/CE as
+// cross_entropy_loss, but: (a) no dlogits scatter, (b) targets are signed compact
+// ids and any target < 0 (a token absent from the train-built compact vocab, so
+// it has no LM-head row) is skipped and excluded from the denominator. Returns
+// the mean loss over the *scoreable* tokens and reports that count via n_valid.
+static float cross_entropy_loss_only(const float *logits, const int *targets,
+                                     int V, int S, int *n_valid) {
+    float *col = (float*)malloc(V * 4);
+    double total_loss = 0; int nv = 0;
+    for (int t = 0; t < S; t++) {
+        int tgt = targets[t];
+        if (tgt < 0) continue;                 // unscoreable token — skip
+        cblas_scopy(V, logits + t, S, col, 1);
+        float maxv; vDSP_maxv(col, 1, &maxv, (vDSP_Length)V);
+        float neg_max = -maxv;
+        vDSP_vsadd(col, 1, &neg_max, col, 1, (vDSP_Length)V);
+        int n = V; vvexpf(col, col, &n);
+        float sum; vDSP_sve(col, 1, &sum, (vDSP_Length)V);
+        total_loss -= logf(col[tgt] / sum + 1e-10f);
+        nv++;
+    }
+    free(col);
+    if (n_valid) *n_valid = nv;
+    return nv > 0 ? (float)(total_loss / nv) : 0.0f;
 }
 
 // Vocab compaction: build mapping from full 32K vocab to compact vocab

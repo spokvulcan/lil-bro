@@ -19,6 +19,12 @@ The matching C reader/writer is ``load_init_weights`` / ``dump_grads`` in
 
 from .serialize import flat_order, pack, unpack, write_init, read_grads, read_flat
 from .compare import tensor_metrics, grad_metrics, summarize, gate
+from .checkpoint import (
+    load_ckpt_params,
+    read_header,
+    write_ckpt,
+    generate_from_ckpt,
+)
 
 __all__ = [
     "flat_order",
@@ -31,4 +37,8 @@ __all__ = [
     "grad_metrics",
     "summarize",
     "gate",
+    "load_ckpt_params",
+    "read_header",
+    "write_ckpt",
+    "generate_from_ckpt",
 ]

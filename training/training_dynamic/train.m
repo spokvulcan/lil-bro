@@ -218,6 +218,156 @@ static void dump_grads(const char *path, LayerGrads *grads,
     fclose(f);
 }
 
+// Dump current weights in the same flat layout as the init/grad files. Used by
+// the optimizer step-diff harness: run one update, dump the post-step weights,
+// and compare against the numpy twin's optimizer applied to the same init+grads.
+static void dump_flat_weights(const char *path, LayerWeights *lw,
+                              float *rms_final, float *embed) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("  cannot open %s for weight dump\n", path); return; }
+    fwrite(embed,4,(size_t)VOCAB*DIM,f);
+    for (int L=0; L<NLAYERS; L++) {
+        fwrite(lw[L].Wq,4,WQ_SZ,f); fwrite(lw[L].Wk,4,WK_SZ,f);
+        fwrite(lw[L].Wv,4,WV_SZ,f); fwrite(lw[L].Wo,4,WO_SZ,f);
+        fwrite(lw[L].W1,4,W1_SZ,f); fwrite(lw[L].W2,4,W2_SZ,f); fwrite(lw[L].W3,4,W3_SZ,f);
+        fwrite(lw[L].rms_att,4,DIM,f); fwrite(lw[L].rms_ffn,4,DIM,f);
+    }
+    fwrite(rms_final,4,DIM,f);
+    fclose(f);
+}
+
+// ===== Shared forward pass (training + validation) =====
+// Runs all layers + final RMSNorm, leaving the normed final hidden in x_final
+// and per-layer activations in acts[] (training needs them for backward; val
+// ignores them). This is the model definition: validation loss is measured by
+// the SAME code path that trains — so R0/R1, which gate the gradients of this
+// exact forward, also vouch for the forward val uses. dw_grp is drained per
+// layer exactly as the training loop did (empty during val -> no-op). Pass
+// tm=NULL to skip timing accumulation.
+typedef struct { double rms, ane_fwd, io_fwd, cblas_wait; } FwdTiming;
+
+static void forward_hidden(
+    DynLayerKernels *dk, PerLayerSurfaces *pls, PerLayerRequests *plr,
+    LayerWeights *lw, const float *rms_final, LayerActs *acts,
+    float *x_cur, float *xnorm_buf, float *x_final, float res_alpha,
+    dispatch_group_t dw_grp, FwdTiming *tm)
+{
+    uint64_t t0;
+    double r_rms = 0, r_ane = 0, r_io = 0, r_wait = 0;
+    for (int L = 0; L < NLAYERS; L++) {
+        LayerActs *ac = &acts[L];
+        memcpy(ac->layer_in, x_cur, SEQ*DIM*4);
+
+        // RMSNorm1 (CPU)
+        t0 = mach_absolute_time();
+        rmsnorm(xnorm_buf, x_cur, lw[L].rms_att, DIM, SEQ);
+        memcpy(ac->xnorm, xnorm_buf, SEQ*DIM*4);
+        r_rms += tb_ms(mach_absolute_time() - t0);
+
+        // Wait for any pending dW cblas (empty during validation)
+        t0 = mach_absolute_time();
+        dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
+        r_wait += tb_ms(mach_absolute_time() - t0);
+
+        // SDPA forward (ANE)
+        t0 = mach_absolute_time();
+        write_sdpa_fwd_acts(pls[L].sdpaFwd_in, xnorm_buf);
+        r_io += tb_ms(mach_absolute_time() - t0);
+        t0 = mach_absolute_time();
+        ane_eval_req(dk->sdpaFwd, plr[L].sdpaFwd);
+        r_ane += tb_ms(mach_absolute_time() - t0);
+
+        t0 = mach_absolute_time();
+        IOSurfaceLock(dk->sdpaFwd->ioOut, kIOSurfaceLockReadOnly, NULL);
+        _Float16 *fwd_out = (_Float16*)IOSurfaceGetBaseAddress(dk->sdpaFwd->ioOut);
+        int off = 0;
+        cvt_f16_f32(ac->attn_out, fwd_out + off, Q_DIM*SEQ); off += Q_DIM*SEQ;
+        cvt_f16_f32(ac->Q,        fwd_out + off, Q_DIM*SEQ); off += Q_DIM*SEQ;
+        cvt_f16_f32(ac->K,        fwd_out + off, KV_DIM*SEQ); off += KV_DIM*SEQ;
+        cvt_f16_f32(ac->V,        fwd_out + off, KV_DIM*SEQ); off += KV_DIM*SEQ;
+        IOSurfaceUnlock(dk->sdpaFwd->ioOut, kIOSurfaceLockReadOnly, NULL);
+        r_io += tb_ms(mach_absolute_time() - t0);
+
+        // Wo forward (ANE)
+        t0 = mach_absolute_time();
+        write_wo_fwd_acts(pls[L].woFwd_in, ac->attn_out);
+        r_io += tb_ms(mach_absolute_time() - t0);
+        t0 = mach_absolute_time();
+        ane_eval_req(dk->woFwd, plr[L].woFwd);
+        r_ane += tb_ms(mach_absolute_time() - t0);
+        t0 = mach_absolute_time();
+        io_read_dyn(dk->woFwd->ioOut, ac->o_out, DIM, SEQ);
+        r_io += tb_ms(mach_absolute_time() - t0);
+
+        // CPU: scaled residual + RMSNorm2
+        t0 = mach_absolute_time();
+        vDSP_vsma(ac->o_out, 1, &res_alpha, x_cur, 1, ac->x2, 1, (vDSP_Length)(SEQ*DIM));
+        rmsnorm(ac->x2norm, ac->x2, lw[L].rms_ffn, DIM, SEQ);
+        r_rms += tb_ms(mach_absolute_time() - t0);
+
+        // Fused FFN (ANE)
+        t0 = mach_absolute_time();
+        write_ffn_fused_acts(pls[L].ffnFused_in, ac->x2norm, ac->x2);
+        r_io += tb_ms(mach_absolute_time() - t0);
+        t0 = mach_absolute_time();
+        ane_eval_req(dk->ffnFused, plr[L].ffnFused);
+        r_ane += tb_ms(mach_absolute_time() - t0);
+
+        t0 = mach_absolute_time();
+        IOSurfaceLock(dk->ffnFused->ioOut, kIOSurfaceLockReadOnly, NULL);
+        _Float16 *ffn_out = (_Float16*)IOSurfaceGetBaseAddress(dk->ffnFused->ioOut);
+        off = 0;
+        cvt_f16_f32(x_cur,       ffn_out + off, DIM*SEQ);     off += DIM*SEQ;
+        cvt_f16_f32(ac->h1,      ffn_out + off, HIDDEN*SEQ);  off += HIDDEN*SEQ;
+        cvt_f16_f32(ac->h3,      ffn_out + off, HIDDEN*SEQ);  off += HIDDEN*SEQ;
+        cvt_f16_f32(ac->silu_out,ffn_out + off, HIDDEN*SEQ);
+        IOSurfaceUnlock(dk->ffnFused->ioOut, kIOSurfaceLockReadOnly, NULL);
+        r_io += tb_ms(mach_absolute_time() - t0);
+    }
+
+    // Final RMSNorm (CPU)
+    t0 = mach_absolute_time();
+    rmsnorm(x_final, x_cur, rms_final, DIM, SEQ);
+    r_rms += tb_ms(mach_absolute_time() - t0);
+
+    if (tm) { tm->rms += r_rms; tm->ane_fwd += r_ane; tm->io_fwd += r_io; tm->cblas_wait += r_wait; }
+}
+
+// ===== Validation: mean CE over a fixed deterministic set of val batches =====
+// Evenly-spaced start positions over the held-out shard (no RNG) so the number
+// is comparable step-to-step and run-to-run. b=1 per micro-batch (as in
+// training). Uses the SAME compact LM head as training, so val loss is on the
+// same scale as the printed train loss. Targets absent from the compact vocab
+// are skipped (see cross_entropy_loss_only).
+static float eval_val_loss(
+    DynLayerKernels *dk, PerLayerSurfaces *pls, PerLayerRequests *plr,
+    LayerWeights *lw, const float *rms_final,
+    const float *embed, const float *cembed, int CV, const VocabMap *vm,
+    const uint16_t *vdata, size_t vntok, int nbatches,
+    LayerActs *acts, float *x_cur, float *xnorm_buf, float *x_final,
+    float *logits, float res_alpha, dispatch_group_t dw_grp)
+{
+    if (!vdata || vntok < (size_t)(SEQ + 1) || nbatches < 1) return 0.0f;
+    size_t maxpos = vntok - SEQ - 1;
+    double total = 0; long total_valid = 0;
+    int targets[SEQ];
+    for (int b = 0; b < nbatches; b++) {
+        size_t pos = (size_t)((double)b * (double)maxpos / (double)nbatches);
+        const uint16_t *in = vdata + pos;
+        const uint16_t *tg = vdata + pos + 1;
+        for (int t = 0; t < SEQ; t++) targets[t] = vm->full_to_compact[tg[t]];
+        embed_lookup(x_cur, embed, in, DIM, SEQ);
+        forward_hidden(dk, pls, plr, lw, rms_final, acts,
+                       x_cur, xnorm_buf, x_final, res_alpha, dw_grp, NULL);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
+        int nv = 0;
+        float l = cross_entropy_loss_only(logits, targets, CV, SEQ, &nv);
+        total += (double)l * nv; total_valid += nv;
+    }
+    return total_valid > 0 ? (float)(total / total_valid) : 0.0f;
+}
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         setbuf(stdout, NULL);
@@ -239,6 +389,12 @@ int main(int argc, char *argv[]) {
         const char *data_path = DEFAULT_DATA_PATH;
         const char *init_path = NULL;        // R1: load shared init from flat binary
         const char *dump_grads_path = NULL;  // R1: dump raw grads after one batch, exit
+        const char *ckpt_path = CKPT_PATH;   // checkpoint output (runtime override)
+        const char *val_data_path = NULL;    // held-out shard for periodic val loss
+        int val_every = 0;                   // 0 = no validation
+        int val_batches = 20;                // fixed val batch count
+        const char *dump_weights_path = NULL;// step-diff: dump post-update weights, exit
+        int opt_is_muon = OPTIMIZER_IS_MUON; // optimizer (runtime --opt overrides the header)
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
             else if (strcmp(argv[i], "--scratch") == 0) from_scratch = true;
@@ -252,6 +408,17 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--data") == 0 && i+1<argc) data_path = argv[++i];
             else if (strcmp(argv[i], "--init") == 0 && i+1<argc) init_path = argv[++i];
             else if (strcmp(argv[i], "--dump-grads") == 0 && i+1<argc) dump_grads_path = argv[++i];
+            else if (strcmp(argv[i], "--ckpt") == 0 && i+1<argc) ckpt_path = argv[++i];
+            else if (strcmp(argv[i], "--val-data") == 0 && i+1<argc) val_data_path = argv[++i];
+            else if (strcmp(argv[i], "--val-every") == 0 && i+1<argc) val_every = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--val-batches") == 0 && i+1<argc) val_batches = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--dump-weights") == 0 && i+1<argc) dump_weights_path = argv[++i];
+            else if (strcmp(argv[i], "--opt") == 0 && i+1<argc) {
+                const char *o = argv[++i];
+                if (strcmp(o, "muon") == 0) opt_is_muon = 1;
+                else if (strcmp(o, "adamw") == 0) opt_is_muon = 0;
+                else { printf("unknown --opt %s (use adamw|muon)\n", o); return 1; }
+            }
         }
         float lr = max_lr;
 
@@ -273,7 +440,7 @@ int main(int argc, char *argv[]) {
         float resume_loss = 0;
         bool resuming = false;
         if (do_resume) {
-            resuming = load_checkpoint(CKPT_PATH, &start_step, &total_steps, &lr, &resume_loss,
+            resuming = load_checkpoint(ckpt_path, &start_step, &total_steps, &lr, &resume_loss,
                 &cum_train, &cum_wall, &cum_steps, &adam_t,
                 lw, la, rms_final, &arms_final, embed, &aembed);
             if (resuming) printf("[RESUMED step %d, loss=%.4f]\n", start_step, resume_loss);
@@ -287,7 +454,8 @@ int main(int argc, char *argv[]) {
             double embed_m = (double)VOCAB*DIM / 1e6;
             printf("Params: %.1fM (transformer %.1fM + embed %.1fM)\n", xformer_m+embed_m, xformer_m, embed_m);
             printf("Kernels: 10 compiled (sdpaFwd+woFwd, ffnFused, ffnBwdW2t+W13t, wotBwd, sdpaBwd1+2, qBwd+kvBwd)\n");
-            printf("Accum %d steps, LR=%g\n", accum_steps, max_lr);
+            printf("Accum %d steps, LR=%g, optimizer=%s\n", accum_steps, max_lr,
+                   opt_is_muon ? "muon" : "adamw");
             double fwd_flops = 2.0*NLAYERS*((double)WQ_SZ + WK_SZ + WV_SZ + WO_SZ + W1_SZ + W2_SZ + W3_SZ) * SEQ;
             double total_flops = 3.0 * fwd_flops;
             printf("FLOPs/step: fwd=%.1fM total=%.1fM\n", fwd_flops/1e6, total_flops/1e6);
@@ -366,6 +534,23 @@ int main(int argc, char *argv[]) {
         float *cembed = vocab_compact_embed(embed, &vm, DIM);
         float *gcembed = (float*)calloc((size_t)CV*DIM, 4);
         AdamState acembed = adam_alloc((size_t)CV*DIM);
+
+        // Held-out validation shard (data01): periodic forward-only val loss.
+        uint16_t *val_data = NULL; size_t val_ntokens = 0, val_len = 0; int val_fd = -1;
+        if (val_data_path && val_every > 0) {
+            val_fd = open(val_data_path, O_RDONLY);
+            if (val_fd < 0) { printf("Cannot open val data %s (val disabled)\n", val_data_path); }
+            else {
+                struct stat vst; fstat(val_fd, &vst); val_len = vst.st_size;
+                val_data = (uint16_t*)mmap(NULL, val_len, PROT_READ, MAP_PRIVATE, val_fd, 0);
+                if (val_data == MAP_FAILED) { val_data = NULL; printf("val mmap failed (val disabled)\n"); }
+                else {
+                    val_ntokens = val_len / 2;
+                    printf("Val data: %zu tokens from %s (every %d steps, %d batches)\n",
+                           val_ntokens, val_data_path, val_every, val_batches);
+                }
+            }
+        }
 
         // ===== Compile all kernels ONCE =====
         printf("Compiling 10 dynamic kernels (one-time)...\n");
@@ -455,6 +640,16 @@ int main(int argc, char *argv[]) {
         for (int step = start_step; step < total_steps; step++) {
             uint64_t t0, t1, t_step = mach_absolute_time();
 
+            // Periodic validation on the held-out shard. Current weights are
+            // staged in the per-layer surfaces; this clobbers x_cur/acts/logits,
+            // which the training forward below recomputes from scratch.
+            if (val_data && (step % val_every == 0)) {
+                float vl = eval_val_loss(&dk, pls, plr, lw, rms_final, embed, cembed,
+                    CV, &vm, val_data, val_ntokens, val_batches,
+                    acts, x_cur, xnorm_buf, x_final, logits, res_alpha, dw_grp);
+                printf("  [val] step=%d val_loss=%.4f\n", step, vl);
+            }
+
             // Sample data (overfit: pin one fixed batch so loss must collapse to ~0)
             size_t max_pos = n_tokens - SEQ - 1;
             size_t pos = overfit ? 0 : (size_t)(drand48() * max_pos);
@@ -466,88 +661,14 @@ int main(int argc, char *argv[]) {
 
             embed_lookup(x_cur, embed, input_tokens, DIM, SEQ);
 
-            double t_rms=0, t_ane_fwd=0, t_io_fwd=0, t_cblas_wait=0;
+            FwdTiming ft = {0};
             double t_ane_bwd=0, t_io_bwd=0, t_silu=0, t_rms_bwd=0, t_cls=0, t_dw_copy=0;
 
-            // ===== FORWARD (28 layers) =====
-            for (int L=0; L<NLAYERS; L++) {
-                LayerActs *ac = &acts[L];
-                memcpy(ac->layer_in, x_cur, SEQ*DIM*4);
+            // ===== FORWARD (shared with validation; see forward_hidden) =====
+            forward_hidden(&dk, pls, plr, lw, rms_final, acts,
+                           x_cur, xnorm_buf, x_final, res_alpha, dw_grp, &ft);
 
-                // RMSNorm1 (CPU)
-                t0 = mach_absolute_time();
-                rmsnorm(xnorm_buf, x_cur, lw[L].rms_att, DIM, SEQ);
-                memcpy(ac->xnorm, xnorm_buf, SEQ*DIM*4);
-                t_rms += tb_ms(mach_absolute_time() - t0);
-
-                // Wait for any pending dW cblas
-                t0 = mach_absolute_time();
-                dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
-                t_cblas_wait += tb_ms(mach_absolute_time() - t0);
-
-                // SDPA forward (ANE): xnorm + Wq,Wk,Wv → attn_out[Q_DIM], Q_rope[Q_DIM], K_rope[KV_DIM], V[KV_DIM], xnorm[DIM]
-                t0 = mach_absolute_time();
-                write_sdpa_fwd_acts(pls[L].sdpaFwd_in, xnorm_buf);
-                t_io_fwd += tb_ms(mach_absolute_time() - t0);
-                t0 = mach_absolute_time();
-                ane_eval_req(dk.sdpaFwd, plr[L].sdpaFwd);
-                t_ane_fwd += tb_ms(mach_absolute_time() - t0);
-
-                // Read SDPA output: [1, Q_DIM+Q_DIM+KV_DIM+KV_DIM+DIM, 1, SEQ] fp16
-                t0 = mach_absolute_time();
-                IOSurfaceLock(dk.sdpaFwd->ioOut, kIOSurfaceLockReadOnly, NULL);
-                _Float16 *fwd_out = (_Float16*)IOSurfaceGetBaseAddress(dk.sdpaFwd->ioOut);
-                int off = 0;
-                cvt_f16_f32(ac->attn_out, fwd_out + off, Q_DIM*SEQ); off += Q_DIM*SEQ;
-                cvt_f16_f32(ac->Q,        fwd_out + off, Q_DIM*SEQ); off += Q_DIM*SEQ;
-                cvt_f16_f32(ac->K,        fwd_out + off, KV_DIM*SEQ); off += KV_DIM*SEQ;
-                cvt_f16_f32(ac->V,        fwd_out + off, KV_DIM*SEQ); off += KV_DIM*SEQ;
-                // xnorm passthrough (DIM*SEQ) — not needed, already saved
-                IOSurfaceUnlock(dk.sdpaFwd->ioOut, kIOSurfaceLockReadOnly, NULL);
-                t_io_fwd += tb_ms(mach_absolute_time() - t0);
-
-                // Wo forward (ANE): attn_out[Q_DIM] → o_out[DIM]
-                t0 = mach_absolute_time();
-                write_wo_fwd_acts(pls[L].woFwd_in, ac->attn_out);
-                t_io_fwd += tb_ms(mach_absolute_time() - t0);
-                t0 = mach_absolute_time();
-                ane_eval_req(dk.woFwd, plr[L].woFwd);
-                t_ane_fwd += tb_ms(mach_absolute_time() - t0);
-                t0 = mach_absolute_time();
-                io_read_dyn(dk.woFwd->ioOut, ac->o_out, DIM, SEQ);
-                t_io_fwd += tb_ms(mach_absolute_time() - t0);
-
-                // CPU: scaled residual + RMSNorm
-                t0 = mach_absolute_time();
-                vDSP_vsma(ac->o_out, 1, &res_alpha, x_cur, 1, ac->x2, 1, (vDSP_Length)(SEQ*DIM));
-                rmsnorm(ac->x2norm, ac->x2, lw[L].rms_ffn, DIM, SEQ);
-                t_rms += tb_ms(mach_absolute_time() - t0);
-
-                // Fused FFN (ANE)
-                t0 = mach_absolute_time();
-                write_ffn_fused_acts(pls[L].ffnFused_in, ac->x2norm, ac->x2);
-                t_io_fwd += tb_ms(mach_absolute_time() - t0);
-                t0 = mach_absolute_time();
-                ane_eval_req(dk.ffnFused, plr[L].ffnFused);
-                t_ane_fwd += tb_ms(mach_absolute_time() - t0);
-
-                // Read fused output: [1, DIM+3*HIDDEN, 1, SEQ]
-                t0 = mach_absolute_time();
-                IOSurfaceLock(dk.ffnFused->ioOut, kIOSurfaceLockReadOnly, NULL);
-                _Float16 *ffn_out = (_Float16*)IOSurfaceGetBaseAddress(dk.ffnFused->ioOut);
-                off = 0;
-                cvt_f16_f32(x_cur,       ffn_out + off, DIM*SEQ);     off += DIM*SEQ;
-                cvt_f16_f32(ac->h1,      ffn_out + off, HIDDEN*SEQ);  off += HIDDEN*SEQ;
-                cvt_f16_f32(ac->h3,      ffn_out + off, HIDDEN*SEQ);  off += HIDDEN*SEQ;
-                cvt_f16_f32(ac->silu_out,ffn_out + off, HIDDEN*SEQ);
-                IOSurfaceUnlock(dk.ffnFused->ioOut, kIOSurfaceLockReadOnly, NULL);
-                t_io_fwd += tb_ms(mach_absolute_time() - t0);
-            }
-
-            // Final RMSNorm + classifier + loss (CPU)
-            t0 = mach_absolute_time();
-            rmsnorm(x_final, x_cur, rms_final, DIM, SEQ);
-            t_rms += tb_ms(mach_absolute_time() - t0);
+            // Classifier + loss (CPU)
             t0 = mach_absolute_time();
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
@@ -795,7 +916,7 @@ int main(int argc, char *argv[]) {
 
             if (step % 10 == 0 || step == start_step) {
                 printf("  timing: ane_fwd=%.1f io_fwd=%.1f rms=%.1f ane_bwd=%.1f io_bwd=%.1f silu=%.1f rms_bwd=%.1f cls=%.1f cblas_wait=%.1f dw_copy=%.1f\n",
-                       t_ane_fwd, t_io_fwd, t_rms, t_ane_bwd, t_io_bwd, t_silu, t_rms_bwd, t_cls, t_cblas_wait, t_dw_copy);
+                       ft.ane_fwd, ft.io_fwd, ft.rms, t_ane_bwd, t_io_bwd, t_silu, t_rms_bwd, t_cls, ft.cblas_wait, t_dw_copy);
                 float xmx, xmn;
                 vDSP_maxv(x_cur,1,&xmx,(vDSP_Length)(SEQ*DIM));
                 vDSP_minv(x_cur,1,&xmn,(vDSP_Length)(SEQ*DIM));
@@ -830,13 +951,16 @@ int main(int argc, char *argv[]) {
 
                 // R1 gate: grads are now raw (loss_scale cancelled, LM-head folded
                 // into gembed) but pre-clip and pre-Adam — the exact ∇ the oracle
-                // computes. Dump and exit before any optimizer mutation.
+                // computes. Dump here. Exit immediately unless --dump-weights also
+                // asked for the post-optimizer weights (the step-diff harness wants
+                // both: the same grads in, the updated weights out).
                 if (dump_grads_path) {
                     dump_grads(dump_grads_path, grads, grms_final, gembed);
-                    printf("  [R1: raw grads dumped to %s after one batch — exiting]\n",
-                           dump_grads_path);
-                    munmap(token_data, data_len); close(data_fd);
-                    return 0;
+                    printf("  [R1: raw grads dumped to %s after one batch]\n", dump_grads_path);
+                    if (!dump_weights_path) {
+                        munmap(token_data, data_len); close(data_fd);
+                        return 0;
+                    }
                 }
 
                 // Global gradient norm
@@ -906,16 +1030,31 @@ int main(int argc, char *argv[]) {
                     lr = min_lr + 0.5f * (1.0f + cosf(M_PI * decay_ratio)) * (max_lr - min_lr);
                 }
 
-                // Adam update
+                // Optimizer update. Muon (Newton-Schulz) for the 2D weight
+                // matrices, AdamW for the norm vectors and (below) the embedding —
+                // matches is_muon_param in lilbro/mlx_ref/params.py. The Muon
+                // momentum buffer reuses the Adam m-slot (unused for these params
+                // in Muon mode). AdamW everywhere is the existing control path.
+                // Norms are excluded from weight decay (0.0f) on both paths.
                 for (int L=0; L<NLAYERS; L++) {
                     LayerGrads *g = &grads[L];
-                    adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].Wo, g->Wo, &la[L].Wo, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].W1, g->W1, &la[L].W1, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].W2, g->W2, &la[L].W2, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
-                    adam_update(lw[L].W3, g->W3, &la[L].W3, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                    if (opt_is_muon) {
+                        muon_update(lw[L].Wq, g->Wq, la[L].Wq.m, Q_DIM,  DIM,    lr, 0.95f, 1, 5);
+                        muon_update(lw[L].Wk, g->Wk, la[L].Wk.m, KV_DIM, DIM,    lr, 0.95f, 1, 5);
+                        muon_update(lw[L].Wv, g->Wv, la[L].Wv.m, KV_DIM, DIM,    lr, 0.95f, 1, 5);
+                        muon_update(lw[L].Wo, g->Wo, la[L].Wo.m, DIM,    Q_DIM,  lr, 0.95f, 1, 5);
+                        muon_update(lw[L].W1, g->W1, la[L].W1.m, HIDDEN, DIM,    lr, 0.95f, 1, 5);
+                        muon_update(lw[L].W2, g->W2, la[L].W2.m, DIM,    HIDDEN, lr, 0.95f, 1, 5);
+                        muon_update(lw[L].W3, g->W3, la[L].W3.m, HIDDEN, DIM,    lr, 0.95f, 1, 5);
+                    } else {
+                        adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                        adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                        adam_update(lw[L].Wv, g->Wv, &la[L].Wv, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                        adam_update(lw[L].Wo, g->Wo, &la[L].Wo, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                        adam_update(lw[L].W1, g->W1, &la[L].W1, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                        adam_update(lw[L].W2, g->W2, &la[L].W2, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                        adam_update(lw[L].W3, g->W3, &la[L].W3, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+                    }
                     adam_update(lw[L].rms_att, g->rms_att, &la[L].rms_att, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
                     adam_update(lw[L].rms_ffn, g->rms_ffn, &la[L].rms_ffn, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
 
@@ -943,6 +1082,16 @@ int main(int argc, char *argv[]) {
                 free(cembed);
                 cembed = vocab_compact_embed(embed, &vm, DIM);
 
+                // Step-diff: weights now hold exactly one optimizer step applied
+                // to the (dumped) grads from the shared init. Dump and exit.
+                if (dump_weights_path) {
+                    dump_flat_weights(dump_weights_path, lw, rms_final, embed);
+                    printf("  [step-diff: post-%s weights dumped to %s after one step]\n",
+                           opt_is_muon ? "muon" : "adamw", dump_weights_path);
+                    munmap(token_data, data_len); close(data_fd);
+                    return 0;
+                }
+
                 // Zero grads
                 for (int L=0; L<NLAYERS; L++) layer_grads_zero(&grads[L]);
                 memset(grms_final, 0, DIM*4);
@@ -953,7 +1102,7 @@ int main(int argc, char *argv[]) {
                 if ((step+1) % 100 == 0 && last_loss < best_loss) {
                     best_loss = last_loss;
                     double wall = tb_ms(mach_absolute_time() - t_wall_start);
-                    save_checkpoint(CKPT_PATH, step+1, total_steps, lr, last_loss,
+                    save_checkpoint(ckpt_path, step+1, total_steps, lr, last_loss,
                         total_train_ms+cum_train, wall+cum_wall, total_steps_done+cum_steps, adam_t,
                         lw, la, rms_final, &arms_final, embed, &aembed);
                     printf("  [ckpt saved, best_loss=%.4f]\n", best_loss);
@@ -985,6 +1134,8 @@ int main(int argc, char *argv[]) {
         free(dq_full); free(dk_full); free(dv_full);
         free(dq); free(dk_buf); free(dv);
         munmap(token_data, data_len); close(data_fd);
+        if (val_data) { munmap(val_data, val_len); }
+        if (val_fd >= 0) close(val_fd);
     }
     return 0;
 }

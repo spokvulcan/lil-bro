@@ -66,7 +66,8 @@ class Config:
 
     # --- bookkeeping ---
     ckpt_path: str = ""        # default -> ane_<name>_ckpt.bin
-    data_path: str = "../tinystories_data00.bin"
+    data_path: str = "../tinystories_data00.bin"      # train shard (data00)
+    val_data_path: str = "../tinystories_data01.bin"  # held-out val shard (data01)
 
     def __post_init__(self) -> None:
         # Resolve sentinels (frozen dataclass -> object.__setattr__).
