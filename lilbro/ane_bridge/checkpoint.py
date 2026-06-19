@@ -159,12 +159,19 @@ def write_ckpt(path: str | Path, params: dict[str, np.ndarray], cfg: Config,
 
 
 def generate_from_ckpt(path: str | Path, cfg: Config, prompt, n_new: int,
-                       temperature: float = 0.0, seed: int = 0) -> np.ndarray:
+                       temperature: float = 0.0, seed: int = 0,
+                       allowed_ids=None) -> np.ndarray:
     """Load an ANE checkpoint and autoregressively sample ``n_new`` tokens.
 
     Generation runs on the MLX twin (a faithful oracle of the same model), so we
     reuse the tested sampler rather than reimplement decode on the ANE side.
+
+    Because the ANE trains with vocab compaction, **temperature sampling needs
+    ``allowed_ids`` set to the training shard's active vocab** or it draws from the
+    untrained LM-head rows (see ``lilbro.eval.sample``). Greedy (``temperature=0``)
+    is safe without a mask.
     """
     from lilbro.eval.sample import generate  # lazy: pulls mlx only when sampling
     params = load_ckpt_params(path, cfg)
-    return generate(params, prompt, cfg, n_new, temperature=temperature, seed=seed)
+    return generate(params, prompt, cfg, n_new, temperature=temperature, seed=seed,
+                    allowed_ids=allowed_ids)

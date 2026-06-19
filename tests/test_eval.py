@@ -77,3 +77,18 @@ def test_sampler_runs_and_respects_context():
     assert out.max() < cfg.vocab
     # Decodes without raising.
     assert isinstance(decode_bytes(out), str)
+
+
+@pytest.mark.slow
+def test_sampler_allowed_ids_masks_to_active_vocab():
+    """`allowed_ids` must confine sampling to the given vocab subset — the fix for
+    a compact-vocab model whose untrained LM-head tail derails free sampling."""
+    from lilbro.eval.sample import generate
+    cfg = Config(name="ga", dim=32, n_layers=1, n_heads=2, head_dim=16,
+                 seq=16, vocab=256, hidden=64, seed=0)
+    params = init_params(cfg)
+    allowed = [10, 20, 30, 40, 50]
+    out = generate(params, encode_bytes("hi"), cfg, n_new=15, temperature=1.0,
+                   seed=1, allowed_ids=allowed)
+    generated = out[2:]  # past the 2-byte prompt
+    assert set(int(t) for t in generated) <= set(allowed)
