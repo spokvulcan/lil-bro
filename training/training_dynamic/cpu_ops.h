@@ -63,14 +63,23 @@ static void adam_update(float *w, const float *g, AdamState *s, int t, float lr,
     }
 }
 
-// ===== Muon optimizer (CPU-side, matches lilbro/mlx_ref/optim.py exactly) =====
-// Newton-Schulz quintic orthogonalization (Keller Jordan Muon). Computed in
-// float64 — same dtype as the numpy twin — so the ANE Muon update can be diffed
-// against the twin to ~float32 round-off (the only fp32 step is the final write
-// back into the fp32 weight). G is [rows,cols] row-major; the result overwrites
-// Xout [rows,cols]. Internally transposes so the iterated matrix has rows<=cols
-// (identical to the twin's `if X.shape[0] > X.shape[1]: X = X.T`).
-static void newton_schulz5_f64(double *Xout, const double *G, int rows, int cols, int steps) {
+// ===== Muon optimizer (CPU-side) =====
+// Newton-Schulz orthogonalization in float64 (the only fp32 step is the final
+// write-back into the fp32 weight). G is [rows,cols] row-major; the result
+// overwrites Xout [rows,cols]. Internally transposes so the iterated matrix has
+// rows<=cols.
+//
+// Each iteration is the quintic (DeepSeek-V4 §2.4 eq 28):
+//   M_k = a·M + b·(M Mᵀ)M + c·(M Mᵀ)²M
+// Two variants of the coefficient schedule:
+//   - prior (Keller Jordan): all `steps` iterations on (3.4445,-4.7750,2.0315).
+//   - v4 (DeepSeek-V4 hybrid, MUON_V4_STEPS=10): first 8 on that same triple for
+//     rapid convergence, final 2 on (2,-1.5,0.5) to settle the singular values
+//     exactly at 1. Selected by `v4_hybrid` (which forces the last-2-step stage).
+#define MUON_V4_STEPS    10     // V4 hybrid Newton-Schulz iteration count (§2.4)
+#define MUON_V4_RMS      0.18   // V4-Flash target update RMS γ (§4.2.1)
+static void newton_schulz_f64(double *Xout, const double *G, int rows, int cols,
+                              int steps, int v4_hybrid) {
     int transposed = rows > cols;
     int r = transposed ? cols : rows;   // iterated matrix is [r, c], r<=c
     int c = transposed ? rows : cols;
@@ -84,12 +93,15 @@ static void newton_schulz5_f64(double *Xout, const double *G, int rows, int cols
     nrm = sqrt(nrm) + 1e-7;
     for (size_t i=0;i<(size_t)r*c;i++) X[i] /= nrm;
 
-    const double a=3.4445, b=-4.7750, cc=2.0315;
     double *A  = (double*)malloc((size_t)r*r*sizeof(double));
     double *AA = (double*)malloc((size_t)r*r*sizeof(double));
     double *B  = (double*)malloc((size_t)r*r*sizeof(double));
     double *BX = (double*)malloc((size_t)r*c*sizeof(double));
     for (int s=0;s<steps;s++) {
+        // V4 hybrid: the final 2 of 10 steps switch to the stabilizing triple.
+        double a, b, cc;
+        if (v4_hybrid && s >= steps - 2) { a = 2.0; b = -1.5; cc = 0.5; }
+        else                             { a = 3.4445; b = -4.7750; cc = 2.0315; }
         cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,   r, r, c, 1.0, X, c, X, c, 0.0, A,  r);
         cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, r, r, r, 1.0, A, r, A, r, 0.0, AA, r);
         for (size_t i=0;i<(size_t)r*r;i++) B[i] = b*A[i] + cc*AA[i];
@@ -105,21 +117,32 @@ static void newton_schulz5_f64(double *Xout, const double *G, int rows, int cols
 }
 
 // One Muon update for a 2D weight w[rows,cols] (row-major). `buf` is the
-// persistent SGD-momentum buffer (size rows*cols). Mirrors optim.py Muon.step_param:
-//   buf = mu*buf + g ;  d = g + mu*buf (nesterov) ;  u = NS5(d) ;
-//   scale = max(1, rows/cols)^0.5 ;  w -= lr * u * scale
+// persistent SGD-momentum buffer. Both variants share the Nesterov momentum:
+//   M = mu*buf + g ;  d = g + mu*M (nesterov) ;  u = NewtonSchulz(d)
+// then differ only in the update rescale and weight decay (DeepSeek-V4 Alg. 1):
+//   - v4=1:  scale = sqrt(max(n,m))·γ (γ=MUON_V4_RMS) ; decoupled wd:
+//            w = w·(1 - lr·wd) - lr·u·scale          [§2.4 / §4.2.1]
+//   - v4=0:  scale = max(1, n/m)^0.5 ; no wd (the prior Keller-Jordan path).
+// This is the only difference between the prior and V4 Muon, so --muon-variant
+// is a clean one-variable comparison.
 static void muon_update(float *w, const float *g, float *buf, int rows, int cols,
-                        float lr, float mu, int nesterov, int ns_steps) {
+                        float lr, float mu, int nesterov, int v4, float wd) {
     size_t n = (size_t)rows*cols;
+    int steps = v4 ? MUON_V4_STEPS : 5;
     double *d = (double*)malloc(n*sizeof(double));
     double *u = (double*)malloc(n*sizeof(double));
     for (size_t i=0;i<n;i++) {
         buf[i] = mu*buf[i] + g[i];
         d[i] = nesterov ? ((double)g[i] + (double)mu*buf[i]) : (double)buf[i];
     }
-    newton_schulz5_f64(u, d, rows, cols, ns_steps);
-    double scale = sqrt(fmax(1.0, (double)rows/(double)cols));
-    for (size_t i=0;i<n;i++) w[i] -= (float)((double)lr * u[i] * scale);
+    newton_schulz_f64(u, d, rows, cols, steps, v4);
+    double scale = v4 ? sqrt((double)(rows > cols ? rows : cols)) * MUON_V4_RMS
+                      : sqrt(fmax(1.0, (double)rows/(double)cols));
+    if (v4 && wd > 0.0f)
+        for (size_t i=0;i<n;i++)
+            w[i] = (float)((double)w[i]*(1.0 - (double)lr*wd) - (double)lr*u[i]*scale);
+    else
+        for (size_t i=0;i<n;i++) w[i] -= (float)((double)lr * u[i] * scale);
     free(d); free(u);
 }
 

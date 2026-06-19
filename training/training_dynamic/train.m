@@ -395,6 +395,8 @@ int main(int argc, char *argv[]) {
         int val_batches = 20;                // fixed val batch count
         const char *dump_weights_path = NULL;// step-diff: dump post-update weights, exit
         int opt_is_muon = OPTIMIZER_IS_MUON; // optimizer (runtime --opt overrides the header)
+        int muon_is_v4 = 1;                  // Muon variant: 1 = V4 hybrid NS + 0.18-RMS rescale (#4),
+                                             // 0 = prior Keller-Jordan (--muon-variant prior)
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
             else if (strcmp(argv[i], "--scratch") == 0) from_scratch = true;
@@ -418,6 +420,12 @@ int main(int argc, char *argv[]) {
                 if (strcmp(o, "muon") == 0) opt_is_muon = 1;
                 else if (strcmp(o, "adamw") == 0) opt_is_muon = 0;
                 else { printf("unknown --opt %s (use adamw|muon)\n", o); return 1; }
+            }
+            else if (strcmp(argv[i], "--muon-variant") == 0 && i+1<argc) {
+                const char *v = argv[++i];
+                if (strcmp(v, "v4") == 0) muon_is_v4 = 1;
+                else if (strcmp(v, "prior") == 0) muon_is_v4 = 0;
+                else { printf("unknown --muon-variant %s (use v4|prior)\n", v); return 1; }
             }
         }
         float lr = max_lr;
@@ -454,8 +462,9 @@ int main(int argc, char *argv[]) {
             double embed_m = (double)VOCAB*DIM / 1e6;
             printf("Params: %.1fM (transformer %.1fM + embed %.1fM)\n", xformer_m+embed_m, xformer_m, embed_m);
             printf("Kernels: 10 compiled (sdpaFwd+woFwd, ffnFused, ffnBwdW2t+W13t, wotBwd, sdpaBwd1+2, qBwd+kvBwd)\n");
-            printf("Accum %d steps, LR=%g, optimizer=%s\n", accum_steps, max_lr,
-                   opt_is_muon ? "muon" : "adamw");
+            printf("Accum %d steps, LR=%g, optimizer=%s%s\n", accum_steps, max_lr,
+                   opt_is_muon ? "muon" : "adamw",
+                   opt_is_muon ? (muon_is_v4 ? " (v4 hybrid NS)" : " (prior NS)") : "");
             // V4 ablation knobs (PRD #2). Printed so a run's config is on the
             // record; every knob is off/identity by default → plain transformer.
             printf("V4 knobs: qk_norm=%d attn_sink=%d swiglu_clamp=%d "
@@ -1045,13 +1054,13 @@ int main(int argc, char *argv[]) {
                 for (int L=0; L<NLAYERS; L++) {
                     LayerGrads *g = &grads[L];
                     if (opt_is_muon) {
-                        muon_update(lw[L].Wq, g->Wq, la[L].Wq.m, Q_DIM,  DIM,    lr, 0.95f, 1, 5);
-                        muon_update(lw[L].Wk, g->Wk, la[L].Wk.m, KV_DIM, DIM,    lr, 0.95f, 1, 5);
-                        muon_update(lw[L].Wv, g->Wv, la[L].Wv.m, KV_DIM, DIM,    lr, 0.95f, 1, 5);
-                        muon_update(lw[L].Wo, g->Wo, la[L].Wo.m, DIM,    Q_DIM,  lr, 0.95f, 1, 5);
-                        muon_update(lw[L].W1, g->W1, la[L].W1.m, HIDDEN, DIM,    lr, 0.95f, 1, 5);
-                        muon_update(lw[L].W2, g->W2, la[L].W2.m, DIM,    HIDDEN, lr, 0.95f, 1, 5);
-                        muon_update(lw[L].W3, g->W3, la[L].W3.m, HIDDEN, DIM,    lr, 0.95f, 1, 5);
+                        muon_update(lw[L].Wq, g->Wq, la[L].Wq.m, Q_DIM,  DIM,    lr, 0.95f, 1, muon_is_v4, wd);
+                        muon_update(lw[L].Wk, g->Wk, la[L].Wk.m, KV_DIM, DIM,    lr, 0.95f, 1, muon_is_v4, wd);
+                        muon_update(lw[L].Wv, g->Wv, la[L].Wv.m, KV_DIM, DIM,    lr, 0.95f, 1, muon_is_v4, wd);
+                        muon_update(lw[L].Wo, g->Wo, la[L].Wo.m, DIM,    Q_DIM,  lr, 0.95f, 1, muon_is_v4, wd);
+                        muon_update(lw[L].W1, g->W1, la[L].W1.m, HIDDEN, DIM,    lr, 0.95f, 1, muon_is_v4, wd);
+                        muon_update(lw[L].W2, g->W2, la[L].W2.m, DIM,    HIDDEN, lr, 0.95f, 1, muon_is_v4, wd);
+                        muon_update(lw[L].W3, g->W3, la[L].W3.m, HIDDEN, DIM,    lr, 0.95f, 1, muon_is_v4, wd);
                     } else {
                         adam_update(lw[L].Wq, g->Wq, &la[L].Wq, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
                         adam_update(lw[L].Wk, g->Wk, &la[L].Wk, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
