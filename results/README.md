@@ -2,10 +2,28 @@
 
 Ablation outputs: tables, loss curves, and the energy verdict.
 
-Headline artifact — per component, vs the dense+AdamW control at best-tuned LR:
+## DeepSeek-V4 parity build status (PRD spokvulcan/lil-bro#2)
+
+Per-mechanism **correctness** state (R0 overfit on the ANE is the gate that must be
+green before any ablation number is trusted). Held-out-val ablation numbers (the
+headline below) are the follow-up measurement once a mechanism is R0-green.
+
+| Issue | Mechanism | R0 gate (ANE) | Evidence |
+|---|---|---|---|
+| #3 | Config ablation knobs (prefactor) | ✅ identity | 25 cfg tests; R0 bit-identical 0.0156 |
+| #4 | Muon → V4 hybrid Newton-Schulz | ✅ green | R0→0.0000 `--opt muon`; [muon_v4.md](muon_v4.md) |
+| #10 | Partial RoPE (last `rope_rotary_dims`) | ✅ green | identity@hd≤64; hd=128→0.0000; [partial_rope.md](partial_rope.md) |
+| #9 | SwiGLU clamping | ✅ green | R0 green + FD backward 9/9; [swiglu_clamp.md](swiglu_clamp.md) |
+| #5 | mHC Sinkhorn spike (fp16) | ✅ green | τ≥0.5 doubly-stoch.; bwd 7.9e-11; [mhc_sinkhorn_spike.md](mhc_sinkhorn_spike.md) |
+| #7 | Q/KV RMSNorm | ⏳ pending | needs MIL per-head norm + bwd |
+| #8 | Attention sink | ⏳ pending | needs CPU softmax-with-sink fwd+bwd |
+| #6 | ANE MTP path | ⏳ pending | needs extra MTP block fwd+bwd |
+| #11 | mHC (flagship) | ⏳ pending | n_hc-wide residual + A/B/C maps (uses #5 recipe) |
+
+## Headline artifact — per component, vs the dense+AdamW control at best-tuned LR
 
 | component | Δ tokens-to-target | Δ steps | Δ energy (ANE) | Δ wall-clock | verdict |
 |-----------|--------------------|---------|----------------|--------------|---------|
 
-Plus the systems verdict: ANE vs MLX on energy-/wall-clock-to-target and measured
-ANE utilization (measured here, not taken from upstream's conflicting figures).
+Plus the systems verdict: ANE energy-/wall-clock-to-target and measured ANE
+utilization (measured here directly, not taken from upstream's conflicting figures).
