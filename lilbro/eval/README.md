@@ -9,3 +9,14 @@ loss only).
   the headline **tokens-to-target** metric.
 - **Target:** defined at the knee of the dense+AdamW baseline's val curve @ rung 2.
 - **Generation sampler:** qualitative check (coherent TinyStories text).
+
+## Built
+
+- `data.py` — `TokenStream`, a memmap over the upstream flat **uint16** token
+  format (no header; `n_tokens = filesize/2`), with next-token-shift batching and
+  a deterministic `fixed_val_batches` set.
+- `evaluate.py` — `val_loss` over the fixed batch set.
+- `sample.py` — `generate` (autoregressive decoding via the MLX twin).
+- `tokenizer.py` — byte-level tokenizer (256 vocab) for the R0/R1 rungs.
+
+Tests: `tests/test_eval.py`.

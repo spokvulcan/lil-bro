@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Data / checkpoints / generated artifacts
+*.bin
+!assets/**/*.bin
+training/training_dynamic/train
+results/*.png
+results/*.json
+!results/README.md
+
+# Generated ANE model headers (emitted from lilbro/configs)
+training/training_dynamic/models/gen_*.h
