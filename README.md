@@ -25,23 +25,29 @@ the first "no" for an answer.
 
 ## The thesis
 
-Systems **+** architecture-ablation. The headline number is **hardware-independent**
-— *tokens-to-target validation loss* — so conclusions about architecture hold no
-matter where they run. The systems verdict (energy / wall-clock, ANE vs MLX)
-rides alongside. And nothing counts until the ANE's gradients match a trusted
-**MLX oracle** within tolerance: no "win" may come from a silently-wrong backward
-pass.
+> **Direction update (2026-06-20): ANE-only.** No MLX/torch twin, no fp64 gradient
+> oracle, no GPU baseline. Correctness is verified **behaviorally** — R0 overfit on
+> the ANE → loss ~0, plus held-out validation — not by a gradient diff. The MLX twin
+> and R1 grad-diff gate were the Phase-1 instrument (built, green — R1 caught a real
+> GQA bug) and **remain in the repo as history**, but are no longer the method. New
+> work follows [ADR 0001](docs/adr/0001-deepseek-v4-for-dense-ane.md).
 
-- **Headline:** tokens-to-target validation loss (hardware-independent)
-- **Secondary:** energy- and wall-clock-to-target (ANE vs MLX)
-- **Correctness gate:** ANE gradients match the MLX oracle within tolerance
+Systems **+** architecture-ablation. The headline number is **tokens-to-target
+validation loss** — a behavioral metric, so conclusions about architecture hold
+regardless of optimizer or rung. The systems verdict (energy / wall-clock) is
+measured **directly on the ANE**. And nothing counts until a config clears the **R0
+overfit gate on the ANE**: no "win" may come from a silently-wrong backward pass.
+
+- **Headline:** tokens-to-target validation loss
+- **Secondary:** energy- and wall-clock-to-target, measured directly on the ANE
+- **Correctness gate:** R0 overfit on the ANE (loss → ~0) + held-out validation (behavioral)
 
 ## What lil-bro adds over upstream
 
 - **Parametric model configs** (tiny → TinyStories scale) — upstream config is compile-time `#define`s
 - A held-out **validation/eval harness** (`data00` train / `data01` val) — upstream measures train loss only
 - **Muon** optimizer and **Multi-Token Prediction (MTP)** as opt-in ablations
-- An **MLX twin** serving as a **correctness oracle** (gradient diff) *and* **GPU energy baseline**
+- A **behavioral correctness gate** — overfit-one-batch on the ANE (loss → ~0) + held-out validation (the Phase-1 **MLX twin / gradient oracle** is retained as history but **superseded**; ANE-only)
 - A **tokens-to-target** ablation study of DeepSeek-V4 ideas at small dense scale
 
 ## The scaling ladder
@@ -50,10 +56,10 @@ Climb only when the current rung's gate is green — never scale a broken config
 
 | Rung | Config | Gate |
 |---|---|---|
-| R0 overfit | 1 layer, d=64, byte-256 vocab, seq=64 | ANE loss → ~0 on one repeated batch |
-| R1 grad-diff | same | ANE grads match the MLX oracle within tolerance |
-| R2 small | d=256, ~6 layers, 32K vocab, seq=256 | val tracks MLX; **headline ablation here** |
-| R3 110M | d=768, 12 layers, 32K, seq=256 | reproduces upstream; energy verdict |
+| R0 overfit | 1 layer, d=64, byte-256 vocab, seq=64 | ANE loss → ~0 on one repeated batch (behavioral correctness gate) |
+| ~~R1 grad-diff~~ *(Phase-1 history)* | same | ANE grads matched the MLX oracle — green, caught a real GQA bug; **superseded** by R0 + val, kept as history |
+| R2 small | d=256, ~6 layers, 32K vocab, seq=256 | held-out val converges + coherent samples; **headline ablation here** |
+| R3 110M | d=768, 12 layers, 32K, seq=256 | reproduces upstream; ANE energy verdict |
 
 **Status:** Phase 1 (baseline → Muon → MTP). Full phasing, method invariants, and
 gates in [ROADMAP.md](ROADMAP.md); the complete Phase-1 spec in [docs/PRD.md](docs/PRD.md).
