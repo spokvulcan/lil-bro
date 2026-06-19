@@ -16,7 +16,7 @@ headline below) are the follow-up measurement once a mechanism is R0-green.
 | #9 | SwiGLU clamping | ✅ green | R0 green + FD backward 9/9; [swiglu_clamp.md](swiglu_clamp.md) |
 | #5 | mHC Sinkhorn spike (fp16) | ✅ green | τ≥0.5 doubly-stoch.; bwd 7.9e-11; [mhc_sinkhorn_spike.md](mhc_sinkhorn_spike.md) |
 | #7 | Q/KV RMSNorm | ⏳ pending | needs MIL per-head norm + bwd |
-| #8 | Attention sink | ⏳ pending | needs CPU softmax-with-sink fwd+bwd |
+| #8 | Attention sink | ✅ green | R0 on→0.0105 (off→0.0156); FD bwd 1.24e-3; [attn_sink.md](attn_sink.md) |
 | #6 | ANE MTP path | ⏳ pending | needs extra MTP block fwd+bwd |
 | #11 | mHC (flagship) | ⏳ pending | n_hc-wide residual + A/B/C maps (uses #5 recipe) |
 

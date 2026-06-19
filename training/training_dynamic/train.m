@@ -104,7 +104,11 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 static void save_checkpoint(const char *path, int step, int total_steps, float lr, float loss,
                             double ct, double cw, int cs, int adam_t,
                             LayerWeights *lw, LayerAdam *la, float *rms_final, AdamState *arms_final,
-                            float *embed, AdamState *aembed) {
+                            float *embed, AdamState *aembed
+#if ATTN_SINK
+                            , float *attn_sink, AdamState *asink
+#endif
+                            ) {
     FILE *f = fopen(path, "wb");
     CkptHdr h = {0};
     h.magic = 0x424C5A54; h.version = 4;
@@ -134,13 +138,23 @@ static void save_checkpoint(const char *path, int step, int total_steps, float l
     fwrite(arms_final->m,4,DIM,f); fwrite(arms_final->v,4,DIM,f);
     fwrite(embed,4,VOCAB*DIM,f);
     fwrite(aembed->m,4,VOCAB*DIM,f); fwrite(aembed->v,4,VOCAB*DIM,f);
+#if ATTN_SINK
+    // Per-head sink logits + Adam state, appended (issue #8). Only present in
+    // ATTN_SINK builds; a sink build and a non-sink build never share a run.
+    fwrite(attn_sink,4,(size_t)NLAYERS*HEADS,f);
+    fwrite(asink->m,4,(size_t)NLAYERS*HEADS,f); fwrite(asink->v,4,(size_t)NLAYERS*HEADS,f);
+#endif
     fclose(f);
 }
 
 static bool load_checkpoint(const char *path, int *step, int *total_steps, float *lr, float *loss,
                              double *ct, double *cw, int *cs, int *adam_t,
                              LayerWeights *lw, LayerAdam *la, float *rms_final, AdamState *arms_final,
-                             float *embed, AdamState *aembed) {
+                             float *embed, AdamState *aembed
+#if ATTN_SINK
+                             , float *attn_sink, AdamState *asink
+#endif
+                             ) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
     CkptHdr h;
@@ -167,6 +181,10 @@ static bool load_checkpoint(const char *path, int *step, int *total_steps, float
     fread(arms_final->m,4,DIM,f); fread(arms_final->v,4,DIM,f);
     fread(embed,4,VOCAB*DIM,f);
     fread(aembed->m,4,VOCAB*DIM,f); fread(aembed->v,4,VOCAB*DIM,f);
+#if ATTN_SINK
+    fread(attn_sink,4,(size_t)NLAYERS*HEADS,f);
+    fread(asink->m,4,(size_t)NLAYERS*HEADS,f); fread(asink->v,4,(size_t)NLAYERS*HEADS,f);
+#endif
     fclose(f);
     return true;
 }
@@ -250,8 +268,9 @@ static void forward_hidden(
     DynLayerKernels *dk, PerLayerSurfaces *pls, PerLayerRequests *plr,
     LayerWeights *lw, const float *rms_final, LayerActs *acts,
     float *x_cur, float *xnorm_buf, float *x_final, float res_alpha,
-    dispatch_group_t dw_grp, FwdTiming *tm)
+    const float *attn_sink, dispatch_group_t dw_grp, FwdTiming *tm)
 {
+    (void)attn_sink;
     uint64_t t0;
     double r_rms = 0, r_ane = 0, r_io = 0, r_wait = 0;
     for (int L = 0; L < NLAYERS; L++) {
@@ -287,6 +306,16 @@ static void forward_hidden(
         cvt_f16_f32(ac->V,        fwd_out + off, KV_DIM*SEQ); off += KV_DIM*SEQ;
         IOSurfaceUnlock(dk->sdpaFwd->ioOut, kIOSurfaceLockReadOnly, NULL);
         r_io += tb_ms(mach_absolute_time() - t0);
+
+#if ATTN_SINK
+        // Re-run the attention core on CPU with a learnable per-head sink logit in
+        // the softmax denominator (issue #8). The ANE kernel computed Q/K/V (which
+        // we keep), but its softmax has no sink term; overwrite attn_out with the
+        // sink version. Backward bypasses sdpaBwd1/2 (see attn_sink_backward).
+        t0 = mach_absolute_time();
+        attn_sink_forward(ac->attn_out, ac->Q, ac->K, ac->V, attn_sink + L*HEADS, SEQ);
+        r_rms += tb_ms(mach_absolute_time() - t0);
+#endif
 
         // Wo forward (ANE)
         t0 = mach_absolute_time();
@@ -345,7 +374,7 @@ static float eval_val_loss(
     const float *embed, const float *cembed, int CV, const VocabMap *vm,
     const uint16_t *vdata, size_t vntok, int nbatches,
     LayerActs *acts, float *x_cur, float *xnorm_buf, float *x_final,
-    float *logits, float res_alpha, dispatch_group_t dw_grp)
+    float *logits, float res_alpha, const float *attn_sink, dispatch_group_t dw_grp)
 {
     if (!vdata || vntok < (size_t)(SEQ + 1) || nbatches < 1) return 0.0f;
     size_t maxpos = vntok - SEQ - 1;
@@ -358,7 +387,7 @@ static float eval_val_loss(
         for (int t = 0; t < SEQ; t++) targets[t] = vm->full_to_compact[tg[t]];
         embed_lookup(x_cur, embed, in, DIM, SEQ);
         forward_hidden(dk, pls, plr, lw, rms_final, acts,
-                       x_cur, xnorm_buf, x_final, res_alpha, dw_grp, NULL);
+                       x_cur, xnorm_buf, x_final, res_alpha, attn_sink, dw_grp, NULL);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
         int nv = 0;
@@ -444,13 +473,28 @@ int main(int argc, char *argv[]) {
         AdamState arms_final = adam_alloc(DIM);
         AdamState aembed = adam_alloc((size_t)VOCAB*DIM);
 
+        // Attention sink (issue #8): one learnable logit per (layer, head). Init 0
+        // so exp(sink)=1 from the start — the sink behaves like one extra all-zero
+        // key, active from step 0 (no warm-up needed for the R0 gate). AdamW like
+        // the other per-element bias/norm params. attn_sink stays allocated even
+        // when the knob is off (passed to forward_hidden, used only #if ATTN_SINK).
+        float *attn_sink = (float*)calloc((size_t)NLAYERS*HEADS, 4);
+#if ATTN_SINK
+        float *gsink = (float*)calloc((size_t)NLAYERS*HEADS, 4);
+        AdamState asink = adam_alloc((size_t)NLAYERS*HEADS);
+#endif
+
         double cum_train=0, cum_wall=0; int cum_steps=0;
         float resume_loss = 0;
         bool resuming = false;
         if (do_resume) {
             resuming = load_checkpoint(ckpt_path, &start_step, &total_steps, &lr, &resume_loss,
                 &cum_train, &cum_wall, &cum_steps, &adam_t,
-                lw, la, rms_final, &arms_final, embed, &aembed);
+                lw, la, rms_final, &arms_final, embed, &aembed
+#if ATTN_SINK
+                , attn_sink, &asink
+#endif
+                );
             if (resuming) printf("[RESUMED step %d, loss=%.4f]\n", start_step, resume_loss);
         }
         if (!resuming) {
@@ -661,7 +705,7 @@ int main(int argc, char *argv[]) {
             if (val_data && (step % val_every == 0)) {
                 float vl = eval_val_loss(&dk, pls, plr, lw, rms_final, embed, cembed,
                     CV, &vm, val_data, val_ntokens, val_batches,
-                    acts, x_cur, xnorm_buf, x_final, logits, res_alpha, dw_grp);
+                    acts, x_cur, xnorm_buf, x_final, logits, res_alpha, attn_sink, dw_grp);
                 printf("  [val] step=%d val_loss=%.4f\n", step, vl);
             }
 
@@ -681,7 +725,7 @@ int main(int argc, char *argv[]) {
 
             // ===== FORWARD (shared with validation; see forward_hidden) =====
             forward_hidden(&dk, pls, plr, lw, rms_final, acts,
-                           x_cur, xnorm_buf, x_final, res_alpha, dw_grp, &ft);
+                           x_cur, xnorm_buf, x_final, res_alpha, attn_sink, dw_grp, &ft);
 
             // Classifier + loss (CPU)
             t0 = mach_absolute_time();
@@ -839,6 +883,18 @@ int main(int argc, char *argv[]) {
                     free(capt_do); free(capt_attn);
                 });
 
+#if ATTN_SINK
+                // CPU attention-sink backward (issue #8). da_buf = d/d(attn_out)
+                // from wotBwd above; ac->Q/K/V are the same RoPE'd activations the
+                // sink forward consumed. Produces GQA-reduced dq[Q_DIM],
+                // dk_buf[KV_DIM], dv[KV_DIM] directly and accumulates the per-head
+                // sink gradient into gsink (zeroed with the other grads each step),
+                // bypassing the ANE sdpaBwd1/2 kernels (whose softmax has no sink).
+                t0 = mach_absolute_time();
+                attn_sink_backward(da_buf, ac->Q, ac->K, ac->V, attn_sink + L*HEADS,
+                                   dq, dk_buf, dv, gsink + L*HEADS, SEQ);
+                t_rms_bwd += tb_ms(mach_absolute_time() - t0);
+#else
                 // GQA: tile K,V from KV_DIM → Q_DIM for SDPA backward
                 t0 = mach_absolute_time();
                 gqa_tile_kv(k_tiled, ac->K, SEQ);
@@ -878,6 +934,7 @@ int main(int argc, char *argv[]) {
                 gqa_reduce_kv(dv, dv_full, SEQ);
                 // dQ stays at Q_DIM — no reduction needed
                 memcpy(dq, dq_full, SEQ*Q_DIM*4);
+#endif
 
                 // RoPE backward on dQ[Q_DIM] and dK[KV_DIM]
                 rope_backward_inplace(dq, SEQ, Q_DIM, HD);
@@ -987,6 +1044,9 @@ int main(int argc, char *argv[]) {
                     for(int i=0;i<DIM;i++){g->rms_att[i]*=gsc; g->rms_ffn[i]*=gsc;}
                 }
                 for(int i=0;i<DIM;i++) grms_final[i]*=gsc;
+#if ATTN_SINK
+                for(int i=0;i<NLAYERS*HEADS;i++) gsink[i]*=gsc;
+#endif
                 vocab_scatter_grads(gembed, gcembed, &vm, DIM);
                 for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed[i]*=gsc;
 
@@ -1022,6 +1082,9 @@ int main(int argc, char *argv[]) {
                 { float s;
                   vDSP_dotpr(grms_final,1,grms_final,1,&s,(vDSP_Length)DIM); grad_norm_sq+=s;
                   vDSP_dotpr(gembed,1,gembed,1,&s,(vDSP_Length)(VOCAB*DIM)); grad_norm_sq+=s;
+#if ATTN_SINK
+                  vDSP_dotpr(gsink,1,gsink,1,&s,(vDSP_Length)(NLAYERS*HEADS)); grad_norm_sq+=s;
+#endif
                 }
                 float grad_norm = sqrtf(grad_norm_sq);
                 if ((step+1) % 10 == 0) {
@@ -1060,6 +1123,9 @@ int main(int argc, char *argv[]) {
                     }
                     vDSP_vsmul(grms_final,1,&clip_scale,grms_final,1,(vDSP_Length)DIM);
                     vDSP_vsmul(gembed,1,&clip_scale,gembed,1,(vDSP_Length)(VOCAB*DIM));
+#if ATTN_SINK
+                    vDSP_vsmul(gsink,1,&clip_scale,gsink,1,(vDSP_Length)(NLAYERS*HEADS));
+#endif
                 }
 
                 // Cosine LR schedule with warmup
@@ -1120,6 +1186,10 @@ int main(int argc, char *argv[]) {
                 }
                 adam_update(rms_final, grms_final, &arms_final, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
                 adam_update(embed, gembed, &aembed, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+#if ATTN_SINK
+                // Sink logits are bias-like scalars → AdamW with no weight decay.
+                adam_update(attn_sink, gsink, &asink, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
+#endif
                 free(cembed);
                 cembed = vocab_compact_embed(embed, &vm, DIM);
 
@@ -1136,6 +1206,9 @@ int main(int argc, char *argv[]) {
                 // Zero grads
                 for (int L=0; L<NLAYERS; L++) layer_grads_zero(&grads[L]);
                 memset(grms_final, 0, DIM*4);
+#if ATTN_SINK
+                memset(gsink, 0, (size_t)NLAYERS*HEADS*4);
+#endif
                 memset(gembed, 0, (size_t)VOCAB*DIM*4);
                 memset(gcembed, 0, (size_t)CV*DIM*4);
 
@@ -1145,7 +1218,11 @@ int main(int argc, char *argv[]) {
                     double wall = tb_ms(mach_absolute_time() - t_wall_start);
                     save_checkpoint(ckpt_path, step+1, total_steps, lr, last_loss,
                         total_train_ms+cum_train, wall+cum_wall, total_steps_done+cum_steps, adam_t,
-                        lw, la, rms_final, &arms_final, embed, &aembed);
+                        lw, la, rms_final, &arms_final, embed, &aembed
+#if ATTN_SINK
+                        , attn_sink, &asink
+#endif
+                        );
                     printf("  [ckpt saved, best_loss=%.4f]\n", best_loss);
                 }
             }

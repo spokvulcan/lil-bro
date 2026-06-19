@@ -272,6 +272,80 @@ static void embed_backward(float *d_embed, const float *dx, const uint16_t *toke
     }
 }
 
+// ===== Attention sink (issue #8): learnable per-head sink logit in the softmax
+// denominator. When ATTN_SINK is on, the whole attention core (scores, softmax,
+// scores@V) runs on CPU here — Q/K/V are the RoPE'd entries from the SDPA kernel.
+// This lands the softmax on the CPU (the documented mask+softmax decomposition)
+// and absorbs the sink's effect on the softmax normalizer, which the ANE backward
+// kernels cannot. GQA: q-head h reads kv-head (h % KV_HEADS); causal.
+// FD-verified fwd+bwd (training/training_dynamic/test_attn_sink derivation). =====
+static void attn_sink_forward(float *attn_out, const float *Q, const float *K,
+                              const float *V, const float *sink_h, int seq) {
+    float scale = 1.0f/sqrtf((float)HD);
+    for (int h=0; h<HEADS; h++) {
+        int kvh = h % KV_HEADS;
+        float s = sink_h[h];
+        for (int q=0; q<seq; q++) {
+            float sc[SEQ]; float m = s;             // sink logit participates in the max
+            for (int j=0; j<=q; j++) {
+                float dot=0;
+                for (int d=0; d<HD; d++) dot += Q[(h*HD+d)*seq+q]*K[(kvh*HD+d)*seq+j];
+                sc[j]=dot*scale; if (sc[j]>m) m=sc[j];
+            }
+            float Z=0; for (int j=0;j<=q;j++){ sc[j]=expf(sc[j]-m); Z+=sc[j]; }
+            float inv = 1.0f/(Z + expf(s-m));       // +exp(sink) in the denominator
+            for (int d=0; d<HD; d++) {
+                float acc=0;
+                for (int j=0;j<=q;j++) acc += sc[j]*V[(kvh*HD+d)*seq+j];
+                attn_out[(h*HD+d)*seq+q] = acc*inv;
+            }
+        }
+    }
+}
+// da[Q_DIM,seq] = dL/dattn_out -> dQ[Q_DIM], dK[KV_DIM], dV[KV_DIM] (GQA-reduced),
+// dsink[HEADS] (accumulated). Recomputes the softmax (no saved probs).
+static void attn_sink_backward(const float *da, const float *Q, const float *K,
+                               const float *V, const float *sink_h,
+                               float *dQ, float *dK, float *dV, float *dsink, int seq) {
+    float scale = 1.0f/sqrtf((float)HD);
+    memset(dQ, 0, Q_DIM*seq*4); memset(dK, 0, KV_DIM*seq*4); memset(dV, 0, KV_DIM*seq*4);
+    for (int h=0;h<HEADS;h++) {
+        int kvh = h % KV_HEADS; float s = sink_h[h]; float dsh = 0;
+        for (int q=0;q<seq;q++) {
+            float sc[SEQ]; float m=s;
+            for (int j=0;j<=q;j++){
+                float dot=0;
+                for (int d=0;d<HD;d++) dot += Q[(h*HD+d)*seq+q]*K[(kvh*HD+d)*seq+j];
+                sc[j]=dot*scale; if(sc[j]>m)m=sc[j];
+            }
+            float Z=0; for(int j=0;j<=q;j++){ sc[j]=expf(sc[j]-m); Z+=sc[j]; }
+            float esink=expf(s-m), inv=1.0f/(Z+esink);
+            float p[SEQ]; for(int j=0;j<=q;j++) p[j]=sc[j]*inv;
+            float psink = esink*inv;
+            float dp[SEQ];
+            for(int j=0;j<=q;j++){
+                float acc=0;
+                for(int d=0;d<HD;d++){
+                    float dad = da[(h*HD+d)*seq+q];
+                    acc += dad * V[(kvh*HD+d)*seq+j];
+                    dV[(kvh*HD+d)*seq+j] += p[j]*dad;     // GQA: accumulates over q-heads
+                }
+                dp[j]=acc;
+            }
+            float g=0; for(int j=0;j<=q;j++) g += p[j]*dp[j];   // softmax-with-sink reduction
+            dsh += -psink*g;                                   // dL/dsink_h
+            for(int j=0;j<=q;j++){
+                float dscore = p[j]*(dp[j]-g)*scale;
+                for(int d=0;d<HD;d++){
+                    dQ[(h*HD+d)*seq+q] += dscore*K[(kvh*HD+d)*seq+j];
+                    dK[(kvh*HD+d)*seq+j] += dscore*Q[(h*HD+d)*seq+q];
+                }
+            }
+        }
+        dsink[h] += dsh;
+    }
+}
+
 // RoPE backward (in-place): inverse rotation on dQ/dK gradients
 // Data layout: [DIM, SEQ] channel-first, DIM = nheads * hd
 static void rope_backward_inplace(float *dx, int seq, int dim, int hd) {
