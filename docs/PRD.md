@@ -4,6 +4,8 @@
 
 A research fork of [maderix/ANE](https://github.com/maderix/ANE) (MIT). See [ROADMAP.md](../ROADMAP.md) for phasing and [NOTICE](../NOTICE) for attribution. *(No time estimates by design — phases are ordered by dependency.)*
 
+> **Superseded in part (2026-06-20): ANE-only.** The **MLX twin / fp64 oracle / GPU baseline** described in this Phase-1 PRD were the instrument actually built (R0 & R1 green; R1 caught a real GQA backward bug — `results/r1_grad_diff.md`) and remain in the repo. Going forward the project is **ANE-only**: correctness is verified **behaviorally** (R0 overfit on the ANE + held-out validation), with no gradient oracle and no GPU baseline. The Phase-1 narrative below is preserved as history; new work follows [ADR 0001](adr/0001-deepseek-v4-for-dense-ane.md) and PRD [spokvulcan/lil-bro#2](https://github.com/spokvulcan/lil-bro/issues/2).
+
 ## Problem Statement
 
 As an ML-systems researcher with an Apple-Silicon MacBook, I can see that training on the Apple Neural Engine is *possible* — the upstream proof-of-concept shows it — but I can't answer the questions I actually care about, and I can't run controlled experiments at all:

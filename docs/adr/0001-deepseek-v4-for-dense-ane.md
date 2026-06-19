@@ -6,6 +6,15 @@
 - **Primary spec:** `~/Downloads/DeepSeek_V4.pdf` ("DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence"), read in full this session.
 - **Research input:** deep-research run `wf_d4fafd82-a72` (22 sources, 25 claims verified, 20 confirmed / 5 killed). Cited below as **[R]**.
 
+> **Amended 2026-06-20 — ANE-only.** No MLX/torch twin, no fp64 gradient oracle, no
+> GPU baseline. Correctness is verified **behaviorally** (R0 overfit on the ANE → loss
+> ~0), with each mechanism's effect read on **held-out validation** loss. Every
+> reference below to the "MLX twin / fp64 oracle / R1 grad-diff gate / prototype" is
+> superseded: the gate is R0 overfit, and the mHC "prototype" is now an **ANE-side
+> spike** on the CPU path. (`lilbro/mlx_ref` + the grad-diff tests remain on disk,
+> retained but no longer the gate.) Accepted trade-off: with no gradient oracle, a
+> subtly wrong backward that still trains will not be caught.
+
 ## Provenance convention
 
 Because one research finding collided with my first PDF read, every load-bearing
@@ -23,8 +32,8 @@ Apple Neural Engine** to measure whether DeepSeek-V4 ideas improve the
 small-dense efficiency frontier (PRD). The current trainer
 (`training_dynamic/`) is a plain pre-norm transformer: RMSNorm → MHA/GQA →
 SwiGLU, AdamW or Muon (`--opt`), with attention decomposed as **Q@Kᵀ on ANE →
-mask+softmax on CPU → scores@V on ANE** (`training/README.md`). MTP exists only
-in the MLX twin; there is no ANE MTP path yet.
+mask+softmax on CPU → scores@V on ANE** (`training/README.md`). MTP is not yet
+implemented on the ANE (Tier B lands it).
 
 We want to extend the architecture "as close as possible to real DeepSeek-V4,
 but optimized for the dense little model." DeepSeek-V4 is **V3 + three
@@ -42,9 +51,11 @@ specifies the first one (mHC) in build-ready detail.
   MIL kernels. Dynamic shapes / gather-scatter are the *hard* ANE ops.
 - **CPU is already in the attention loop** (mask+softmax) — cheap CPU-side ops
   (softmax, Sinkhorn on tiny matrices) can land there first, then move to ANE.
-- **Gate discipline (ROADMAP "method invariants"):** a component's ablation number
-  is trusted **only after** it passes the **R1 grad-diff** gate vs the torch fp64 /
-  MLX oracle. Headline metric = tokens-to-target (hardware-independent).
+- **Gate discipline (ANE-only, behavioral):** a component's ablation number is
+  trusted **only after** it passes the **R0 overfit** gate on the ANE (full loop →
+  loss ~0), with its effect read on **held-out validation** loss. Headline metric =
+  tokens-to-target. No gradient oracle — a subtly wrong backward that still trains is
+  not caught (accepted ANE-only trade-off).
 
 ---
 
@@ -74,12 +85,12 @@ user's request ("what would *you* choose for V4 parity"). All seven were accepte
 | Decision | Choice | One-line rationale |
 |---|---|---|
 | **Parity** | Architectural-mechanism parity | Only definition both measurable and honest at 20M. See [CONTEXT.md](../../CONTEXT.md). |
-| **A / C maps** | **Sigmoid** (`A=σ`, `C=2σ`), per V4 PDF | Faithful to V4; the fp64/MLX oracle validates correctness, so the softmax reference code isn't needed. |
+| **A / C maps** | **Sigmoid** (`A=σ`, `C=2σ`), per V4 PDF | Faithful to V4; correctness is checked behaviorally (overfit), so the softmax reference code isn't needed as an oracle. |
 | **Sinkhorn backward** | **Unrolled** through `t_max` | At 4×4 the cost is trivial, so implicit-diff's O(1)-memory win is moot; unrolled is *more* exact at small `t_max` and is what V4 did. Implicit kept as fallback. |
-| **`t_max`** | **20** + doubly-stochasticity convergence check; **log-domain** Sinkhorn | Parity value; convergence risk favors more iters not fewer; cost negligible. Prototype verifies `B` row/col sums ≈1 in fp16. |
+| **`t_max`** | **20** + doubly-stochasticity convergence check; **log-domain** Sinkhorn | Parity value; convergence risk favors more iters not fewer; cost negligible. The ANE-side spike verifies `B` row/col sums ≈1 in fp16. |
 | **`n_hc`** | **4**, exposed as a `Config` knob | Parity value; 4× of a tiny residual is still tiny; trivial to ablate `{2,4}` later. |
-| **Placement** | **CPU-first** for the whole mHC block; ANE by profile | Mirrors the existing mask+softmax decomposition; the iterative 4×4 Sinkhorn fights fixed-shape MIL; lowest new-kernel risk to reach R1-green. |
-| **Sequencing** | **Tier A on ANE ∥ mHC Sinkhorn prototype in the MLX twin** | The prototype is twin-only (non-blocking) and answers the riskiest fp16 unknown early while Tier A delivers quick ANE wins. |
+| **Placement** | **CPU-first** for the whole mHC block; ANE by profile | Mirrors the existing mask+softmax decomposition; the iterative 4×4 Sinkhorn fights fixed-shape MIL; lowest new-kernel risk to reach an overfit-green gate. |
+| **Sequencing** | **Tier A on ANE ∥ mHC Sinkhorn spike on the ANE CPU path** | The spike is isolated (non-blocking) and answers the riskiest fp16 unknown early while Tier A delivers quick ANE wins. |
 
 The build-ready spec below reflects these choices; its earlier "recommendation"
 phrasing now reads as ratified.
@@ -229,30 +240,29 @@ ablation; reuses the existing CPU-in-the-loop decomposition for the 4×4 Sinkhor
 
 **Negative / cost:** `n_hc×` wider residual stream → `n_hc×` activation memory on the
 residual path; new forward + backward + (eventually) MIL kernels; per-sub-layer
-dynamic-param generation adds compute; another twin (MLX) implementation to keep the
-R1 oracle valid.
+dynamic-param generation adds compute.
 
 **Risks (→ Open Questions):** fp16 Sinkhorn *gradient* stability is **unmeasured**;
 `t_max` convergence at small scale is **unvalidated**; the dynamic-generation detail
 should be re-read against the PDF before coding.
 
-### Decision: the Step-2 prototype is now **mandatory**
+### Decision: the Sinkhorn spike is now **mandatory**
 
 Because the fp16/ANE stability of Sinkhorn's backward is inference, not evidence
 [R, INFERENCE], and the unrolled-vs-implicit and `t_max` choices are unsettled:
-**prove log-domain Sinkhorn forward+backward in the MLX twin (the correctness
-oracle) first**, then check the op against the ANE MIL compiler — *before* writing any
-ANE mHC kernel. This was "optional" in the pre-research plan; the evidence promotes it
-to a gate.
+**spike log-domain Sinkhorn forward+backward in isolation on the ANE CPU path
+first** — verify fp16 doubly-stochasticity + a behavioral overfit of an isolated mHC
+block — *before* wiring it into the full mHC residual. This was "optional" in the
+pre-research plan; the evidence promotes it to a gate.
 
 ---
 
-## Open questions (post-grilling — for the prototype, not the design)
+## Open questions (post-grilling — for the spike, not the design)
 
 The design is settled (decisions table above). What remains is **measured**, not decided:
 
 1. **Does `B` converge to doubly-stochastic in fp16 at `t_max=20`?** The non-expansiveness
-   guarantee depends on it. The prototype checks row/col sums ≈1; if not, raise `t_max`
+   guarantee depends on it. The spike checks row/col sums ≈1; if not, raise `t_max`
    or add epsilon-scaling. (Backward stays unrolled; escalate to implicit only if fp16
    gradients misbehave *here*.)
 2. **Re-read PDF §2.2 eqs 3–7 before coding the map generation** — the RMSNorm+low-rank
@@ -270,14 +280,13 @@ backward (unrolled), `t_max` (20), `n_hc` (4), placement (CPU-first), sequencing
 ## Next steps (workflow)
 
 1. ✅ `/grill-with-docs` — **done 2026-06-19**; decisions ratified above; `CONTEXT.md` created.
-2. **Prototype (mandatory, next)** — log-Sinkhorn fwd/bwd (unrolled, `t_max=20`, sigmoid
-   `A`/`C`) in the MLX twin; run the fp16 convergence check (open question 1); then the
-   MIL op-support check. `/handoff` findings back.
-3. **In parallel** — land Tier A stabilizers (Q/KV RMSNorm, attention sink, SwiGLU
+2. ✅ `/to-prd` → `/to-issues` — **done 2026-06-20**; PRD spokvulcan/lil-bro#2 + 9 ANE-only issues (#3–#11).
+3. **ANE-side Sinkhorn spike (mandatory, next)** — log-Sinkhorn fwd/bwd (unrolled, `t_max=20`,
+   sigmoid `A`/`C`) on the ANE CPU path; verify fp16 doubly-stochasticity + a behavioral
+   overfit; then the MIL op-support check (issue #5).
+4. **In parallel** — land Tier A stabilizers (Q/KV RMSNorm, attention sink, SwiGLU
    clamping, partial RoPE, Muon→V4 NS coefficients) as clean R2 ablations on the ANE.
-4. `/to-prd` → `/to-issues` — one issue per Tier-A item + the mHC build, each carrying
-   its R1 grad-diff gate as acceptance criteria.
-5. `/implement` per issue (fresh context) → R1 grad gate green → R2 ablation
+5. `/implement` per issue (fresh context) → **R0 overfit green** → R2 ablation
    (iso-loss, ≥3-point LR sweep, vary exactly one component).
 
 ## References

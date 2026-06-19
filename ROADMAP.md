@@ -2,11 +2,20 @@
 
 Phases are ordered by **dependency, not schedule** — no time estimates by design.
 
+> **Direction update (2026-06-20): ANE-only.** Going forward this is an ANE-only
+> project — no MLX/torch twin, no fp64 gradient oracle, no GPU baseline. Correctness is
+> verified **behaviorally** (R0 overfit on the ANE + held-out validation), not by a
+> gradient diff. The MLX twin and the R1 grad-diff gate below were the Phase-1
+> instrument (built, green — R1 caught a real GQA bug) and **remain in the repo as
+> history**, but are no longer the method. New work follows
+> [ADR 0001](docs/adr/0001-deepseek-v4-for-dense-ane.md).
+
 ## Phase 1 — Systems + architecture ablation (current)
 
 Train a small **dense** TinyStories transformer **from scratch on the ANE**, and
 measure whether DeepSeek-V4 ideas improve the *small-dense-model efficiency
-frontier*. MLX is **not** the trainer — it is the correctness oracle + GPU baseline.
+frontier*. (Phase 1 used an MLX twin as correctness oracle + GPU baseline; that role
+is **superseded** — see the ANE-only direction note above.)
 
 **1a — ANE**
 - ✅ Parameterize model config — one shared `Config` drives the ANE trainer via a
@@ -43,8 +52,8 @@ frontier*. MLX is **not** the trainer — it is the correctness oracle + GPU bas
 - **iso-loss** (compute-to-target); target = baseline knee val loss @ R2
 - **per-config LR sweep (≥3)** — mandatory for a fair optimizer/architecture comparison
 - vary **exactly one** component; hold data / seq / batch-tokens / dims / val-set fixed
-- a config's ablation number is trusted **only after** it passes the R1 correctness gate
-- headline metric is **hardware-independent** (tokens-to-target); energy/wall-clock are systems-side secondaries
+- a config's ablation number is trusted **only after** it passes the R0 overfit gate on the ANE (behavioral; no gradient oracle)
+- headline metric is **tokens-to-target** (held-out val loss); ANE energy/wall-clock/utilization are systems-side secondaries (measured directly, not vs a GPU)
 - measure ANE utilization ourselves — upstream states both "~2–3% of peak" and "15.5%"; trust neither
 
 ## Phase 2 — Tool-first (deferred)
