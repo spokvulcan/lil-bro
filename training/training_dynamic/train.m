@@ -188,13 +188,15 @@ int main(int argc, char *argv[]) {
         float res_alpha = 1.0f / sqrtf(2.0f * NLAYERS);
         float min_lr_frac = 0.1f;
 
-        bool do_resume = false, from_scratch = false;
+        bool do_resume = false, from_scratch = false, overfit = false;
         const char *data_path = DEFAULT_DATA_PATH;
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
             else if (strcmp(argv[i], "--scratch") == 0) from_scratch = true;
+            else if (strcmp(argv[i], "--overfit") == 0) overfit = true;  // R0 gate: pin one batch
             else if (strcmp(argv[i], "--steps") == 0 && i+1<argc) total_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--lr") == 0 && i+1<argc) max_lr = atof(argv[++i]);
+            else if (strcmp(argv[i], "--wd") == 0 && i+1<argc) wd = atof(argv[++i]);
             else if (strcmp(argv[i], "--accum") == 0 && i+1<argc) accum_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--warmup") == 0 && i+1<argc) warmup_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--clip") == 0 && i+1<argc) grad_clip = atof(argv[++i]);
@@ -393,9 +395,9 @@ int main(int argc, char *argv[]) {
         for (int step = start_step; step < total_steps; step++) {
             uint64_t t0, t1, t_step = mach_absolute_time();
 
-            // Sample data
+            // Sample data (overfit: pin one fixed batch so loss must collapse to ~0)
             size_t max_pos = n_tokens - SEQ - 1;
-            size_t pos = (size_t)(drand48() * max_pos);
+            size_t pos = overfit ? 0 : (size_t)(drand48() * max_pos);
             uint16_t *input_tokens = token_data + pos;
             uint16_t *target_tokens_raw = token_data + pos + 1;
 
