@@ -10,7 +10,7 @@
 usable without MLX present.
 """
 
-from .params import MTP_LAMBDA, init_params, is_muon_param, param_spec
+from .params import MTP_LAMBDA, init_params, is_muon_param, param_shapes, param_spec
 from .optim import AdamW, Muon, make_optimizer, optimizer_step
 from .train import train_steps
 
@@ -18,6 +18,7 @@ __all__ = [
     "MTP_LAMBDA",
     "init_params",
     "is_muon_param",
+    "param_shapes",
     "param_spec",
     "AdamW",
     "Muon",

@@ -26,8 +26,8 @@ frontier*. MLX is **not** the trainer — it is the correctness oracle + GPU bas
 ### Scaling ladder (climb only when the gate is green)
 | Rung | Config | Gate |
 |---|---|---|
-| R0 overfit | 1 layer, d=64, byte-256 vocab, seq=64 | ANE loss → ~0 on one repeated batch |
-| R1 grad-diff | same | ANE grads match MLX within tolerance |
+| R0 overfit | 1 layer, d=64, byte-256 vocab, seq=64 | ANE loss → ~0 on one repeated batch — ✅ **GREEN** (`results/r0_overfit.md`) |
+| R1 grad-diff | d=64, 2 layers, MHA + GQA | ANE grads match the torch **fp64** oracle (fp16-scale cosine/rel_l2) — ✅ **GREEN**; caught + fixed a real GQA backward bug (`results/r1_grad_diff.md`) |
 | R2 small | d=256, ~6 layers, 32K vocab, seq=256 | val tracks MLX; coherent stories; **headline ablation here** |
 | R3 110M | d=768, 12 layers, 32K, seq=256 | reproduces upstream; energy verdict |
 

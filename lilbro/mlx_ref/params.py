@@ -55,6 +55,14 @@ def param_spec(cfg: Config) -> list[tuple[str, str]]:
     return spec
 
 
+def param_shapes(cfg: Config) -> dict[str, tuple[int, ...]]:
+    """Ordered ``{name: shape}`` map, the single source of per-parameter shape.
+
+    Same order as ``param_spec``/``init_params``; shared by the twins and the
+    ANE bridge so the flat on-disk layout cannot drift from the model."""
+    return {name: _shape_for(kind, cfg) for name, kind in param_spec(cfg)}
+
+
 # Which parameters get the Muon optimizer: 2D weight matrices, EXCEPT the tied
 # embedding/LM head. Norms (vectors) and the embedding stay on AdamW (per PRD).
 def is_muon_param(name: str, kind: str) -> bool:

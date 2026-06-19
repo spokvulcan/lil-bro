@@ -29,6 +29,12 @@ MTP (`mtp_depth > 0`) follows the DeepSeek-V3 recipe: per-depth module = project
 of `[RMSNorm(h); RMSNorm(Emb(future))]` → a reused transformer block → the shared
 head; combined loss `main + MTP_LAMBDA·mean_k(loss_k)`.
 
-Gates: `tests/test_grad_diff.py` (R1: MLX vs torch, all params within ~1e-4, base
-+ GQA + MTP) and `tests/test_overfit.py` (R0: loss→~0, AdamW + Muon + MTP). The
-ANE backend plugs into both once its runtime-config wiring lands.
+GQA tiling here is **interleaved** (q-head `h` → kv-head `h % kv_heads`), matching
+the ANE forward kernel's `concat(interleave=false)` (`mil_dynamic.h`) — `repeat` /
+`concatenate`, *not* `repeat_interleave`. R1 caught the ANE backward disagreeing
+with its own forward on this; see `results/r1_grad_diff.md`.
+
+Gates: `tests/test_grad_diff.py` (MLX vs torch, all params within ~1e-4, base +
+GQA + MTP — always-on) and `tests/test_overfit.py` (R0: loss→~0, AdamW + Muon +
+MTP). The ANE joins the R1 grad diff at fp16 scale via `lilbro/ane_bridge` (real
+hardware); it has no MTP path, so MTP stays twin-only.

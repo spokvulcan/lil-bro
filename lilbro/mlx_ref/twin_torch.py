@@ -44,7 +44,11 @@ def _rope(x, theta):
 def _attention(q, k, v, cfg: Config):
     # q: [B, H, Sq, hd]; k, v: [B, KVH, Sk, hd]  (Sq == Sk here, self-attn).
     B, H, Sq, hd = q.shape
-    if cfg.gqa_ratio > 1:                          # tile: head h -> kv head h % kv_heads
+    if cfg.gqa_ratio > 1:
+        # Interleaved grouping: q-head h -> kv-head h % kv_heads, i.e. tiled head
+        # order [kv0..kvN, kv0..kvN, ...]. This is what the ANE forward kernel
+        # computes — concat(interleave=false) over gqa_ratio copies of k_rope
+        # (mil_dynamic.h) — so repeat (NOT repeat_interleave) is correct here.
         k = k.repeat(1, cfg.gqa_ratio, 1, 1)
         v = v.repeat(1, cfg.gqa_ratio, 1, 1)
     scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hd))

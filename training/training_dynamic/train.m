@@ -171,6 +171,53 @@ static bool load_checkpoint(const char *path, int *step, int *total_steps, float
     return true;
 }
 
+// ===== R1 bridge: shared init in, raw gradients out =====
+// Flat float32 layout shared with lilbro/ane_bridge (param_spec dense order):
+//   embed[VOCAB*DIM], then per layer {Wq,Wk,Wv,Wo,W1,W2,W3,rms_att,rms_ffn},
+//   then rms_final[DIM]. No MTP (the ANE trainer has no MTP path).
+static bool load_init_weights(const char *path, LayerWeights *lw,
+                              float *rms_final, float *embed) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    size_t want = (size_t)VOCAB*DIM
+                + (size_t)NLAYERS*(WQ_SZ+WK_SZ+WV_SZ+WO_SZ+W1_SZ+W2_SZ+W3_SZ+2*DIM)
+                + DIM;
+    fseek(f, 0, SEEK_END); long have = ftell(f); fseek(f, 0, SEEK_SET);
+    if ((size_t)have != want*4) {
+        printf("  init size mismatch: %ld bytes, expected %zu\n", have, want*4);
+        fclose(f); return false;
+    }
+    size_t n = 0;
+    n += fread(embed, 4, (size_t)VOCAB*DIM, f);
+    for (int L=0; L<NLAYERS; L++) {
+        n += fread(lw[L].Wq,4,WQ_SZ,f); n += fread(lw[L].Wk,4,WK_SZ,f);
+        n += fread(lw[L].Wv,4,WV_SZ,f); n += fread(lw[L].Wo,4,WO_SZ,f);
+        n += fread(lw[L].W1,4,W1_SZ,f); n += fread(lw[L].W2,4,W2_SZ,f);
+        n += fread(lw[L].W3,4,W3_SZ,f);
+        n += fread(lw[L].rms_att,4,DIM,f); n += fread(lw[L].rms_ffn,4,DIM,f);
+    }
+    n += fread(rms_final,4,DIM,f);
+    fclose(f);
+    return n == want;
+}
+
+// Dump raw (unscaled, unclipped) gradients in the same flat layout as the init.
+static void dump_grads(const char *path, LayerGrads *grads,
+                       float *grms_final, float *gembed) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { printf("  cannot open %s for grad dump\n", path); return; }
+    fwrite(gembed,4,(size_t)VOCAB*DIM,f);
+    for (int L=0; L<NLAYERS; L++) {
+        LayerGrads *g = &grads[L];
+        fwrite(g->Wq,4,WQ_SZ,f); fwrite(g->Wk,4,WK_SZ,f);
+        fwrite(g->Wv,4,WV_SZ,f); fwrite(g->Wo,4,WO_SZ,f);
+        fwrite(g->W1,4,W1_SZ,f); fwrite(g->W2,4,W2_SZ,f); fwrite(g->W3,4,W3_SZ,f);
+        fwrite(g->rms_att,4,DIM,f); fwrite(g->rms_ffn,4,DIM,f);
+    }
+    fwrite(grms_final,4,DIM,f);
+    fclose(f);
+}
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         setbuf(stdout, NULL);
@@ -190,6 +237,8 @@ int main(int argc, char *argv[]) {
 
         bool do_resume = false, from_scratch = false, overfit = false;
         const char *data_path = DEFAULT_DATA_PATH;
+        const char *init_path = NULL;        // R1: load shared init from flat binary
+        const char *dump_grads_path = NULL;  // R1: dump raw grads after one batch, exit
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
             else if (strcmp(argv[i], "--scratch") == 0) from_scratch = true;
@@ -201,6 +250,8 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--warmup") == 0 && i+1<argc) warmup_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--clip") == 0 && i+1<argc) grad_clip = atof(argv[++i]);
             else if (strcmp(argv[i], "--data") == 0 && i+1<argc) data_path = argv[++i];
+            else if (strcmp(argv[i], "--init") == 0 && i+1<argc) init_path = argv[++i];
+            else if (strcmp(argv[i], "--dump-grads") == 0 && i+1<argc) dump_grads_path = argv[++i];
         }
         float lr = max_lr;
 
@@ -262,6 +313,15 @@ int main(int argc, char *argv[]) {
                 printf("  ERROR: Pretrained weight loading not implemented for Qwen3. Use --scratch.\n");
                 return 1;
             }
+        }
+
+        // R1: overwrite init with the shared numpy weights (same the twins load),
+        // so the gradient diff compares identical models from identical weights.
+        if (init_path) {
+            if (!load_init_weights(init_path, lw, rms_final, embed)) {
+                printf("Cannot load init weights from %s\n", init_path); return 1;
+            }
+            printf("  [R1: shared init loaded from %s]\n", init_path);
         }
 
         // Precompute transposed weights for forward/backward kernels
@@ -767,6 +827,17 @@ int main(int argc, char *argv[]) {
                 for(int i=0;i<DIM;i++) grms_final[i]*=gsc;
                 vocab_scatter_grads(gembed, gcembed, &vm, DIM);
                 for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed[i]*=gsc;
+
+                // R1 gate: grads are now raw (loss_scale cancelled, LM-head folded
+                // into gembed) but pre-clip and pre-Adam — the exact ∇ the oracle
+                // computes. Dump and exit before any optimizer mutation.
+                if (dump_grads_path) {
+                    dump_grads(dump_grads_path, grads, grms_final, gembed);
+                    printf("  [R1: raw grads dumped to %s after one batch — exiting]\n",
+                           dump_grads_path);
+                    munmap(token_data, data_len); close(data_fd);
+                    return 0;
+                }
 
                 // Global gradient norm
                 float grad_norm_sq = 0;

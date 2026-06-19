@@ -79,12 +79,12 @@ The headline number is **hardware-independent** (tokens-to-target validation los
 
 **Modules tested (the two seams):**
 
-- **Seam 1 — full-step ANE↔MLX gradient diff (primary).** From a shared config + fixed seed + identical init + one fixed batch, run a single forward+backward on both backends; assert all parameter gradients agree within tolerance. A single seam covering base model + Muon + MTP. This *is* the R1 correctness gate.
+- **Seam 1 — full-step gradient diff (primary).** From a shared config + fixed seed + identical init + one fixed batch, run a single forward+backward; assert all parameter gradients agree with the oracle within tolerance. Two consumers of one seam: the **MLX twin** vs torch fp64, always-on (`tests/test_grad_diff.py`, covers base + GQA + MTP); and the **ANE** vs torch fp64 on real hardware via `lilbro/ane_bridge` (`r1_gate.py`, dense base + GQA — the ANE has no MTP path). The diff is on the raw gradient *before* the optimizer step, so it is optimizer-agnostic (Muon vs AdamW change the update, not the gradient; Muon's end-to-end correctness is R0's job). This *is* the R1 correctness gate. *(First ANE run caught a real forward/backward GQA-convention mismatch — see `results/r1_grad_diff.md`.)*
 - **Seam 2 — overfit-one-batch (behavioral, end-to-end).** Train a tiny config on one repeated batch on the ANE; assert loss collapses toward ~0. Black-box, no oracle; exercises the full loop including the Muon update. This *is* the R0 gate.
 
 **Prior art:** the upstream per-kernel unit tests (RMSNorm-backward, fused-backward, QKV, etc.) serve as **failure localizers** when Seam 1 fails — they are *not* the primary seam. The reference-dump comparison pattern (historically used by an upstream inference verify script) informs Seam 1's design; lil-bro builds the gradient-diff harness fresh against MLX.
 
-**Tolerances:** fp32-scale relative error. A genuine backward-pass bug diverges far beyond fp32 rounding noise, so fp32 comparison suffices to catch real errors; PyTorch fp64 is reserved only for ambiguous diffs.
+**Tolerances:** consumer-dependent. The MLX↔torch diff is ≥fp32 on both sides, so it uses **fp32-scale element-wise relative error** (`1e-4`) — a genuine backward bug diverges far beyond fp32 rounding. The **ANE matmuls are fp16**, so its diff against the fp64 oracle uses an **fp16-scale gate instead**: per-parameter cosine (direction) ≥ 0.99 and relative-L2 (magnitude) ≤ 0.10, thresholds set from the measured clean floor (~0.998 / 0.067) and validated to fail the GQA bug (cosine 0.44 / rel_l2 >1.0) by a wide margin. Element-wise fp32 tolerance does **not** apply to fp16 hardware. PyTorch fp64 is the oracle for both.
 
 ## Out of Scope
 

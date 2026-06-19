@@ -50,7 +50,10 @@ def _causal_mask(S):
 
 def _attention(q, k, v, cfg: Config):
     B, H, Sq, hd = q.shape
-    if cfg.gqa_ratio > 1:                          # tile: head h -> kv head h % kv_heads
+    if cfg.gqa_ratio > 1:
+        # Interleaved grouping: q-head h -> kv-head h % kv_heads, tiled head order
+        # [kv0..kvN, kv0..kvN, ...]. Matches the ANE forward kernel's
+        # concat(interleave=false) over gqa_ratio copies of k_rope (mil_dynamic.h).
         k = mx.concatenate([k] * cfg.gqa_ratio, axis=1)
         v = mx.concatenate([v] * cfg.gqa_ratio, axis=1)
     scores = (q @ mx.swapaxes(k, -2, -1)) * (1.0 / math.sqrt(hd))
