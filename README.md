@@ -1,3 +1,24 @@
+# lil-bro
+
+> A research **fork of [maderix/ANE](https://github.com/maderix/ANE)** (MIT). lil-bro trains a small **dense TinyStories** transformer **from scratch on the Apple Neural Engine**, and uses it as a testbed to measure — rigorously — whether **DeepSeek-V4** architectural ideas improve the *small-dense-model efficiency frontier*.
+
+**Thesis:** systems + architecture-ablation. *(The "tool-first / non-hallucinating" model is deferred — see [ROADMAP](ROADMAP.md) Phase 2.)*
+
+**What lil-bro adds over upstream**
+- Parametric model configs (tiny → TinyStories scale) — upstream config is compile-time `#define`s
+- A held-out **validation/eval harness** (`data00` train / `data01` val) — upstream measures train loss only
+- **Muon** optimizer and **Multi-Token Prediction (MTP)** as opt-in ablations
+- An **MLX twin** serving as a **correctness oracle** (gradient diff) *and* **GPU energy baseline**
+- A **tokens-to-target** ablation study of DeepSeek-V4 ideas at small dense scale
+
+**Headline metric:** tokens-to-target validation loss (hardware-independent). **Secondary:** energy- and wall-clock-to-target (ANE vs MLX). **Correctness gate:** ANE gradients match the MLX oracle within tolerance.
+
+**Status:** Phase 1 (baseline → Muon → MTP). See [ROADMAP.md](ROADMAP.md). Attribution & license in [NOTICE](NOTICE) and [LICENSE](LICENSE).
+
+---
+
+*Below is the original upstream README from [maderix/ANE](https://github.com/maderix/ANE):*
+
 # ANE Training — Backpropagation on Apple Neural Engine
 
 Training neural networks directly on Apple's Neural Engine (ANE) via reverse-engineered private APIs. No CoreML training APIs, no Metal, no GPU — pure ANE compute.

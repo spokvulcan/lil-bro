@@ -1,0 +1,19 @@
+lil-bro
+=======
+
+lil-bro is a research fork of maderix/ANE (https://github.com/maderix/ANE),
+used under the MIT License (see LICENSE; Copyright (c) 2026 maderix).
+
+The upstream project demonstrates that *training* is possible on the Apple
+Neural Engine via reverse-engineered private APIs (a proof of concept, by the
+author's own description). lil-bro builds on that foundation and adds:
+
+  - parametric model configs (tiny -> TinyStories scale)
+  - a held-out validation/eval harness (data00 train / data01 val)
+  - the Muon optimizer and Multi-Token Prediction (MTP) as opt-in ablations
+  - an MLX twin used as a correctness oracle (gradient diff) and GPU energy baseline
+  - a tokens-to-target ablation study of DeepSeek-V4 architectural ideas at
+    small dense scale
+
+All original upstream code remains under the MIT License. Modifications and
+additions in this fork are likewise MIT-licensed.
