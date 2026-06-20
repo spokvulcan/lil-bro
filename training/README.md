@@ -15,7 +15,7 @@ Model configs live in `training_dynamic/models/*.h`. To add a new model, create 
 
 ## Architecture
 
-- **SDPA causal mask workaround**: ANE hardware ignores attn_mask — decompose into Q@K^T (ANE conv) + mask+softmax (CPU) + scores@V (ANE conv)
+- **SDPA causal mask workaround**: ANE ignores the native fused-SDPA `attn_mask`. The **dynamic pipeline** keeps the whole SDPA on the ANE by applying the mask as an **additive bias** before softmax (`mil_dynamic.h:188-194`: scores `matmul` → scale → `add(mask)` → `softmax` → scores@V `matmul`). The older **static pipelines** instead decompose into Q@K^T (ANE) + mask+softmax (CPU) + scores@V (ANE).
 - **GQA support**: K/V heads tiled to match Q heads for SDPA, reduced back after backward pass
 
 ## Three Training Pipelines
