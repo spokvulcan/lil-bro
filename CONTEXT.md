@@ -32,3 +32,23 @@ output back to the streams).
 The keep/drop/adapt buckets for V4 components ([ADR 0001](docs/adr/0001-deepseek-v4-for-dense-ane.md)):
 A = cheap stabilizers (adapt now), B = flagship (mHC + ANE MTP), C = CSA/HCA (defer to a
 long-context rung), D = MoE / precision / post-training (drop).
+
+**faithful sample** (vs. *plausible* sample):
+A generated-text sample produced by the *exact* forward the model trains with — for the
+flagship, the FD-verified C `forward_hidden` including the mHC wrapper — so fidelity holds
+*by construction*. Contrast a numpy re-implementation, which can read back plausible text
+while being subtly wrong; that is a *plausible* sample, not a faithful one ([ADR 0002](docs/adr/0002-observing-mhc-flagship-train.md)).
+_Avoid_: "generated text" (unqualified) when the distinction matters.
+
+**in-trainer emission**:
+Running the sampler inside the training loop (a sibling of `eval_val_loss`) and printing
+`[gen step=N] <token-ids>` to stdout, which the dashboard decodes and displays — rather than
+a separate process or a dashboard-side forward. Chosen to avoid a second ANE client
+(contention) and a second mHC implementation (drift).
+
+**build-tied checkpoint**:
+The on-disk format is defined by the *compile-time* knobs, not self-described in the header:
+the loader reads the `#if ATTN_SINK` / `#if QK_NORM` / (v5) `#if N_HC>1` blocks only when
+those knobs are set. A reader (e.g. the dashboard) must therefore be told the build config.
+`CkptHdr.version` 5 carries the mHC block; a mismatched build refuses to load.
+_Avoid_: calling it "self-describing".

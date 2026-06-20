@@ -102,6 +102,12 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 }
 
 // ===== Checkpoint =====
+#if N_HC > 1
+// mHC param block (v5): the per-(layer,sub-layer) maps + AdamW state, appended
+// after embed/sink/qnorm. Defined down in the mHC section; forward-declared here so
+// save/load can call it while the file handle is open. See ADR 0002.
+static void mhc_ckpt_io(FILE *f, int writing);
+#endif
 static void save_checkpoint(const char *path, int step, int total_steps, float lr, float loss,
                             double ct, double cw, int cs, int adam_t,
                             LayerWeights *lw, LayerAdam *la, float *rms_final, AdamState *arms_final,
@@ -115,7 +121,14 @@ static void save_checkpoint(const char *path, int step, int total_steps, float l
                             ) {
     FILE *f = fopen(path, "wb");
     CkptHdr h = {0};
-    h.magic = 0x424C5A54; h.version = 4;
+    // v5 carries the appended mHC block (#if N_HC>1); a vanilla build still stamps v4
+    // so existing v4 checkpoints remain loadable. See ADR 0002 (build-tied format).
+    h.magic = 0x424C5A54;
+#if N_HC > 1
+    h.version = 5;
+#else
+    h.version = 4;
+#endif
     h.step = step; h.total_steps = total_steps;
     h.n_layers = NLAYERS; h.vocab_size = VOCAB; h.dim = DIM;
     h.hidden_dim = HIDDEN; h.n_heads = HEADS; h.seq_len = SEQ;
@@ -155,6 +168,11 @@ static void save_checkpoint(const char *path, int step, int total_steps, float l
     fwrite(knorm_w,4,(size_t)NLAYERS*HD,f);
     fwrite(aknorm->m,4,(size_t)NLAYERS*HD,f); fwrite(aknorm->v,4,(size_t)NLAYERS*HD,f);
 #endif
+#if N_HC > 1
+    // mHC maps + AdamW state (issue #11). Last block, so any reader that stops at
+    // embed (e.g. the dashboard's vanilla loader) stays aligned. See ADR 0002.
+    mhc_ckpt_io(f, 1);
+#endif
     fclose(f);
 }
 
@@ -173,7 +191,13 @@ static bool load_checkpoint(const char *path, int *step, int *total_steps, float
     if (!f) return false;
     CkptHdr h;
     fread(&h, sizeof(h), 1, f);
-    if (h.magic != 0x424C5A54 || h.version != 4) { fclose(f); return false; }
+    // A flagship (N_HC>1) build requires v5 (the mHC block must be present, else the
+    // reads below run off the end); a vanilla build accepts v4 or v5. See ADR 0002.
+#if N_HC > 1
+    if (h.magic != 0x424C5A54 || h.version != 5) { fclose(f); return false; }
+#else
+    if (h.magic != 0x424C5A54 || (h.version != 4 && h.version != 5)) { fclose(f); return false; }
+#endif
     *step = h.step; *total_steps = h.total_steps; *lr = h.lr; *loss = h.loss;
     *ct = h.cum_train; *cw = h.cum_wall; *cs = h.cum_steps; *adam_t = h.adam_t;
     for (int L = 0; L < NLAYERS; L++) {
@@ -204,6 +228,11 @@ static bool load_checkpoint(const char *path, int *step, int *total_steps, float
     fread(aqnorm->m,4,(size_t)NLAYERS*HD,f); fread(aqnorm->v,4,(size_t)NLAYERS*HD,f);
     fread(knorm_w,4,(size_t)NLAYERS*HD,f);
     fread(aknorm->m,4,(size_t)NLAYERS*HD,f); fread(aknorm->v,4,(size_t)NLAYERS*HD,f);
+#endif
+#if N_HC > 1
+    // Read the mHC block into the already-allocated globals (mhc_global_init runs
+    // before load_checkpoint, so this overwrites the fresh random init). See ADR 0002.
+    mhc_ckpt_io(f, 0);
 #endif
     fclose(f);
     return true;
@@ -310,6 +339,30 @@ static MhcAdam mhc_adam_alloc(void){ MhcAdam a;
     a.Wpre=adam_alloc(MHC_M*N_HC); a.Wres=adam_alloc(MHC_M*N_HC*N_HC); a.Wpost=adam_alloc(MHC_M*N_HC);
     a.Spre=adam_alloc(N_HC); a.Sres=adam_alloc(N_HC*N_HC); a.Spost=adam_alloc(N_HC);
     a.a_pre=adam_alloc(1); a.a_res=adam_alloc(1); a.a_post=adam_alloc(1); return a; }
+
+// v5 checkpoint (de)serialization of one (map, adam) pair. MHC_F is float in the
+// trainer, and adam m/v are float, so every field is 4-byte; MHC_IO picks fwrite or
+// fread on `writing`. Weights and AdamW moments interleaved so a partial file is
+// obvious. Field order/sizes mirror mhc_adam_alloc exactly. See ADR 0002.
+static void mhc_one_ckpt_io(MhcMap *m, MhcAdam *a, FILE *f, int writing){
+    #define MHC_IO(p,n) do{ if(writing) fwrite((p),4,(size_t)(n),f); else fread((p),4,(size_t)(n),f); }while(0)
+    MHC_IO(m->Wpre, MHC_M*N_HC);      MHC_IO(a->Wpre.m, MHC_M*N_HC);      MHC_IO(a->Wpre.v, MHC_M*N_HC);
+    MHC_IO(m->Wres, MHC_M*N_HC*N_HC); MHC_IO(a->Wres.m, MHC_M*N_HC*N_HC); MHC_IO(a->Wres.v, MHC_M*N_HC*N_HC);
+    MHC_IO(m->Wpost,MHC_M*N_HC);      MHC_IO(a->Wpost.m,MHC_M*N_HC);      MHC_IO(a->Wpost.v,MHC_M*N_HC);
+    MHC_IO(m->Spre, N_HC);            MHC_IO(a->Spre.m, N_HC);            MHC_IO(a->Spre.v, N_HC);
+    MHC_IO(m->Sres, N_HC*N_HC);       MHC_IO(a->Sres.m, N_HC*N_HC);       MHC_IO(a->Sres.v, N_HC*N_HC);
+    MHC_IO(m->Spost,N_HC);            MHC_IO(a->Spost.m,N_HC);            MHC_IO(a->Spost.v,N_HC);
+    MHC_IO(&m->a_pre, 1);  MHC_IO(a->a_pre.m, 1);  MHC_IO(a->a_pre.v, 1);
+    MHC_IO(&m->a_res, 1);  MHC_IO(a->a_res.m, 1);  MHC_IO(a->a_res.v, 1);
+    MHC_IO(&m->a_post,1);  MHC_IO(a->a_post.m,1);  MHC_IO(a->a_post.v,1);
+    #undef MHC_IO
+}
+static void mhc_ckpt_io(FILE *f, int writing){
+    for(int L=0;L<NLAYERS;L++){
+        mhc_one_ckpt_io(&g_mapA[L], &g_amapA[L], f, writing);
+        mhc_one_ckpt_io(&g_mapF[L], &g_amapF[L], f, writing);
+    }
+}
 
 static float mhc_one_gnsq(const MhcGrad *g){ float s,acc=0;
     vDSP_dotpr(g->Wpre,1,g->Wpre,1,&s,(vDSP_Length)(MHC_M*N_HC)); acc+=s;
@@ -604,6 +657,86 @@ static float eval_val_loss(
     return total_valid > 0 ? (float)(total / total_valid) : 0.0f;
 }
 
+// ===== In-trainer faithful sampler (ADR 0002) =====
+// Sibling of eval_val_loss: same faithful forward_hidden (mHC included #if N_HC>1),
+// but autoregressive over a prompt instead of CE over held-out data. Full-sequence
+// recompute per token — attention is causal and mHC maps are per-position, so the
+// padding tail (positions >= n) cannot leak into the last real position's logits.
+// Emits "[gen step=N] <full-token-ids>"; the dashboard decodes with its tokenizer.
+//
+// Pick the next compact class from the logits column at `pos`: argmax for temp<=0,
+// else temperature softmax over the top_k logits.
+static int mhc_sample_col(const float *logits, int CV, int seq, int pos,
+                          float temperature, int top_k){
+    if (temperature < 1e-4f){
+        int best=0; float bv=logits[(size_t)0*seq+pos];
+        for(int c=1;c<CV;c++){ float v=logits[(size_t)c*seq+pos]; if(v>bv){bv=v;best=c;} }
+        return best;
+    }
+    if (top_k<=0 || top_k>CV) top_k=CV;
+    int   *idx=(int*)malloc((size_t)top_k*sizeof(int));
+    float *val=(float*)malloc((size_t)top_k*sizeof(float));
+    int filled=0, worst_i=0; float worst=0;
+    for(int c=0;c<CV;c++){
+        float v=logits[(size_t)c*seq+pos];
+        if(filled<top_k){
+            idx[filled]=c; val[filled]=v; filled++;
+            if(filled==top_k){ worst=val[0]; worst_i=0;
+                for(int j=1;j<top_k;j++) if(val[j]<worst){worst=val[j];worst_i=j;} }
+        } else if(v>worst){
+            idx[worst_i]=c; val[worst_i]=v;
+            worst=val[0]; worst_i=0;
+            for(int j=1;j<top_k;j++) if(val[j]<worst){worst=val[j];worst_i=j;}
+        }
+    }
+    float mx=-1e30f; for(int j=0;j<top_k;j++){ val[j]/=temperature; if(val[j]>mx)mx=val[j]; }
+    float sum=0; for(int j=0;j<top_k;j++){ val[j]=expf(val[j]-mx); sum+=val[j]; }
+    float r=(float)drand48()*sum, acc=0; int pick=idx[top_k-1];
+    for(int j=0;j<top_k;j++){ acc+=val[j]; if(acc>=r){ pick=idx[j]; break; } }
+    free(idx); free(val);
+    return pick;
+}
+
+static void sample_and_emit(
+    DynLayerKernels *dk, PerLayerSurfaces *pls, PerLayerRequests *plr,
+    LayerWeights *lw, const float *rms_final,
+    const float *embed, const float *cembed, int CV, const VocabMap *vm,
+    LayerActs *acts, float *x_cur, float *xnorm_buf, float *x_final,
+    float *logits, float res_alpha, const float *attn_sink,
+    const float *qnorm_w, const float *knorm_w, dispatch_group_t dw_grp,
+    int step, const int *prompt_ids, int prompt_len, int n_new,
+    float temperature, int top_k)
+{
+    uint16_t in[SEQ];
+    int toks[SEQ];
+    int n = prompt_len > 0 ? prompt_len : 1;
+    if (n > SEQ-1) n = SEQ-1;
+    for (int i=0;i<n;i++) toks[i] = prompt_ids ? prompt_ids[i] : 1;  // default BOS=1
+    for (int g=0; g<n_new && n<SEQ; g++){
+        for (int t=0;t<SEQ;t++) in[t] = (uint16_t)(t<n ? toks[t] : 0);
+        embed_lookup(x_cur, embed, in, DIM, SEQ);
+        forward_hidden(dk, pls, plr, lw, rms_final, acts,
+                       x_cur, xnorm_buf, x_final, res_alpha,
+                       attn_sink, qnorm_w, knorm_w,
+#if N_HC > 1
+                       &g_mhc_val,
+#else
+                       NULL,
+#endif
+                       dw_grp, NULL);
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
+        int c = mhc_sample_col(logits, CV, SEQ, n-1, temperature, top_k);
+        int full = (c>=0 && c<CV) ? vm->compact_to_full[c] : 0;
+        toks[n++] = full;
+        if (full == 2) break;  // EOS
+    }
+    printf("[gen step=%d]", step);
+    for (int i=0;i<n;i++) printf(" %d", toks[i]);
+    printf("\n");
+    fflush(stdout);
+}
+
 #if MTP_DEPTH > 0
 // ===== Multi-Token Prediction orchestration (issue #6, CPU-first) =====
 // Per depth kk (1..MTP_DEPTH): hp = previous hidden truncated to Sk=SEQ-kk; e =
@@ -775,6 +908,9 @@ int main(int argc, char *argv[]) {
         const char *val_data_path = NULL;    // held-out shard for periodic val loss
         int val_every = 0;                   // 0 = no validation
         int val_batches = 20;                // fixed val batch count
+        int sample_every = 0;                // ADR 0002: emit faithful samples every K steps (0=off)
+        int sample_tokens = 64;              // tokens to generate per sample
+        int sample_prompt[SEQ]; int sample_prompt_len = 0;  // default (len 0) = BOS only
         const char *dump_weights_path = NULL;// step-diff: dump post-update weights, exit
         int opt_is_muon = OPTIMIZER_IS_MUON; // optimizer (runtime --opt overrides the header)
         int muon_is_v4 = 1;                  // Muon variant: 1 = V4 hybrid NS + 0.18-RMS rescale (#4),
@@ -796,6 +932,14 @@ int main(int argc, char *argv[]) {
             else if (strcmp(argv[i], "--val-data") == 0 && i+1<argc) val_data_path = argv[++i];
             else if (strcmp(argv[i], "--val-every") == 0 && i+1<argc) val_every = atoi(argv[++i]);
             else if (strcmp(argv[i], "--val-batches") == 0 && i+1<argc) val_batches = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--sample-every") == 0 && i+1<argc) sample_every = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--sample-tokens") == 0 && i+1<argc) sample_tokens = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--sample-prompt-ids") == 0 && i+1<argc) {
+                // space-separated full-vocab token ids (the dashboard tokenizes text → ids)
+                char *s = argv[++i]; sample_prompt_len = 0;
+                for (char *p = strtok(s, " ,"); p && sample_prompt_len < SEQ-1; p = strtok(NULL, " ,"))
+                    sample_prompt[sample_prompt_len++] = atoi(p);
+            }
             else if (strcmp(argv[i], "--dump-weights") == 0 && i+1<argc) dump_weights_path = argv[++i];
             else if (strcmp(argv[i], "--opt") == 0 && i+1<argc) {
                 const char *o = argv[++i];
@@ -867,8 +1011,9 @@ int main(int argc, char *argv[]) {
         // mHC (issue #11): expand the residual stream to N_HC parallel streams and
         // wrap every sub-layer in dynamic input/residual/output maps (A/B/C). Maps,
         // grads, AdamW state, and forward/backward scratch all live in file-scope
-        // globals (see mhc_global_init). Like MTP, not yet checkpoint-persisted — the
-        // R0 gate runs in one process. Inert at N_HC==1 (this whole block compiles out).
+        // globals (see mhc_global_init). Persisted in the v5 checkpoint (ADR 0002):
+        // init here first, then load_checkpoint below overwrites on --resume. Inert at
+        // N_HC==1 (this whole block compiles out).
         mhc_global_init();
         printf("mHC enabled: N_HC=%d streams, %d sub-layer maps (A=sigmoid, B=Sinkhorn, C=2*sigmoid)\n",
                N_HC, 2*NLAYERS);
@@ -1101,6 +1246,17 @@ int main(int argc, char *argv[]) {
                     acts, x_cur, xnorm_buf, x_final, logits, res_alpha,
                     attn_sink, qnorm_w, knorm_w, dw_grp);
                 printf("  [val] step=%d val_loss=%.4f\n", step, vl);
+            }
+
+            // Faithful in-trainer sampling (ADR 0002): same forward the model trains
+            // with, autoregressive over a prompt. Clobbers x_cur/acts/logits like the
+            // val pass; the training forward below recomputes from scratch.
+            if (sample_every > 0 && step % sample_every == 0) {
+                sample_and_emit(&dk, pls, plr, lw, rms_final, embed, cembed, CV, &vm,
+                    acts, x_cur, xnorm_buf, x_final, logits, res_alpha,
+                    attn_sink, qnorm_w, knorm_w, dw_grp, step,
+                    sample_prompt_len > 0 ? sample_prompt : NULL, sample_prompt_len,
+                    sample_tokens, 0.8f, 40);
             }
 
             // Sample data (overfit: pin one fixed batch so loss must collapse to ~0)

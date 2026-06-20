@@ -38,6 +38,18 @@ MODEL_CONFIGS = {
         'ckpt_static': None,
         'ckpt_dynamic': 'training_dynamic/ane_qwen3_06b_dyn_ckpt.bin',
     },
+    # mHC flagship (ADR 0002): gen_r2_small built with -DN_HC=2. Same dims as the
+    # vanilla r2_small, but text comes from the trainer's faithful forward via [gen]
+    # lines (the numpy generator can't represent mHC), so faithful_gen disables it.
+    # Writes a distinct ckpt so the vanilla 152M r2_small artifact isn't clobbered.
+    'r2_small_mhc': {
+        'dim': 256, 'hidden': 768, 'heads': 8, 'kv_heads': 8,
+        'hd': 32, 'seq': 256, 'vocab': 32000, 'nlayers': 6,
+        'ckpt_static': None,
+        'ckpt_dynamic': 'training_dynamic/ane_r2_small_mhc_ckpt.bin',
+        'make_model': 'gen_r2_small', 'extra': '-DN_HC=2', 'n_hc': 2,
+        'ckpt_name': 'ane_r2_small_mhc_ckpt.bin',  # --ckpt, relative to training_dynamic/
+    },
 }
 
 # Active model dims — set in main()
@@ -86,6 +98,10 @@ class State:
         self.gen_step = 0
         self.gen_status = 'idle'
         self.gen_lock = threading.Lock()
+        self.faithful_gen = False   # flagship: text comes from trainer [gen] lines, not numpy
+        self.val_loss = 0.0
+        self.best_val_loss = float('inf')
+        self.val_history = []       # (step, val_loss)
         self.cpu_pct_history = deque(maxlen=300)
         self.mem_mb_history = deque(maxlen=300)
         self.proc_mem_mb_history = deque(maxlen=300)
@@ -355,11 +371,14 @@ RE_ANE_UTIL = re.compile(r'ANE utilization:\s+([\d.]+)%')
 RE_EFFICIENCY = re.compile(r'(Total steps|Wall time|Compile time|Compile|Train time|Avg compile|Avg train|ANE TFLOPS|Total TFLOPS|ANE utilization):?\s+(.+)')
 RE_COMPILED = re.compile(r'Compiled (\d+) kernels in (\d+)ms')
 RE_CKPT_SAVED = re.compile(r'\[ckpt saved, best_loss=([\d.]+)\]')
+RE_GEN = re.compile(r'\[gen step=(\d+)\]\s*([\d ]*)')   # ADR 0002: faithful in-trainer sample
+RE_VAL = re.compile(r'\[val\] step=(\d+) val_loss=([\d.]+)')
 RE_ANE_POWER = re.compile(r'ANE Power:\s+([\d.]+)\s*mW')
 RE_CPU_POWER = re.compile(r'CPU Power:\s+([\d.]+)\s*mW')
 RE_GPU_POWER = re.compile(r'GPU Power:\s+([\d.]+)\s*mW')
 
 USE_WANDB = False
+LOG_FH = None   # optional file handle: mirror every training line for external monitoring
 
 def wandb_log_step():
     """Log current state to wandb. Called after each step update."""
@@ -417,6 +436,11 @@ def _sync_globals_from_parsed(cfg):
 
 def parse_line(line):
     S.logs.append(line)
+    if LOG_FH is not None:
+        try:
+            LOG_FH.write(line + '\n'); LOG_FH.flush()
+        except (ValueError, OSError):
+            pass
     # Parse JSON lines from static pipeline ({"type":"step",...} or {"type":"batch",...})
     stripped = line.strip()
     if stripped.startswith('{'):
@@ -461,6 +485,29 @@ def parse_line(line):
                 return
         except (json.JSONDecodeError, KeyError):
             pass
+    # ADR 0002: faithful sample emitted by the trainer (full-vocab token ids) — decode
+    # here with the tokenizer and feed the Generated Text panel (replaces numpy gen).
+    m = RE_GEN.search(line)
+    if m:
+        ids = [int(t) for t in m[2].split()] if m[2].strip() else []
+        tok = get_tokenizer()
+        # drop BOS(1)/EOS(2) for display; this tokenizer stores spaces literally
+        # (no U+2581 marker), so the replace is a harmless no-op here.
+        text = (''.join(tok.decode(i) for i in ids if i not in (1, 2)).replace('▁', ' ').strip()
+                if tok else ' '.join(str(i) for i in ids))
+        with S.gen_lock:
+            S.gen_text = text
+            S.gen_step = int(m[1])
+            S.gen_status = 'done'
+        return
+    m = RE_VAL.search(line)
+    if m:
+        S.val_loss = float(m[2])
+        S.best_val_loss = min(S.best_val_loss, S.val_loss)
+        S.val_history.append((int(m[1]), S.val_loss))
+        if USE_WANDB:
+            wandb.log({'val/loss': S.val_loss}, step=int(m[1]))
+        return
     m = RE_MODEL_NAME.search(line)
     if m:
         S.model_config['name'] = m[1]
@@ -743,6 +790,10 @@ def draw(term):
     sps = 1000.0 / S.ms_per_step if S.ms_per_step > 0 else 0
     put(sr, mid_x + 1, f' Best: {S.best_loss:.4f}   {S.ms_per_step:.1f}ms/step ({sps:.1f} steps/s)' if S.best_loss < float('inf') else ' Best: --')
     sr += 1
+    # Held-out val loss (faithful forward on data01) — secondary signal (ADR 0002)
+    if S.best_val_loss < float('inf'):
+        put(sr, mid_x + 1, f' Val: {S.val_loss:.4f} (best {S.best_val_loss:.4f}) @ step {S.val_history[-1][0] if S.val_history else 0}', term.cyan)
+        sr += 1
     # TFLOPS
     ane_tflops = S.flops.get('ane_tflops', 0)
     ane_util = S.flops.get('ane_util', 0)
@@ -904,10 +955,12 @@ def set_nonblock(fd):
     fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
 def spawn_training(resume=False, steps=10000, dynamic=False, ane=False, scratch=False,
-                   lr=None, accum=None, no_ane_extras=False, data=None, model=None):
+                   lr=None, accum=None, no_ane_extras=False, data=None, model=None,
+                   make_extra=None, train_extra=None):
     if dynamic:
         model_arg = f' MODEL={model}' if model else ''
-        cmd = f'cd training_dynamic && make{model_arg} 2>&1 && ./train'
+        extra_arg = f' EXTRA={make_extra}' if make_extra else ''
+        cmd = f'cd training_dynamic && make{model_arg}{extra_arg} 2>&1 && ./train'
     elif ane:
         cmd = 'make train_large_ane 2>&1 && ./train_large_ane'
     else:
@@ -924,6 +977,8 @@ def spawn_training(resume=False, steps=10000, dynamic=False, ane=False, scratch=
         cmd += ' --no-ane-extras'
     if data is not None:
         cmd += f' --data {data}'
+    if train_extra:
+        cmd += f' {train_extra}'
     cmd += f' --steps {steps}'
     proc = subprocess.Popen(
         ['bash', '-c', cmd],
@@ -961,6 +1016,13 @@ def main():
     parser.add_argument('--no-generate', action='store_true', help='Disable text generation')
     parser.add_argument('--steps', type=int, default=10000, help='Total steps (default: 10000)')
     parser.add_argument('--data', type=str, default=None, help='Path to training data shard (.bin)')
+    parser.add_argument('--val-data', type=str, default=None, help='Held-out shard for periodic val loss')
+    parser.add_argument('--val-every', type=int, default=500, help='Val loss every N steps (with --val-data)')
+    parser.add_argument('--sample-every', type=int, default=500,
+                        help='Faithful in-trainer sample every N steps (flagship only; ADR 0002)')
+    parser.add_argument('--sample-tokens', type=int, default=64, help='Tokens per sample')
+    parser.add_argument('--log-file', type=str, default=None,
+                        help='Also mirror every training line to this file (external monitoring)')
     parser.add_argument('--wandb', action='store_true', help='Log to Weights & Biases')
     parser.add_argument('--wandb-project', type=str, default='ane-training', help='W&B project name')
     parser.add_argument('--wandb-name', type=str, default=None, help='W&B run name')
@@ -983,8 +1045,26 @@ def main():
     if args.dynamic and not args.resume:
         args.scratch = True
 
-    global CKPT_PATH, USE_WANDB
+    global CKPT_PATH, USE_WANDB, LOG_FH
     CKPT_PATH = cfg['ckpt_dynamic'] if args.dynamic else cfg['ckpt_static']
+    if args.log_file:
+        LOG_FH = open(args.log_file, 'w', buffering=1)
+        LOG_FH.write(f'# dashboard log: model={args.model} steps={args.steps}\n'); LOG_FH.flush()
+
+    # Flagship (mHC): build with EXTRA and let the trainer emit faithful [gen] samples
+    # (the numpy generator can't represent mHC, so faithful_gen disables it). ADR 0002.
+    make_model = cfg.get('make_model', args.model)
+    make_extra = cfg.get('extra')
+    S.faithful_gen = cfg.get('n_hc', 1) > 1
+    train_extra_parts = []
+    if cfg.get('ckpt_name'):
+        train_extra_parts += ['--ckpt', cfg['ckpt_name']]
+    if args.val_data:
+        train_extra_parts += ['--val-data', args.val_data, '--val-every', str(args.val_every)]
+    if S.faithful_gen and args.sample_every > 0:
+        train_extra_parts += ['--sample-every', str(args.sample_every),
+                              '--sample-tokens', str(args.sample_tokens)]
+    train_extra = ' '.join(train_extra_parts)
 
     # Weights & Biases
     if args.wandb:
@@ -1015,7 +1095,8 @@ def main():
     train_proc = spawn_training(resume=args.resume, steps=args.steps, dynamic=args.dynamic,
                                 scratch=args.scratch, lr=args.lr, accum=args.accum,
                                 ane=args.ane, no_ane_extras=args.no_ane_extras,
-                                data=args.data, model=args.model)
+                                data=args.data, model=make_model,
+                                make_extra=make_extra, train_extra=train_extra)
     S.train_pid = train_proc.pid
     procs.append(train_proc)
 
@@ -1030,7 +1111,9 @@ def main():
         if pm_proc:
             procs.append(pm_proc)
 
-    if not args.no_generate:
+    # The numpy generator is a plain-GQA forward — wrong for the mHC flagship, where
+    # faithful text arrives via the trainer's [gen] lines instead (ADR 0002).
+    if not args.no_generate and not S.faithful_gen:
         gen_t = threading.Thread(target=generation_thread, daemon=True)
         gen_t.start()
 
@@ -1160,13 +1243,14 @@ def main():
                         train_proc = spawn_training(resume=True, steps=args.steps, dynamic=args.dynamic,
                                                         lr=args.lr, accum=args.accum,
                                                         ane=args.ane, no_ane_extras=args.no_ane_extras,
-                                                        data=args.data, model=S.active_model)
+                                                        data=args.data, model=make_model,
+                                                        make_extra=make_extra, train_extra=train_extra)
                         S.train_pid = train_proc.pid
                         procs = [p for p in procs if p.poll() is None]
                         procs.append(train_proc)
                         S.logs.append(f'[dashboard] Restarted {S.active_model} with --resume')
                         need_draw = True
-                    elif key == 'g':
+                    elif key == 'g' and not S.faithful_gen:
                         with S.gen_lock:
                             S.gen_status = 'generating'
                             S.gen_step = S.step
