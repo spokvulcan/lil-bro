@@ -236,10 +236,19 @@ sequences — and whether mHC↔Muon redundancy persists there. See Caveats.
 
 ## Reproduce
 
+Harness vendored in [`training/sweep/`](../training/sweep/) (cells + runners; see its
+README). Build artifacts / logs / result TSVs go to a work dir (`/tmp/sweep` by default).
+
 ```bash
-# harness in /tmp/sweep (cells.zsh, run_r0.zsh, run_r2.zsh); binaries built per-cell
-zsh /tmp/sweep/run_r0.zsh                                   # Phase 1: R0 gates
-ACCUM=4 R2_STEPS=800 VAL_EVERY=50 zsh /tmp/sweep/run_r2.zsh # Phase 2: R2 screen
-CELLS_FILE=/tmp/sweep/cells_c.zsh R2SUM=/tmp/sweep/r2c_summary.tsv FORCE_R2=1 \
-  ACCUM=4 R2_STEPS=800 VAL_EVERY=50 zsh /tmp/sweep/run_r2.zsh   # Stage C
+zsh training/sweep/run_r0.zsh                 # Phase 1: R0 correctness gates
+zsh training/sweep/run_r2.zsh                 # Phase 2: R2 fast-learning screen
+# LR-fairness stages (architectures already R0-green -> FORCE_R2=1, separate summary):
+for s in c d e; do
+  CELLS_FILE=training/sweep/cells_$s.zsh R2SUM=/tmp/sweep/r2${s}_summary.tsv FORCE_R2=1 \
+    zsh training/sweep/run_r2.zsh
+done
+# consolidated leaderboard:
+for f in /tmp/sweep/r2*_summary.tsv; do tail -n +2 $f; done | sort -t$'\t' -k5 -g | column -t -s$'\t'
 ```
+
+Default budget is an 800-step / accum-4 *screen* (`R2_STEPS` / `ACCUM` / ... override it).
