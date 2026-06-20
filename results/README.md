@@ -17,7 +17,7 @@ headline below) are the follow-up measurement once a mechanism is R0-green.
 | #5 | mHC Sinkhorn spike (fp16) | ✅ green | τ≥0.5 doubly-stoch.; bwd 7.9e-11; [mhc_sinkhorn_spike.md](mhc_sinkhorn_spike.md) |
 | #7 | Q/KV RMSNorm | ✅ green | R0 on→0.0202 (off→0.0150); FD bwd 5.8e-4; [qk_norm.md](qk_norm.md) |
 | #8 | Attention sink | ✅ green | R0 on→0.0105 (off→0.0150); FD bwd 2.4e-4; [attn_sink.md](attn_sink.md) |
-| #6 | ANE MTP path | ⏳ pending | needs extra MTP block fwd+bwd |
+| #6 | ANE MTP path | ✅ green | R0 combined→0.0105 (off→0.0150); FD e2e 8.2e-5; [mtp.md](mtp.md) |
 | #11 | mHC (flagship) | ⏳ pending | n_hc-wide residual + A/B/C maps (uses #5 recipe) |
 
 ## Headline artifact — per component, vs the dense+AdamW control at best-tuned LR

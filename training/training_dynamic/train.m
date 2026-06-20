@@ -423,6 +423,152 @@ static float eval_val_loss(
     return total_valid > 0 ? (float)(total / total_valid) : 0.0f;
 }
 
+#if MTP_DEPTH > 0
+// ===== Multi-Token Prediction orchestration (issue #6, CPU-first) =====
+// Per depth kk (1..MTP_DEPTH): hp = previous hidden truncated to Sk=SEQ-kk; e =
+// embedding of the kk-shifted target; hk = block(proj·concat(rms_h(hp),rms_e(e)));
+// loss_kk = CE(compact-head(hk), targets[kk:]). Combined term = lambda·mean. The
+// trunk and embed gradients flow back into the shared tables. See cpu_ops.h
+// mtp_block_* and test_mtp.c (FD-verified end-to-end).
+typedef struct { float rms_h[DIM], rms_e[DIM], proj[2*DIM*DIM]; MtpBlock blk; } MtpParams;
+typedef struct { AdamState rms_h, rms_e, proj, Wq, Wk, Wv, Wo, W1, W2, W3, rms_att, rms_ffn; } MtpAdam;
+typedef struct { MtpBlockAct act; float hk[DIM*SEQ], hp[DIM*SEQ], ev[DIM*SEQ], normed[2*DIM*SEQ]; int Sk; } MtpSaved;
+
+static int mtp_ndep(void) { int n=0; for(int kk=1;kk<=MTP_DEPTH;kk++){ if(SEQ-kk>0) n++; } return n; }
+
+// Forward: returns the MTP loss term (lambda*mean of per-depth CE), fills saved[].
+static float mtp_forward(const float *trunk, const uint16_t *tgt_raw, const uint16_t *ctgt,
+                         const float *embed, const float *cembed, int CV, const float *rms_final,
+                         const MtpParams *mtp, float res_alpha, MtpSaved *saved) {
+    int prevS=SEQ, ndep=0; const float *h_prev=trunk; double sum=0;
+    float *nh=(float*)malloc(DIM*SEQ*4),*ne=(float*)malloc(DIM*SEQ*4),*hkin=(float*)malloc(DIM*SEQ*4),*hn=(float*)malloc(DIM*SEQ*4);
+    for (int kk=1; kk<=MTP_DEPTH; kk++) { int Sk=SEQ-kk; if(Sk<=0) break; int d=kk-1; ndep++;
+        const MtpParams *M=&mtp[d]; MtpSaved *sv=&saved[d]; sv->Sk=Sk;
+        for(int i=0;i<DIM;i++) for(int t=0;t<Sk;t++) sv->hp[i*Sk+t]=h_prev[i*prevS+t];
+        for(int i=0;i<DIM;i++) for(int t=0;t<Sk;t++) sv->ev[i*Sk+t]=embed[(size_t)tgt_raw[kk-1+t]*DIM+i];
+        rmsnorm(nh, sv->hp, M->rms_h, DIM, Sk); rmsnorm(ne, sv->ev, M->rms_e, DIM, Sk);
+        for(int i=0;i<DIM;i++) for(int t=0;t<Sk;t++) sv->normed[i*Sk+t]=nh[i*Sk+t];
+        for(int i=0;i<DIM;i++) for(int t=0;t<Sk;t++) sv->normed[(DIM+i)*Sk+t]=ne[i*Sk+t];
+        mtp_mm(hkin, M->proj, sv->normed, DIM, 2*DIM, Sk);
+        mtp_block_fwd(sv->hk, hkin, &M->blk, &sv->act, Sk, res_alpha);
+        rmsnorm(hn, sv->hk, rms_final, DIM, Sk);
+        float *lg=(float*)malloc((size_t)CV*Sk*4); mtp_mm(lg, cembed, hn, CV, DIM, Sk);
+        double L=0;
+        for(int t=0;t<Sk;t++){ int ct=ctgt[kk+t]; if(ct<0||ct>=CV) continue;
+            float m=-1e30f; for(int v=0;v<CV;v++){float l=lg[v*Sk+t]; if(l>m)m=l;}
+            float Z=0; for(int v=0;v<CV;v++) Z+=expf(lg[v*Sk+t]-m); L += (m+logf(Z)) - lg[ct*Sk+t]; }
+        sum += L/Sk; free(lg);
+        h_prev=sv->hk; prevS=Sk;
+    }
+    free(nh);free(ne);free(hkin);free(hn);
+    return ndep ? (float)(MTP_LAMBDA*sum/ndep) : 0.0f;
+}
+
+// Backward: accumulates d_trunk, gembed (input), gcembed/grms_final (head), and
+// the per-depth MTP grads. All scaled by loss_scale to match the main loss.
+static void mtp_backward(const MtpSaved *saved, int ndep, const uint16_t *tgt_raw, const uint16_t *ctgt,
+                         const float *cembed, int CV, const float *rms_final, const MtpParams *mtp,
+                         float res_alpha, float loss_scale,
+                         float *d_trunk, float *gembed, float *gcembed, float *grms_final, MtpParams *gmtp) {
+    float *dh_next=(float*)malloc(DIM*SEQ*4); int dh_next_S=0;
+    for (int d=ndep-1; d>=0; d--) { int kk=d+1; int Sk=saved[d].Sk; const MtpParams *M=&mtp[d]; MtpParams *G=&gmtp[d];
+        const MtpSaved *sv=&saved[d];
+        float *hn=(float*)malloc(DIM*Sk*4); rmsnorm(hn, sv->hk, rms_final, DIM, Sk);
+        float *lg=(float*)malloc((size_t)CV*Sk*4); mtp_mm(lg, cembed, hn, CV, DIM, Sk);
+        float *dlg=(float*)calloc((size_t)CV*Sk,4);
+        float sc = loss_scale * MTP_LAMBDA / (float)(ndep * Sk);
+        for(int t=0;t<Sk;t++){ int ct=ctgt[kk+t]; if(ct<0||ct>=CV) continue;
+            float m=-1e30f; for(int v=0;v<CV;v++){float l=lg[v*Sk+t]; if(l>m)m=l;}
+            float Z=0; for(int v=0;v<CV;v++) Z+=expf(lg[v*Sk+t]-m);
+            for(int v=0;v<CV;v++){ float p=expf(lg[v*Sk+t]-m)/Z; dlg[v*Sk+t]=(p-(v==ct?1.0f:0.0f))*sc; } }
+        mtp_dWacc(gcembed, dlg, hn, CV, DIM, Sk);
+        float *dhn=(float*)malloc(DIM*Sk*4); mtp_mmWT(dhn, cembed, dlg, CV, DIM, Sk);
+        float *dhk=(float*)calloc(DIM*Sk,4); rmsnorm_bwd(dhk, grms_final, dhn, sv->hk, rms_final, DIM, Sk);
+        if (d<ndep-1) for(int i=0;i<DIM;i++) for(int t=0;t<dh_next_S;t++) dhk[i*Sk+t]+=dh_next[i*dh_next_S+t];
+        float *dhkin=(float*)calloc(DIM*Sk,4); mtp_block_bwd(dhkin, dhk, &M->blk, &sv->act, &G->blk, Sk, res_alpha);
+        mtp_dWacc(G->proj, dhkin, sv->normed, DIM, 2*DIM, Sk);
+        float *dnormed=(float*)malloc((size_t)2*DIM*Sk*4); mtp_mmWT(dnormed, M->proj, dhkin, DIM, 2*DIM, Sk);
+        float *dnh=(float*)malloc(DIM*Sk*4),*dne=(float*)malloc(DIM*Sk*4);
+        for(int i=0;i<DIM;i++) for(int t=0;t<Sk;t++){ dnh[i*Sk+t]=dnormed[i*Sk+t]; dne[i*Sk+t]=dnormed[(DIM+i)*Sk+t]; }
+        float *dhp=(float*)calloc(DIM*Sk,4); rmsnorm_bwd(dhp, G->rms_h, dnh, sv->hp, M->rms_h, DIM, Sk);
+        float *de=(float*)calloc(DIM*Sk,4); rmsnorm_bwd(de, G->rms_e, dne, sv->ev, M->rms_e, DIM, Sk);
+        for(int i=0;i<DIM;i++) for(int t=0;t<Sk;t++) gembed[(size_t)tgt_raw[kk-1+t]*DIM+i]+=de[i*Sk+t];
+        if (d==0) for(int i=0;i<DIM;i++) for(int t=0;t<Sk;t++) d_trunk[i*SEQ+t]+=dhp[i*Sk+t];
+        else { memcpy(dh_next, dhp, DIM*Sk*4); dh_next_S=Sk; }
+        free(hn);free(lg);free(dlg);free(dhn);free(dhk);free(dhkin);free(dnormed);free(dnh);free(dne);free(dhp);free(de);
+    }
+    free(dh_next);
+}
+
+static void mtp_alloc_init(MtpParams *w, MtpParams *g, MtpAdam *a, uint64_t *rng) {
+    for (int d=0; d<MTP_DEPTH; d++) {
+        for (int i=0;i<DIM;i++){ w[d].rms_h[i]=1.0f; w[d].rms_e[i]=1.0f; w[d].blk.rms_att[i]=1.0f; w[d].blk.rms_ffn[i]=1.0f; }
+        // Small random init for the 2D matrices (proj + block), like the main weights.
+        float *mats[]={w[d].proj,w[d].blk.Wq,w[d].blk.Wk,w[d].blk.Wv,w[d].blk.Wo,w[d].blk.W1,w[d].blk.W2,w[d].blk.W3};
+        size_t ns[]={2*DIM*DIM,Q_DIM*DIM,KV_DIM*DIM,KV_DIM*DIM,DIM*Q_DIM,HIDDEN*DIM,DIM*HIDDEN,HIDDEN*DIM};
+        for (int k=0;k<8;k++) for (size_t i=0;i<ns[k];i++){
+            *rng = *rng*6364136223846793005ULL+1442695040888963407ULL;
+            float u = ((float)((*rng>>40)&0xFFFFFF)/16777216.0f)*2.0f-1.0f;
+            mats[k][i] = u*0.02f;
+        }
+        memset(&g[d], 0, sizeof(MtpParams));
+        a[d].rms_h=adam_alloc(DIM); a[d].rms_e=adam_alloc(DIM);
+        a[d].proj=adam_alloc(2*DIM*DIM);
+        a[d].Wq=adam_alloc(Q_DIM*DIM); a[d].Wk=adam_alloc(KV_DIM*DIM); a[d].Wv=adam_alloc(KV_DIM*DIM);
+        a[d].Wo=adam_alloc(DIM*Q_DIM); a[d].W1=adam_alloc(HIDDEN*DIM); a[d].W2=adam_alloc(DIM*HIDDEN);
+        a[d].W3=adam_alloc(HIDDEN*DIM); a[d].rms_att=adam_alloc(DIM); a[d].rms_ffn=adam_alloc(DIM);
+    }
+}
+
+// Enumerate one depth's 12 tensors in a fixed order (matches mtp_adam_list and the
+// AdamState fields). is2d marks the Muon-eligible 2D matrices (proj + block W*).
+static int mtp_tensors(MtpParams *p, float **ptr, size_t *sz, int *is2d, int *rows, int *cols) {
+    int n=0;
+    #define MT(P,S,D,R,C) do{ ptr[n]=(P); sz[n]=(S); is2d[n]=(D); rows[n]=(R); cols[n]=(C); n++; }while(0)
+    MT(p->rms_h,DIM,0,0,0); MT(p->rms_e,DIM,0,0,0); MT(p->proj,2*DIM*DIM,1,DIM,2*DIM);
+    MT(p->blk.Wq,Q_DIM*DIM,1,Q_DIM,DIM); MT(p->blk.Wk,KV_DIM*DIM,1,KV_DIM,DIM); MT(p->blk.Wv,KV_DIM*DIM,1,KV_DIM,DIM);
+    MT(p->blk.Wo,DIM*Q_DIM,1,DIM,Q_DIM); MT(p->blk.W1,HIDDEN*DIM,1,HIDDEN,DIM); MT(p->blk.W2,DIM*HIDDEN,1,DIM,HIDDEN);
+    MT(p->blk.W3,HIDDEN*DIM,1,HIDDEN,DIM); MT(p->blk.rms_att,DIM,0,0,0); MT(p->blk.rms_ffn,DIM,0,0,0);
+    #undef MT
+    return n;
+}
+static int mtp_adam_list(MtpAdam *a, AdamState **as) {
+    int n=0; as[n++]=&a->rms_h; as[n++]=&a->rms_e; as[n++]=&a->proj;
+    as[n++]=&a->Wq; as[n++]=&a->Wk; as[n++]=&a->Wv; as[n++]=&a->Wo;
+    as[n++]=&a->W1; as[n++]=&a->W2; as[n++]=&a->W3; as[n++]=&a->rms_att; as[n++]=&a->rms_ffn;
+    return n;
+}
+static void mtp_scale_grads(MtpParams *g, float s) {
+    for (int d=0; d<MTP_DEPTH; d++){ float *gp[12]; size_t sz[12]; int a[12],b[12],c[12];
+        int n=mtp_tensors(&g[d],gp,sz,a,b,c); for(int k=0;k<n;k++) for(size_t i=0;i<sz[k];i++) gp[k][i]*=s; }
+}
+static float mtp_gradnorm_sq(MtpParams *g) {
+    double s=0; for (int d=0; d<MTP_DEPTH; d++){ float *gp[12]; size_t sz[12]; int a[12],b[12],c[12];
+        int n=mtp_tensors(&g[d],gp,sz,a,b,c); for(int k=0;k<n;k++) for(size_t i=0;i<sz[k];i++) s+=(double)gp[k][i]*gp[k][i]; }
+    return (float)s;
+}
+static void mtp_zero_grads(MtpParams *g) { for (int d=0; d<MTP_DEPTH; d++) memset(&g[d],0,sizeof(MtpParams)); }
+
+// Optimizer step over all MTP params: Muon for the 2D matrices (when opt_is_muon),
+// AdamW for the norm vectors (always, no weight decay) — mirrors the main loop.
+static void mtp_optimize(MtpParams *w, MtpParams *g, MtpAdam *a, int opt_is_muon, int muon_is_v4,
+                         int adam_t, float lr, float b1, float b2, float eps, float wd) {
+    for (int d=0; d<MTP_DEPTH; d++) {
+        float *wp[12],*gp[12]; size_t sz[12],szg[12]; int is2d[12],rows[12],cols[12],ig[12],rg[12],cg[12];
+        AdamState *as[12];
+        mtp_tensors(&w[d], wp, sz, is2d, rows, cols);
+        mtp_tensors(&g[d], gp, szg, ig, rg, cg);
+        mtp_adam_list(&a[d], as);
+        for (int k=0; k<12; k++) {
+            if (is2d[k] && opt_is_muon)
+                muon_update(wp[k], gp[k], as[k]->m, rows[k], cols[k], lr, 0.95f, 1, muon_is_v4, wd);
+            else
+                adam_update(wp[k], gp[k], as[k], adam_t, lr, b1, b2, eps, is2d[k]?wd:0.0f);
+        }
+    }
+}
+#endif // MTP_DEPTH > 0
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         setbuf(stdout, NULL);
@@ -523,6 +669,18 @@ int main(int argc, char *argv[]) {
 #if QK_NORM
         AdamState aqnorm = adam_alloc((size_t)NLAYERS*HD);
         AdamState aknorm = adam_alloc((size_t)NLAYERS*HD);
+#endif
+#if MTP_DEPTH > 0
+        // MTP blocks (issue #6): one extra transformer block + glue per depth.
+        // Heap-allocated (each MtpParams is a full block; large at big rungs).
+        // Not yet threaded into the checkpoint — resume reinitialises them (the R0
+        // gate runs in one process; ANE-by-profile + persistence are follow-ups).
+        MtpParams *mtpw = (MtpParams*)malloc(MTP_DEPTH*sizeof(MtpParams));
+        MtpParams *mtpg = (MtpParams*)malloc(MTP_DEPTH*sizeof(MtpParams));
+        MtpAdam   *mtpa = (MtpAdam*)malloc(MTP_DEPTH*sizeof(MtpAdam));
+        { uint64_t mtp_rng = 0x9E3779B97F4A7C15ULL; mtp_alloc_init(mtpw, mtpg, mtpa, &mtp_rng); }
+        MtpSaved *mtp_saved = (MtpSaved*)malloc(MTP_DEPTH*sizeof(MtpSaved));
+        int mtp_nd = mtp_ndep();
 #endif
 
         double cum_train=0, cum_wall=0; int cum_steps=0;
@@ -779,6 +937,21 @@ int main(int argc, char *argv[]) {
                         CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
             float loss = cross_entropy_loss(dlogits, logits, ctargets, CV, SEQ);
             t_cls += tb_ms(mach_absolute_time() - t0);
+
+#if MTP_DEPTH > 0
+            // MTP forward (uses the trunk x_cur) + its backward, run as a
+            // self-contained unit before the main backward's async dW so the
+            // shared-grad writes (gcembed/gembed/grms_final) don't race. Produces
+            // mtp_dtrunk, injected into dy after the main final-RMSNorm backward.
+            t0 = mach_absolute_time();
+            float mtp_term = mtp_forward(x_cur, target_tokens_raw, ctargets, embed, cembed, CV,
+                                         rms_final, mtpw, res_alpha, mtp_saved);
+            loss += mtp_term;
+            float *mtp_dtrunk = (float*)calloc(SEQ*DIM, 4);
+            mtp_backward(mtp_saved, mtp_nd, target_tokens_raw, ctargets, cembed, CV, rms_final,
+                         mtpw, res_alpha, loss_scale, mtp_dtrunk, gembed, gcembed, grms_final, mtpg);
+            t_cls += tb_ms(mach_absolute_time() - t0);
+#endif
             last_loss = loss;
 
             // ===== BACKWARD =====
@@ -801,6 +974,12 @@ int main(int argc, char *argv[]) {
             rmsnorm_bwd(dx_rms_final, grms_final, dy, x_cur, rms_final, DIM, SEQ);
             memcpy(dy, dx_rms_final, SEQ*DIM*4);
             free(dx_rms_final);
+
+#if MTP_DEPTH > 0
+            // Trunk gradient from the MTP heads (depth-1 hp = trunk[:S1]).
+            for (int i=0;i<SEQ*DIM;i++) dy[i] += mtp_dtrunk[i];
+            free(mtp_dtrunk);
+#endif
 
             // ===== BACKWARD (28 layers, reverse) =====
             for (int L=NLAYERS-1; L>=0; L--) {
@@ -1103,6 +1282,9 @@ int main(int argc, char *argv[]) {
 #if QK_NORM
                 for(int i=0;i<NLAYERS*HD;i++){ gqnorm[i]*=gsc; gknorm[i]*=gsc; }
 #endif
+#if MTP_DEPTH > 0
+                mtp_scale_grads(mtpg, gsc);
+#endif
                 vocab_scatter_grads(gembed, gcembed, &vm, DIM);
                 for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed[i]*=gsc;
 
@@ -1144,6 +1326,9 @@ int main(int argc, char *argv[]) {
 #if QK_NORM
                   vDSP_dotpr(gqnorm,1,gqnorm,1,&s,(vDSP_Length)(NLAYERS*HD)); grad_norm_sq+=s;
                   vDSP_dotpr(gknorm,1,gknorm,1,&s,(vDSP_Length)(NLAYERS*HD)); grad_norm_sq+=s;
+#endif
+#if MTP_DEPTH > 0
+                  grad_norm_sq += mtp_gradnorm_sq(mtpg);
 #endif
                 }
                 float grad_norm = sqrtf(grad_norm_sq);
@@ -1189,6 +1374,9 @@ int main(int argc, char *argv[]) {
 #if QK_NORM
                     vDSP_vsmul(gqnorm,1,&clip_scale,gqnorm,1,(vDSP_Length)(NLAYERS*HD));
                     vDSP_vsmul(gknorm,1,&clip_scale,gknorm,1,(vDSP_Length)(NLAYERS*HD));
+#endif
+#if MTP_DEPTH > 0
+                    mtp_scale_grads(mtpg, clip_scale);
 #endif
                 }
 
@@ -1259,6 +1447,10 @@ int main(int argc, char *argv[]) {
                 adam_update(qnorm_w, gqnorm, &aqnorm, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
                 adam_update(knorm_w, gknorm, &aknorm, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
 #endif
+#if MTP_DEPTH > 0
+                mtp_optimize(mtpw, mtpg, mtpa, opt_is_muon, muon_is_v4, adam_t,
+                             lr, adam_b1, adam_b2, adam_eps, wd);
+#endif
                 free(cembed);
                 cembed = vocab_compact_embed(embed, &vm, DIM);
 
@@ -1281,6 +1473,9 @@ int main(int argc, char *argv[]) {
 #if QK_NORM
                 memset(gqnorm, 0, (size_t)NLAYERS*HD*4);
                 memset(gknorm, 0, (size_t)NLAYERS*HD*4);
+#endif
+#if MTP_DEPTH > 0
+                mtp_zero_grads(mtpg);
 #endif
                 memset(gembed, 0, (size_t)VOCAB*DIM*4);
                 memset(gcembed, 0, (size_t)CV*DIM*4);

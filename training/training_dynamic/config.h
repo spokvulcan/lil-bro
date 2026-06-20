@@ -47,6 +47,10 @@
 #ifndef N_HC
 #define N_HC 1
 #endif
+// MTP auxiliary-loss weight (issue #6). Mirrors lilbro/mlx_ref/params.py MTP_LAMBDA.
+#ifndef MTP_LAMBDA
+#define MTP_LAMBDA 0.3f
+#endif
 // Dims actually rotated by RoPE: min(HD, ROPE_ROTARY_DIMS). Identity when HD <=
 // ROPE_ROTARY_DIMS (every current ladder rung). Mirrors Config.rope_rotary_eff.
 #define ROPE_ROTARY_EFF (HD < ROPE_ROTARY_DIMS ? HD : ROPE_ROTARY_DIMS)

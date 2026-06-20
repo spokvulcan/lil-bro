@@ -379,6 +379,102 @@ static void attn_cpu_backward(const float *da, const float *Q, const float *K, c
     free(Qn);free(Kn);free(rq);free(rk);free(dQn);free(dKn);
 }
 
+#if MTP_DEPTH > 0
+// ===== Multi-Token Prediction (MTP) — CPU-first (issue #6) =====
+// A faithful CPU implementation of an extra transformer block per MTP depth plus
+// the V4 MTP glue (rms_h/rms_e, concat, proj, per-depth head). CPU-first per ADR
+// 0001 (lowest new-kernel risk to reach the overfit-green gate; the Sk<SEQ
+// truncation fights the fixed-shape MIL kernels). Matmuls use cblas; attention
+// reuses attn_cpu_forward/backward (no sink/qk-norm). All [C,S] channel-major.
+// FD-verified end-to-end (test_mtp.c): grads of the combined MTP loss w.r.t. all
+// MTP params + the shared trunk/embed match central differences to ~8e-5.
+
+static void mtp_mm(float *o, const float *W, const float *x, int O, int IN, int S) {     // o = W@x
+    cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasNoTrans,O,S,IN,1.0f,W,IN,x,S,0.0f,o,S); }
+static void mtp_mmWT(float *o, const float *W, const float *dy, int O, int IN, int S) {   // o = Wᵀ@dy
+    cblas_sgemm(CblasRowMajor,CblasTrans,CblasNoTrans,IN,S,O,1.0f,W,IN,dy,S,0.0f,o,S); }
+static void mtp_dWacc(float *dW, const float *dy, const float *x, int O, int IN, int S) { // dW += dy@xᵀ
+    cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,O,IN,S,1.0f,dy,S,x,S,1.0f,dW,IN); }
+
+// Interleaved RoPE on [C,S] (C=nheads*HD), partial-aware (matches the ANE kernel
+// and rope_backward_inplace). inv=0 forward rotation, inv=1 inverse (transpose).
+static void rope_apply(float *x, int C, int S, int inv) {
+    int nh = C/HD, norot = HD - ROPE_ROTARY_EFF;
+    for (int h=0; h<nh; h++) for (int i=0; i<HD/2; i++) {
+        if (2*i < norot) continue;
+        float freq = 1.0f/powf(10000.0f, 2.0f*i/(float)HD);
+        for (int p=0; p<S; p++) {
+            float th=p*freq, c=cosf(th), s=sinf(th);
+            int a=(h*HD+2*i)*S+p, b=(h*HD+2*i+1)*S+p; float v0=x[a], v1=x[b];
+            if (!inv) { x[a]=v0*c - v1*s; x[b]=v0*s + v1*c; }
+            else      { x[a]=v0*c + v1*s; x[b]=-v0*s + v1*c; }
+        }
+    }
+}
+
+// One transformer block, identical to the main block (mlx_ref _block): pre-norm
+// attention with residual scale res_alpha, then pre-norm SwiGLU FFN.
+typedef struct { float Wq[Q_DIM*DIM],Wk[KV_DIM*DIM],Wv[KV_DIM*DIM],Wo[DIM*Q_DIM];
+    float W1[HIDDEN*DIM],W2[DIM*HIDDEN],W3[HIDDEN*DIM],rms_att[DIM],rms_ffn[DIM]; } MtpBlock;
+typedef struct { float xin[DIM*SEQ],h1[DIM*SEQ],Q[Q_DIM*SEQ],K[KV_DIM*SEQ],V[KV_DIM*SEQ],
+    attn[Q_DIM*SEQ],x2[DIM*SEQ],h2[DIM*SEQ],g1[HIDDEN*SEQ],g3[HIDDEN*SEQ],
+    silu[HIDDEN*SEQ],gate[HIDDEN*SEQ]; } MtpBlockAct;
+
+static void mtp_block_fwd(float *out, const float *x, const MtpBlock *b, MtpBlockAct *a,
+                          int S, float res_alpha) {
+    memcpy(a->xin, x, DIM*S*4);
+    rmsnorm(a->h1, x, b->rms_att, DIM, S);
+    mtp_mm(a->Q,b->Wq,a->h1,Q_DIM,DIM,S); mtp_mm(a->K,b->Wk,a->h1,KV_DIM,DIM,S); mtp_mm(a->V,b->Wv,a->h1,KV_DIM,DIM,S);
+    rope_apply(a->Q,Q_DIM,S,0); rope_apply(a->K,KV_DIM,S,0);
+    attn_cpu_forward(a->attn, a->Q, a->K, a->V, NULL, NULL, NULL, S);
+    float *o = (float*)malloc(DIM*S*4);
+    mtp_mm(o,b->Wo,a->attn,DIM,Q_DIM,S);
+    for (int i=0;i<DIM*S;i++) a->x2[i]=x[i]+res_alpha*o[i];
+    rmsnorm(a->h2, a->x2, b->rms_ffn, DIM, S);
+    mtp_mm(a->g1,b->W1,a->h2,HIDDEN,DIM,S); mtp_mm(a->g3,b->W3,a->h2,HIDDEN,DIM,S);
+    for (int i=0;i<HIDDEN*S;i++){ float s=1.0f/(1.0f+expf(-a->g1[i])); a->silu[i]=a->g1[i]*s; a->gate[i]=a->silu[i]*a->g3[i]; }
+    float *ff = (float*)malloc(DIM*S*4);
+    mtp_mm(ff,b->W2,a->gate,DIM,HIDDEN,S);
+    for (int i=0;i<DIM*S;i++) out[i]=a->x2[i]+res_alpha*ff[i];
+    free(o); free(ff);
+}
+
+// dout -> dx (accumulated +=), weight grads accumulated into gb.
+static void mtp_block_bwd(float *dx, const float *dout, const MtpBlock *b, const MtpBlockAct *a,
+                          MtpBlock *gb, int S, float res_alpha) {
+    size_t sd=DIM*S, sh=HIDDEN*S, sq=Q_DIM*S, sk=KV_DIM*S;
+    float *dx2=(float*)malloc(sd*4),*dff=(float*)malloc(sd*4),*dgate=(float*)malloc(sh*4);
+    float *dsilu=(float*)malloc(sh*4),*dg1=(float*)malloc(sh*4),*dg3=(float*)malloc(sh*4);
+    float *dh2=(float*)malloc(sd*4),*dattn=(float*)malloc(sq*4),*dQ=(float*)malloc(sq*4);
+    float *dK=(float*)malloc(sk*4),*dV=(float*)malloc(sk*4),*dh1=(float*)malloc(sd*4);
+    float *dxa=(float*)calloc(sd,4),*tmp=(float*)malloc(sd*4),*dxin=(float*)malloc(sd*4),*do_=(float*)malloc(sd*4);
+    // out = x2 + ra*ff
+    for (size_t i=0;i<sd;i++){ dx2[i]=dout[i]; dff[i]=res_alpha*dout[i]; }
+    mtp_dWacc(gb->W2,dff,a->gate,DIM,HIDDEN,S); mtp_mmWT(dgate,b->W2,dff,DIM,HIDDEN,S);
+    for (size_t i=0;i<sh;i++){ float s=1.0f/(1.0f+expf(-a->g1[i]));
+        dsilu[i]=dgate[i]*a->g3[i]; dg3[i]=dgate[i]*a->silu[i];
+        dg1[i]=dsilu[i]*(s*(1.0f+a->g1[i]*(1.0f-s))); }
+    mtp_dWacc(gb->W1,dg1,a->h2,HIDDEN,DIM,S); mtp_dWacc(gb->W3,dg3,a->h2,HIDDEN,DIM,S);
+    mtp_mmWT(dh2,b->W1,dg1,HIDDEN,DIM,S); mtp_mmWT(tmp,b->W3,dg3,HIDDEN,DIM,S);
+    for (size_t i=0;i<sd;i++) dh2[i]+=tmp[i];
+    rmsnorm_bwd(dxa,gb->rms_ffn,dh2,a->x2,b->rms_ffn,DIM,S);
+    for (size_t i=0;i<sd;i++) dx2[i]+=dxa[i];
+    // x2 = xin + ra*o
+    for (size_t i=0;i<sd;i++){ dxin[i]=dx2[i]; do_[i]=res_alpha*dx2[i]; }
+    mtp_dWacc(gb->Wo,do_,a->attn,DIM,Q_DIM,S); mtp_mmWT(dattn,b->Wo,do_,DIM,Q_DIM,S);
+    attn_cpu_backward(dattn,a->Q,a->K,a->V,NULL,NULL,NULL,dQ,dK,dV,NULL,NULL,NULL,S);
+    rope_apply(dQ,Q_DIM,S,1); rope_apply(dK,KV_DIM,S,1);
+    mtp_dWacc(gb->Wq,dQ,a->h1,Q_DIM,DIM,S); mtp_dWacc(gb->Wk,dK,a->h1,KV_DIM,DIM,S); mtp_dWacc(gb->Wv,dV,a->h1,KV_DIM,DIM,S);
+    mtp_mmWT(dh1,b->Wq,dQ,Q_DIM,DIM,S);
+    mtp_mmWT(tmp,b->Wk,dK,KV_DIM,DIM,S); for (size_t i=0;i<sd;i++) dh1[i]+=tmp[i];
+    mtp_mmWT(tmp,b->Wv,dV,KV_DIM,DIM,S); for (size_t i=0;i<sd;i++) dh1[i]+=tmp[i];
+    memset(dxa,0,sd*4); rmsnorm_bwd(dxa,gb->rms_att,dh1,a->xin,b->rms_att,DIM,S);
+    for (size_t i=0;i<sd;i++) dx[i]+= dxin[i]+dxa[i];
+    free(dx2);free(dff);free(dgate);free(dsilu);free(dg1);free(dg3);free(dh2);
+    free(dattn);free(dQ);free(dK);free(dV);free(dh1);free(dxa);free(tmp);free(dxin);free(do_);
+}
+#endif // MTP_DEPTH > 0
+
 // RoPE backward (in-place): inverse rotation on dQ/dK gradients
 // Data layout: [DIM, SEQ] channel-first, DIM = nheads * hd
 static void rope_backward_inplace(float *dx, int seq, int dim, int hd) {
