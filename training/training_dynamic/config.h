@@ -35,6 +35,11 @@
 #ifndef QK_NORM
 #define QK_NORM 0
 #endif
+// RMSNorm epsilon, shared by QK-norm and the RMSNorm path. emit_c.py emits this
+// for generated headers; fallback keeps hand-written model headers compiling.
+#ifndef NORM_EPS
+#define NORM_EPS 1e-05f
+#endif
 #ifndef ATTN_SINK
 #define ATTN_SINK 0
 #endif
@@ -46,6 +51,11 @@
 #endif
 #ifndef N_HC
 #define N_HC 1
+#endif
+// Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
+// emits this for generated headers; fallback keeps hand-written headers compiling.
+#ifndef MTP_DEPTH
+#define MTP_DEPTH 0
 #endif
 // MTP auxiliary-loss weight (issue #6). Mirrors lilbro/mlx_ref/params.py MTP_LAMBDA.
 #ifndef MTP_LAMBDA
