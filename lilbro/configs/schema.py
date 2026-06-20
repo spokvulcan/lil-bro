@@ -180,6 +180,13 @@ LADDER: dict[str, Config] = {
         name="r2_small", dim=256, n_layers=6, n_heads=8, head_dim=32,
         seq=256, vocab=32000, hidden=768, batch_tokens=256 * 16, lr=3e-4,
     ),
+    # Scale-ladder intermediate rung (~42M): width+depth scale-up of r2_small at the
+    # SAME head_dim=32, so r2_small -> r2_mid isolates dim/depth (no head-dim confound);
+    # r3_110m is the rung that also widens head_dim. (scale ladder; ADR 0003)
+    "r2_mid": Config(
+        name="r2_mid", dim=512, n_layers=8, n_heads=16, head_dim=32,
+        seq=256, vocab=32000, hidden=1408, batch_tokens=256 * 16, lr=3e-4,
+    ),
     # R3 confirmation + energy rung: ~stories110m.
     "r3_110m": Config(
         name="r3_110m", dim=768, n_layers=12, n_heads=12, head_dim=64,
