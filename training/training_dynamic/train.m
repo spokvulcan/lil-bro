@@ -3,6 +3,7 @@
 // Compile kernels ONCE at startup, update weights via IOSurface every step.
 #include "mil_dynamic.h"
 #include "cpu_ops.h"
+#include "mhc.h"     // manifold-constrained hyper-connections (issue #11); inert at N_HC==1
 
 // Dynamic kernel set per layer
 typedef struct {
@@ -283,25 +284,158 @@ static void dump_flat_weights(const char *path, LayerWeights *lw,
 // tm=NULL to skip timing accumulation.
 typedef struct { double rms, ane_fwd, io_fwd, cblas_wait; } FwdTiming;
 
+#if N_HC > 1
+// ===== mHC state (issue #11) — file-scope so forward_hidden and the optimizer reach it =====
+// Per (layer, sub-layer) map params + grads + AdamW state; heap tapes/wide buffers.
+// All guarded #if N_HC>1, so N_HC==1 (default) compiles this away byte-for-byte.
+typedef struct { AdamState Wpre,Wres,Wpost,Spre,Sres,Spost,a_pre,a_res,a_post; } MhcAdam;
+typedef struct {
+    MhcMap  *mapA, *mapF;       // [NLAYERS] attention- and FFN-sublayer maps (→ globals)
+    MhcTape *tpA,  *tpF;        // tapes: [NLAYERS] when save, else [1] scratch (validation)
+    float  **XwA, **XwF;        // [NLAYERS] saved input wide streams (NULL when !save)
+    float  **FoutA,**FoutF;     // [NLAYERS] saved sub-layer outputs (NULL when !save)
+    float   *Xw, *Xw2, *Ftmp;   // running wide stream (double-buffered) + Fout scratch
+    int      save;              // 1 training (index by L, persist), 0 validation (scratch)
+} MhcFwd;
+
+static MhcMap  g_mapA[NLAYERS], g_mapF[NLAYERS];
+static MhcGrad g_gmapA[NLAYERS], g_gmapF[NLAYERS];
+static MhcAdam g_amapA[NLAYERS], g_amapF[NLAYERS];
+static MhcFwd  g_mhc_train, g_mhc_val;
+static float  *g_zero_ds;       // [DIM*SEQ] zeros — FFN residual base (mHC adds its own)
+// backward scratch (allocated in mhc_global_init)
+static float  *g_dXw, *g_dXw2, *g_dfout, *g_dB_a, *g_dC_a, *g_dB_f, *g_dC_f;
+
+static MhcAdam mhc_adam_alloc(void){ MhcAdam a;
+    a.Wpre=adam_alloc(MHC_M*N_HC); a.Wres=adam_alloc(MHC_M*N_HC*N_HC); a.Wpost=adam_alloc(MHC_M*N_HC);
+    a.Spre=adam_alloc(N_HC); a.Sres=adam_alloc(N_HC*N_HC); a.Spost=adam_alloc(N_HC);
+    a.a_pre=adam_alloc(1); a.a_res=adam_alloc(1); a.a_post=adam_alloc(1); return a; }
+
+static float mhc_one_gnsq(const MhcGrad *g){ float s,acc=0;
+    vDSP_dotpr(g->Wpre,1,g->Wpre,1,&s,(vDSP_Length)(MHC_M*N_HC)); acc+=s;
+    vDSP_dotpr(g->Wres,1,g->Wres,1,&s,(vDSP_Length)(MHC_M*N_HC*N_HC)); acc+=s;
+    vDSP_dotpr(g->Wpost,1,g->Wpost,1,&s,(vDSP_Length)(MHC_M*N_HC)); acc+=s;
+    vDSP_dotpr(g->Spre,1,g->Spre,1,&s,(vDSP_Length)N_HC); acc+=s;
+    vDSP_dotpr(g->Sres,1,g->Sres,1,&s,(vDSP_Length)(N_HC*N_HC)); acc+=s;
+    vDSP_dotpr(g->Spost,1,g->Spost,1,&s,(vDSP_Length)N_HC); acc+=s;
+    acc += g->a_pre*g->a_pre + g->a_res*g->a_res + g->a_post*g->a_post; return acc; }
+static float mhc_gradnorm_sq(void){ float a=0;
+    for(int L=0;L<NLAYERS;L++){ a+=mhc_one_gnsq(&g_gmapA[L]); a+=mhc_one_gnsq(&g_gmapF[L]); } return a; }
+
+static void mhc_one_scale(MhcGrad *g, float s){
+    vDSP_vsmul(g->Wpre,1,&s,g->Wpre,1,(vDSP_Length)(MHC_M*N_HC));
+    vDSP_vsmul(g->Wres,1,&s,g->Wres,1,(vDSP_Length)(MHC_M*N_HC*N_HC));
+    vDSP_vsmul(g->Wpost,1,&s,g->Wpost,1,(vDSP_Length)(MHC_M*N_HC));
+    vDSP_vsmul(g->Spre,1,&s,g->Spre,1,(vDSP_Length)N_HC);
+    vDSP_vsmul(g->Sres,1,&s,g->Sres,1,(vDSP_Length)(N_HC*N_HC));
+    vDSP_vsmul(g->Spost,1,&s,g->Spost,1,(vDSP_Length)N_HC);
+    g->a_pre*=s; g->a_res*=s; g->a_post*=s; }
+static void mhc_scale_grads(float s){
+    for(int L=0;L<NLAYERS;L++){ mhc_one_scale(&g_gmapA[L],s); mhc_one_scale(&g_gmapF[L],s); } }
+
+static void mhc_zero_grads(void){
+    for(int L=0;L<NLAYERS;L++){ mhc_grad_zero(&g_gmapA[L]); mhc_grad_zero(&g_gmapF[L]); } }
+
+// AdamW: W* with weight decay; S*/alpha bias-like (no wd). The auxiliary map
+// projections use AdamW on both --opt paths (the main 2D-Muon rule doesn't extend
+// to these tiny dynamic generators; AdamW is lower-risk for the R0 gate).
+static void mhc_one_opt(MhcMap *w, MhcGrad *g, MhcAdam *a, int t,
+                        float lr,float b1,float b2,float eps,float wd){
+    adam_update(w->Wpre, g->Wpre, &a->Wpre, t,lr,b1,b2,eps,wd);
+    adam_update(w->Wres, g->Wres, &a->Wres, t,lr,b1,b2,eps,wd);
+    adam_update(w->Wpost,g->Wpost,&a->Wpost,t,lr,b1,b2,eps,wd);
+    adam_update(w->Spre, g->Spre, &a->Spre, t,lr,b1,b2,eps,0.0f);
+    adam_update(w->Sres, g->Sres, &a->Sres, t,lr,b1,b2,eps,0.0f);
+    adam_update(w->Spost,g->Spost,&a->Spost,t,lr,b1,b2,eps,0.0f);
+    adam_update(&w->a_pre, &g->a_pre, &a->a_pre, t,lr,b1,b2,eps,0.0f);
+    adam_update(&w->a_res, &g->a_res, &a->a_res, t,lr,b1,b2,eps,0.0f);
+    adam_update(&w->a_post,&g->a_post,&a->a_post,t,lr,b1,b2,eps,0.0f); }
+static void mhc_optimize(int t, float lr,float b1,float b2,float eps,float wd){
+    for(int L=0;L<NLAYERS;L++){
+        mhc_one_opt(&g_mapA[L],&g_gmapA[L],&g_amapA[L],t,lr,b1,b2,eps,wd);
+        mhc_one_opt(&g_mapF[L],&g_gmapF[L],&g_amapF[L],t,lr,b1,b2,eps,wd); } }
+
+// Worst |rowsum-1|,|colsum-1| of B over every saved training tape (acceptance:
+// the Sinkhorn residual map must stay doubly-stochastic — #5 proved τ≥0.5, t_max=20
+// holds even in fp16; here the CPU maps are fp32, a tighter bound).
+static float mhc_ds_max_train(void){
+    float w=0; for(int L=0;L<NLAYERS;L++){
+        float a=mhc_ds_residual(&g_mhc_train.tpA[L]); if(a>w)w=a;
+        float f=mhc_ds_residual(&g_mhc_train.tpF[L]); if(f>w)w=f; } return w; }
+
+static float *mhc_xw_alloc(void){ return (float*)malloc((size_t)N_HC*DIM*SEQ*4); }
+// Allocate maps/grads/adam + the two forward bundles (training saves per-layer,
+// validation reuses a single scratch tape) + backward scratch.
+static void mhc_global_init(void){
+    unsigned seed=0x1234567u;
+    for(int L=0;L<NLAYERS;L++){
+        g_mapA[L]=mhc_map_alloc(); mhc_map_init(&g_mapA[L],&seed);
+        g_mapF[L]=mhc_map_alloc(); mhc_map_init(&g_mapF[L],&seed);
+        g_gmapA[L]=mhc_grad_alloc(); g_gmapF[L]=mhc_grad_alloc();
+        g_amapA[L]=mhc_adam_alloc(); g_amapF[L]=mhc_adam_alloc();
+    }
+    g_zero_ds=(float*)calloc((size_t)DIM*SEQ,4);
+    g_mhc_train.mapA=g_mapA; g_mhc_train.mapF=g_mapF; g_mhc_train.save=1;
+    g_mhc_train.tpA=(MhcTape*)malloc((size_t)NLAYERS*sizeof(MhcTape));
+    g_mhc_train.tpF=(MhcTape*)malloc((size_t)NLAYERS*sizeof(MhcTape));
+    g_mhc_train.XwA=(float**)malloc(NLAYERS*sizeof(float*));
+    g_mhc_train.XwF=(float**)malloc(NLAYERS*sizeof(float*));
+    g_mhc_train.FoutA=(float**)malloc(NLAYERS*sizeof(float*));
+    g_mhc_train.FoutF=(float**)malloc(NLAYERS*sizeof(float*));
+    for(int L=0;L<NLAYERS;L++){
+        g_mhc_train.XwA[L]=mhc_xw_alloc(); g_mhc_train.XwF[L]=mhc_xw_alloc();
+        g_mhc_train.FoutA[L]=(float*)malloc((size_t)DIM*SEQ*4);
+        g_mhc_train.FoutF[L]=(float*)malloc((size_t)DIM*SEQ*4);
+    }
+    g_mhc_train.Xw=mhc_xw_alloc(); g_mhc_train.Xw2=mhc_xw_alloc();
+    g_mhc_train.Ftmp=(float*)malloc((size_t)DIM*SEQ*4);
+    g_mhc_val.mapA=g_mapA; g_mhc_val.mapF=g_mapF; g_mhc_val.save=0;
+    g_mhc_val.tpA=(MhcTape*)malloc(sizeof(MhcTape));
+    g_mhc_val.tpF=(MhcTape*)malloc(sizeof(MhcTape));
+    g_mhc_val.XwA=g_mhc_val.XwF=g_mhc_val.FoutA=g_mhc_val.FoutF=NULL;
+    g_mhc_val.Xw=mhc_xw_alloc(); g_mhc_val.Xw2=mhc_xw_alloc();
+    g_mhc_val.Ftmp=(float*)malloc((size_t)DIM*SEQ*4);
+    g_dXw=mhc_xw_alloc(); g_dXw2=mhc_xw_alloc(); g_dfout=(float*)malloc((size_t)DIM*SEQ*4);
+    g_dB_a=(float*)malloc((size_t)SEQ*N_HC*N_HC*4); g_dC_a=(float*)malloc((size_t)SEQ*N_HC*4);
+    g_dB_f=(float*)malloc((size_t)SEQ*N_HC*N_HC*4); g_dC_f=(float*)malloc((size_t)SEQ*N_HC*4);
+}
+#endif // N_HC > 1
+
 static void forward_hidden(
     DynLayerKernels *dk, PerLayerSurfaces *pls, PerLayerRequests *plr,
     LayerWeights *lw, const float *rms_final, LayerActs *acts,
     float *x_cur, float *xnorm_buf, float *x_final, float res_alpha,
     const float *attn_sink, const float *qnorm_w, const float *knorm_w,
-    dispatch_group_t dw_grp, FwdTiming *tm)
+    void *mhc, dispatch_group_t dw_grp, FwdTiming *tm)
 {
-    (void)attn_sink; (void)qnorm_w; (void)knorm_w;
+    (void)attn_sink; (void)qnorm_w; (void)knorm_w; (void)mhc;
+#if N_HC > 1
+    MhcFwd *mf = (MhcFwd*)mhc;
+    // Entry: broadcast the embedded hidden into all N_HC streams (X_l ∈ ℝ^{N_HC×d}).
+    for (int i=0;i<N_HC;i++) memcpy(mf->Xw + (size_t)i*DIM*SEQ, x_cur, (size_t)DIM*SEQ*4);
+#endif
     uint64_t t0;
     double r_rms = 0, r_ane = 0, r_io = 0, r_wait = 0;
     for (int L = 0; L < NLAYERS; L++) {
         LayerActs *ac = &acts[L];
+#if N_HC > 1
+        // mHC attention sub-layer: collapse the N_HC streams to the attention input
+        // u = A·X (ac->layer_in), generating + saving the per-position A/B/C maps.
+        MhcTape *tpa = mf->save ? &mf->tpA[L] : &mf->tpA[0];
+        if (mf->save) memcpy(mf->XwA[L], mf->Xw, (size_t)N_HC*DIM*SEQ*4);
+        t0 = mach_absolute_time();
+        mhc_premap(mf->Xw, &mf->mapA[L], tpa, ac->layer_in);
+        rmsnorm(xnorm_buf, ac->layer_in, lw[L].rms_att, DIM, SEQ);
+        r_rms += tb_ms(mach_absolute_time() - t0);
+#else
         memcpy(ac->layer_in, x_cur, SEQ*DIM*4);
 
         // RMSNorm1 (CPU)
         t0 = mach_absolute_time();
         rmsnorm(xnorm_buf, x_cur, lw[L].rms_att, DIM, SEQ);
-        memcpy(ac->xnorm, xnorm_buf, SEQ*DIM*4);
         r_rms += tb_ms(mach_absolute_time() - t0);
+#endif
+        memcpy(ac->xnorm, xnorm_buf, SEQ*DIM*4);
 
         // Wait for any pending dW cblas (empty during validation)
         t0 = mach_absolute_time();
@@ -352,6 +486,27 @@ static void forward_hidden(
         io_read_dyn(dk->woFwd->ioOut, ac->o_out, DIM, SEQ);
         r_io += tb_ms(mach_absolute_time() - t0);
 
+#if N_HC > 1
+        // mHC attention recombine: X ← B·X + C⊗(res_alpha·o_out). Then collapse the
+        // updated streams to the FFN input u = A·X (ac->x2), and run the FFN with a
+        // ZERO residual base so the kernel returns the bare res_alpha·ffn (mHC adds
+        // its own residual via the next recombine).
+        t0 = mach_absolute_time();
+        for (int i=0;i<DIM*SEQ;i++) mf->Ftmp[i] = res_alpha * ac->o_out[i];
+        if (mf->save) memcpy(mf->FoutA[L], mf->Ftmp, (size_t)DIM*SEQ*4);
+        mhc_recombine(mf->Xw, mf->Ftmp, tpa, mf->Xw2);
+        { float *sw=mf->Xw; mf->Xw=mf->Xw2; mf->Xw2=sw; }
+        MhcTape *tpf = mf->save ? &mf->tpF[L] : &mf->tpF[0];
+        if (mf->save) memcpy(mf->XwF[L], mf->Xw, (size_t)N_HC*DIM*SEQ*4);
+        mhc_premap(mf->Xw, &mf->mapF[L], tpf, ac->x2);
+        rmsnorm(ac->x2norm, ac->x2, lw[L].rms_ffn, DIM, SEQ);
+        r_rms += tb_ms(mach_absolute_time() - t0);
+
+        // Fused FFN (ANE) — zero residual base
+        t0 = mach_absolute_time();
+        write_ffn_fused_acts(pls[L].ffnFused_in, ac->x2norm, g_zero_ds);
+        r_io += tb_ms(mach_absolute_time() - t0);
+#else
         // CPU: scaled residual + RMSNorm2
         t0 = mach_absolute_time();
         vDSP_vsma(ac->o_out, 1, &res_alpha, x_cur, 1, ac->x2, 1, (vDSP_Length)(SEQ*DIM));
@@ -362,6 +517,7 @@ static void forward_hidden(
         t0 = mach_absolute_time();
         write_ffn_fused_acts(pls[L].ffnFused_in, ac->x2norm, ac->x2);
         r_io += tb_ms(mach_absolute_time() - t0);
+#endif
         t0 = mach_absolute_time();
         ane_eval_req(dk->ffnFused, plr[L].ffnFused);
         r_ane += tb_ms(mach_absolute_time() - t0);
@@ -370,13 +526,32 @@ static void forward_hidden(
         IOSurfaceLock(dk->ffnFused->ioOut, kIOSurfaceLockReadOnly, NULL);
         _Float16 *ffn_out = (_Float16*)IOSurfaceGetBaseAddress(dk->ffnFused->ioOut);
         off = 0;
+#if N_HC > 1
+        cvt_f16_f32(mf->Ftmp,    ffn_out + off, DIM*SEQ);     off += DIM*SEQ;  // bare res_alpha·ffn
+#else
         cvt_f16_f32(x_cur,       ffn_out + off, DIM*SEQ);     off += DIM*SEQ;
+#endif
         cvt_f16_f32(ac->h1,      ffn_out + off, HIDDEN*SEQ);  off += HIDDEN*SEQ;
         cvt_f16_f32(ac->h3,      ffn_out + off, HIDDEN*SEQ);  off += HIDDEN*SEQ;
         cvt_f16_f32(ac->silu_out,ffn_out + off, HIDDEN*SEQ);
         IOSurfaceUnlock(dk->ffnFused->ioOut, kIOSurfaceLockReadOnly, NULL);
         r_io += tb_ms(mach_absolute_time() - t0);
+#if N_HC > 1
+        // mHC FFN recombine: X ← B·X + C⊗(res_alpha·ffn).
+        t0 = mach_absolute_time();
+        if (mf->save) memcpy(mf->FoutF[L], mf->Ftmp, (size_t)DIM*SEQ*4);
+        mhc_recombine(mf->Xw, mf->Ftmp, tpf, mf->Xw2);
+        { float *sw=mf->Xw; mf->Xw=mf->Xw2; mf->Xw2=sw; }
+        r_rms += tb_ms(mach_absolute_time() - t0);
+#endif
     }
+
+#if N_HC > 1
+    // Exit: collapse the N_HC streams back to a single hidden (sum) before the head.
+    memset(x_cur, 0, (size_t)DIM*SEQ*4);
+    for (int i=0;i<N_HC;i++)
+        vDSP_vadd(x_cur, 1, mf->Xw + (size_t)i*DIM*SEQ, 1, x_cur, 1, (vDSP_Length)(DIM*SEQ));
+#endif
 
     // Final RMSNorm (CPU)
     t0 = mach_absolute_time();
@@ -413,7 +588,13 @@ static float eval_val_loss(
         embed_lookup(x_cur, embed, in, DIM, SEQ);
         forward_hidden(dk, pls, plr, lw, rms_final, acts,
                        x_cur, xnorm_buf, x_final, res_alpha,
-                       attn_sink, qnorm_w, knorm_w, dw_grp, NULL);
+                       attn_sink, qnorm_w, knorm_w,
+#if N_HC > 1
+                       &g_mhc_val,
+#else
+                       NULL,
+#endif
+                       dw_grp, NULL);
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     CV, SEQ, DIM, 1.0f, cembed, DIM, x_final, SEQ, 0.0f, logits, SEQ);
         int nv = 0;
@@ -682,6 +863,16 @@ int main(int argc, char *argv[]) {
         MtpSaved *mtp_saved = (MtpSaved*)malloc(MTP_DEPTH*sizeof(MtpSaved));
         int mtp_nd = mtp_ndep();
 #endif
+#if N_HC > 1
+        // mHC (issue #11): expand the residual stream to N_HC parallel streams and
+        // wrap every sub-layer in dynamic input/residual/output maps (A/B/C). Maps,
+        // grads, AdamW state, and forward/backward scratch all live in file-scope
+        // globals (see mhc_global_init). Like MTP, not yet checkpoint-persisted — the
+        // R0 gate runs in one process. Inert at N_HC==1 (this whole block compiles out).
+        mhc_global_init();
+        printf("mHC enabled: N_HC=%d streams, %d sub-layer maps (A=sigmoid, B=Sinkhorn, C=2*sigmoid)\n",
+               N_HC, 2*NLAYERS);
+#endif
 
         double cum_train=0, cum_wall=0; int cum_steps=0;
         float resume_loss = 0;
@@ -929,7 +1120,20 @@ int main(int argc, char *argv[]) {
             // ===== FORWARD (shared with validation; see forward_hidden) =====
             forward_hidden(&dk, pls, plr, lw, rms_final, acts,
                            x_cur, xnorm_buf, x_final, res_alpha,
-                           attn_sink, qnorm_w, knorm_w, dw_grp, &ft);
+                           attn_sink, qnorm_w, knorm_w,
+#if N_HC > 1
+                           &g_mhc_train,
+#else
+                           NULL,
+#endif
+                           dw_grp, &ft);
+
+#if N_HC > 1
+            // Acceptance probe: the Sinkhorn residual maps B must be doubly-stochastic.
+            if (step == start_step)
+                printf("  mHC doubly-stochasticity: max|rowsum-1|,|colsum-1| over all B = %.2e\n",
+                       mhc_ds_max_train());
+#endif
 
             // Classifier + loss (CPU)
             t0 = mach_absolute_time();
@@ -981,11 +1185,25 @@ int main(int argc, char *argv[]) {
             free(mtp_dtrunk);
 #endif
 
+#if N_HC > 1
+            // mHC exit-collapse backward: collapse was x = Σ_i X[i], so each stream's
+            // gradient is dy (broadcast). dXw carries the wide gradient through the loop.
+            for (int i=0;i<N_HC;i++) memcpy(g_dXw + (size_t)i*DIM*SEQ, dy, (size_t)DIM*SEQ*4);
+#endif
+
             // ===== BACKWARD (28 layers, reverse) =====
             for (int L=NLAYERS-1; L>=0; L--) {
                 LayerActs *ac = &acts[L];
                 LayerGrads *gr = &grads[L];
 
+#if N_HC > 1
+                // mHC FFN recombine backward: dXw (grad wrt layer output) → dXw2 (grad
+                // wrt the pre-FFN wide stream) + dfout + dB_f/dC_f. The FFN sub-layer
+                // backward then runs on dfout as its upstream (dFout_ffn).
+                mhc_recombine_bwd(g_mhc_train.XwF[L], g_mhc_train.FoutF[L], &g_mhc_train.tpF[L],
+                                  g_dXw, g_dXw2, g_dfout, g_dB_f, g_dC_f);
+                memcpy(dy, g_dfout, (size_t)SEQ*DIM*4);
+#endif
                 // dffn = alpha * dy
                 vDSP_vsmul(dy, 1, &res_alpha, dffn, 1, (vDSP_Length)(SEQ*DIM));
 
@@ -1076,11 +1294,24 @@ int main(int argc, char *argv[]) {
                     free(capt_dffn); free(capt_silu); free(capt_dh1); free(capt_dh3); free(capt_x2n);
                 });
 
-                // RMSNorm2 backward
+                // RMSNorm2 backward.  In mHC mode ac->x2 is the collapsed FFN input
+                // u_ffn, so dx2 = du_ffn (no plain residual passthrough — the mHC
+                // recombine carries the stream coupling instead).
                 t0 = mach_absolute_time();
                 memset(dx2, 0, SEQ*DIM*4);
                 rmsnorm_bwd(dx2, gr->rms_ffn, dx_ffn, ac->x2, lw[L].rms_ffn, DIM, SEQ);
+#if N_HC > 1
+                // FFN premap backward: du_ffn (dx2) + dB_f/dC_f → map grads + dXw2.
+                // Then attention recombine backward: dXw2 → dXw (grad wrt pre-attn wide
+                // stream) + dfout(attn). dx2 becomes dFout_attn for the attention path.
+                mhc_premap_bwd(g_mhc_train.XwF[L], &g_mapF[L], &g_mhc_train.tpF[L],
+                               dx2, g_dB_f, g_dC_f, g_dXw2, &g_gmapF[L]);
+                mhc_recombine_bwd(g_mhc_train.XwA[L], g_mhc_train.FoutA[L], &g_mhc_train.tpA[L],
+                                  g_dXw2, g_dXw, g_dfout, g_dB_a, g_dC_a);
+                memcpy(dx2, g_dfout, (size_t)SEQ*DIM*4);
+#else
                 for(int i=0;i<SEQ*DIM;i++) dx2[i] += dy[i];
+#endif
                 t_rms_bwd += tb_ms(mach_absolute_time() - t0);
 
                 // Wo^T backward (ANE): alpha*dx2 @ Wo → da[Q_DIM]
@@ -1227,14 +1458,31 @@ int main(int argc, char *argv[]) {
                 for(int i=0; i<SEQ*DIM; i++) dx_attn[i] += dx_kv[i];
                 free(dx_kv);
 
-                // RMSNorm1 backward
+                // RMSNorm1 backward.  In mHC mode ac->layer_in is the collapsed
+                // attention input u_attn, so dx_rms1 = du_attn (no plain passthrough).
                 t0 = mach_absolute_time();
                 float *dx_rms1 = (float*)calloc(SEQ*DIM, 4);
                 rmsnorm_bwd(dx_rms1, gr->rms_att, dx_attn, ac->layer_in, lw[L].rms_att, DIM, SEQ);
+#if N_HC > 1
+                // Attention premap backward: du_attn (dx_rms1) + dB_a/dC_a → map grads
+                // + dXw. dXw now holds the gradient wrt this layer's input wide stream,
+                // carrying to the next (earlier) reverse layer.
+                mhc_premap_bwd(g_mhc_train.XwA[L], &g_mapA[L], &g_mhc_train.tpA[L],
+                               dx_rms1, g_dB_a, g_dC_a, g_dXw, &g_gmapA[L]);
+#else
                 for(int i=0;i<SEQ*DIM;i++) dy[i] = dx_rms1[i] + dx2[i];
+#endif
                 free(dx_rms1);
                 t_rms_bwd += tb_ms(mach_absolute_time() - t0);
             }
+
+#if N_HC > 1
+            // mHC entry-broadcast backward: the embed went into every stream, so the
+            // embedding gradient is the sum over streams of the input wide gradient.
+            memset(dy, 0, (size_t)DIM*SEQ*4);
+            for (int i=0;i<N_HC;i++)
+                vDSP_vadd(dy, 1, g_dXw + (size_t)i*DIM*SEQ, 1, dy, 1, (vDSP_Length)(DIM*SEQ));
+#endif
 
             // Embedding backward
             dispatch_group_wait(dw_grp, DISPATCH_TIME_FOREVER);
@@ -1285,6 +1533,9 @@ int main(int argc, char *argv[]) {
 #if MTP_DEPTH > 0
                 mtp_scale_grads(mtpg, gsc);
 #endif
+#if N_HC > 1
+                mhc_scale_grads(gsc);
+#endif
                 vocab_scatter_grads(gembed, gcembed, &vm, DIM);
                 for(size_t i=0;i<(size_t)VOCAB*DIM;i++) gembed[i]*=gsc;
 
@@ -1329,6 +1580,9 @@ int main(int argc, char *argv[]) {
 #endif
 #if MTP_DEPTH > 0
                   grad_norm_sq += mtp_gradnorm_sq(mtpg);
+#endif
+#if N_HC > 1
+                  grad_norm_sq += mhc_gradnorm_sq();
 #endif
                 }
                 float grad_norm = sqrtf(grad_norm_sq);
@@ -1377,6 +1631,9 @@ int main(int argc, char *argv[]) {
 #endif
 #if MTP_DEPTH > 0
                     mtp_scale_grads(mtpg, clip_scale);
+#endif
+#if N_HC > 1
+                    mhc_scale_grads(clip_scale);
 #endif
                 }
 
@@ -1451,6 +1708,9 @@ int main(int argc, char *argv[]) {
                 mtp_optimize(mtpw, mtpg, mtpa, opt_is_muon, muon_is_v4, adam_t,
                              lr, adam_b1, adam_b2, adam_eps, wd);
 #endif
+#if N_HC > 1
+                mhc_optimize(adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
+#endif
                 free(cembed);
                 cembed = vocab_compact_embed(embed, &vm, DIM);
 
@@ -1476,6 +1736,9 @@ int main(int argc, char *argv[]) {
 #endif
 #if MTP_DEPTH > 0
                 mtp_zero_grads(mtpg);
+#endif
+#if N_HC > 1
+                mhc_zero_grads();
 #endif
                 memset(gembed, 0, (size_t)VOCAB*DIM*4);
                 memset(gcembed, 0, (size_t)CV*DIM*4);
