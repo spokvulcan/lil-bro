@@ -16,21 +16,36 @@ CELLS_FILE=${CELLS_FILE:-$SCRIPT_DIR/cells.zsh}
 PYTHON=${PYTHON:-$REPO/.venv/bin/python}
 STEPS=${R0_STEPS:-800}
 PASS_THRESH=${PASS_THRESH:-0.1}
-DATA=r0_synthetic.bin
+# Overfit recipe knobs. Defaults reproduce the byte-vocab r0_overfit gate (lr 2e-3,
+# clip 1.0 = the trainer default, warmup 10). Larger real-text rungs explode in fp16
+# under the hot lr at d512/d768, so the ladder passes R0_LR=1e-3 (clip stays 1.0).
+R0_LR=${R0_LR:-2e-3}
+R0_CLIP=${R0_CLIP:-1.0}
+R0_WARMUP=${R0_WARMUP:-10}
+MODEL=${MODEL:-r0_overfit}   # ladder rung -> -include models/gen_$MODEL.h (scale ladder)
+# R0 overfit data: the byte-vocab r0_overfit rung uses a tiny synthetic stream; every
+# real-text rung (32K vocab, seq 256) overfits one pinned batch of the real train shard
+# at the rung's OWN dims — the true (size x config) correctness gate the larger builds need.
+if [[ $MODEL == r0_overfit ]]; then
+  DATA=$TD/r0_synthetic.bin
+else
+  DATA=$REPO/training/tinystories_data00.bin
+fi
 
 mkdir -p $BIN $LOGS $CK
 cd $TD || exit 1
 SDK="$(xcrun --show-sdk-path)"
 source $CELLS_FILE
 
-# auto-generate the R0 synthetic byte stream (128 random bytes, vocab 256) if missing
-if [[ ! -f $TD/$DATA ]]; then
-  (cd $REPO && $PYTHON -c "from lilbro.eval import write_token_stream; import numpy as np; write_token_stream('$TD/$DATA', np.random.default_rng(0).integers(0,256,128))")
+# auto-generate the byte-vocab R0 stream (128 random bytes, vocab 256) if missing.
+# Real-text rungs reuse the existing 32K train shard (no generation needed).
+if [[ $MODEL == r0_overfit && ! -f $DATA ]]; then
+  (cd $REPO && $PYTHON -c "from lilbro.eval import write_token_stream; import numpy as np; write_token_stream('$DATA', np.random.default_rng(0).integers(0,256,128))")
 fi
 
 log(){ print -r -- "[$(date +%H:%M:%S)] $*" | tee -a $SWEEP; }
 
-log "===== PHASE 1: R0 correctness gate (steps=$STEPS, adamw, lr=2e-3, pass<$PASS_THRESH) ====="
+log "===== PHASE 1: R0 correctness gate MODEL=$MODEL (steps=$STEPS, adamw, lr=$R0_LR, clip=$R0_CLIP, pass<$PASS_THRESH) ====="
 printf 'cell\tr0_final_loss\tverdict\n' > $R0RES
 
 for line in $cells; do
@@ -40,10 +55,11 @@ for line in $cells; do
   out=$BIN/r0_$name
   # build (zsh ${=r0x} forces word-splitting of multi-flag extras)
   if ! xcrun clang -O2 -DACCELERATE_NEW_LAPACK -framework Foundation -framework IOSurface -framework Accelerate \
-        -isysroot "$SDK" -fobjc-arc ${=r0x} -include models/gen_r0_overfit.h -o $out train.m 2>$LOGS/r0build_$name.log; then
+        -isysroot "$SDK" -fobjc-arc ${=r0x} -include models/gen_${MODEL}.h -o $out train.m 2>$LOGS/r0build_$name.log; then
     log "R0 $name: BUILD FAILED"; printf '%s\tNA\tBUILD_FAIL\n' "$name" >> $R0RES; continue
   fi
-  $out --scratch --overfit --data $DATA --steps $STEPS --accum 1 --wd 0 --lr 2e-3 --warmup 10 \
+  $out --scratch --overfit --data $DATA --steps $STEPS --accum 1 --wd 0 --lr $R0_LR \
+       --clip $R0_CLIP --warmup $R0_WARMUP \
        --opt adamw --ckpt $CK/r0_$name.bin > $LOGS/r0run_$name.log 2>&1
   floss=$(grep -oE 'loss=[0-9.eE+-]+' $LOGS/r0run_$name.log | tail -1 | sed 's/loss=//')
   verdict="FAIL"

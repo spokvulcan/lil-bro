@@ -27,6 +27,7 @@ SAMPLE_EVERY=${SAMPLE_EVERY:-0}
 SAMPLE_TOKENS=${SAMPLE_TOKENS:-32}
 WD=${WD:-0.1}
 FORCE_R2=${FORCE_R2:-0}
+MODEL=${MODEL:-r2_small}   # ladder rung -> -include models/gen_$MODEL.h (scale ladder)
 
 mkdir -p $BIN $LOGS $CK
 cd $TD || exit 1
@@ -41,7 +42,7 @@ if [[ -f $R0RES ]]; then
   while IFS=$'\t' read -r nm fl vd; do [[ $vd == PASS ]] && passed[$nm]=1; done < $R0RES
 fi
 
-log "===== PHASE 2: R2 fast-learning (steps=$STEPS, accum=$ACCUM, val_every=$VAL_EVERY, wd=$WD, force=$FORCE_R2) ====="
+log "===== PHASE 2: R2 fast-learning MODEL=$MODEL (steps=$STEPS, accum=$ACCUM, val_every=$VAL_EVERY, wd=$WD, force=$FORCE_R2) ====="
 [[ -f $R2SUM ]] || printf 'cell\topt\tlr\tfinal_val\tbest_val\twall_s\n' > $R2SUM
 
 for line in $cells; do
@@ -53,7 +54,7 @@ for line in $cells; do
   fi
   out=$BIN/r2_$name
   if ! xcrun clang -O2 -DACCELERATE_NEW_LAPACK -framework Foundation -framework IOSurface -framework Accelerate \
-        -isysroot "$SDK" -fobjc-arc ${=r2x} -include models/gen_r2_small.h -o $out train.m 2>$LOGS/r2build_$name.log; then
+        -isysroot "$SDK" -fobjc-arc ${=r2x} -include models/gen_${MODEL}.h -o $out train.m 2>$LOGS/r2build_$name.log; then
     log "R2 $name: BUILD FAILED"; continue
   fi
   log "R2 $name: START (opt=$opt lr=$lr extra='$r2x')"
