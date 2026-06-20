@@ -1408,15 +1408,25 @@ int main(int argc, char *argv[]) {
                         dh1[j] = d * h3c * gatemask * silu_tmp2[j];
                     }
 #else
-                    vDSP_vmul(ac->h1, 1, silu_tmp, 1, dh3, 1, (vDSP_Length)n);
-                    vDSP_vmul(dsilu, 1, dh3, 1, dh3, 1, (vDSP_Length)n);
-                    vDSP_vsadd(silu_tmp, 1, &minus1, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vneg(silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vmul(ac->h1, 1, silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vsadd(silu_tmp2, 1, &one, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vmul(silu_tmp, 1, silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vmul(dsilu, 1, ac->h3, 1, dh1, 1, (vDSP_Length)n);
-                    vDSP_vmul(dh1, 1, silu_tmp2, 1, dh1, 1, (vDSP_Length)n);
+                    // Fuse the 9 elementwise vDSP passes into ONE sweep. silu_tmp
+                    // holds sig from the setup above. This bucket was memory-
+                    // bandwidth-bound on the separate passes (~9 full sweeps of
+                    // HIDDEN*SEQ), not compute-bound; collapsing them to a single
+                    // read/write pass cuts the traffic. Identical math:
+                    //   dh3 = dsilu * silu ;  dh1 = dsilu * h3 * silu'(h1)
+                    // with silu = h1*sig and silu'(h1) = sig*(1 + h1*(1-sig)).
+                    // Straight-line FMA, no branches/calls -> clang auto-vectorizes.
+                    // Op order matches the vDSP passes exactly (1-sig as -(sig-1),
+                    // dh1 as (dsilu*h3)*silu'), so the result is bit-identical.
+                    (void)minus1; (void)one;
+                    for (int j = 0; j < n; j++) {
+                        float sig = silu_tmp[j];
+                        float h1v = ac->h1[j];
+                        float d   = dsilu[j];
+                        float siluprime = sig * (h1v * (-(sig - 1.0f)) + 1.0f);
+                        dh3[j] = d * (h1v * sig);
+                        dh1[j] = (d * ac->h3[j]) * siluprime;
+                    }
 #endif
                 }
                 t_silu += tb_ms(mach_absolute_time() - t0);

@@ -73,6 +73,14 @@ wall-clock — never a token-efficiency claim.
 
 ## Migration log
 
-| Date | Change | Gate | Before → after ms/step | Verdict |
+| Date | Change | Gate | Before → after | Verdict |
 |---|---|---|---|---|
-| 2026-06-21 | baseline (stories110m, plain Muon) | R0 ✓ falls 9.14→7.07 | — / **~102** | baseline |
+| 2026-06-21 | baseline (stories110m, plain Muon) | R0 ✓ falls 9.14→7.07 | **~102 ms/step** | baseline |
+| 2026-06-21 | fuse SiLU-bwd 9 vDSP passes → 1 loop | R0 ✓ / R1 cos 0.99944 | `silu` 6.5→5.8 ms (−0.7) | keep (minor) |
+
+**SiLU finding:** the bucket is *not* dominated by the 9 elementwise passes (fusing
+them saved only 0.7 ms) — it's dominated by the **sigmoid setup** (`vvexpf` + `vvrecf`,
+4 vectorized passes left intact). So the real lever for `silu` is the ANE's hardware
+`sigmoid`, i.e. folding SiLU-backward into the FFN-bwd ANE kernel (P3), not CPU
+micro-opt. R1 cos 0.99944 (not 1.0) is benign FMA contraction at -O2 — *more* accurate
+than the separate-rounding vDSP, well inside the cos≥0.99 gate.
