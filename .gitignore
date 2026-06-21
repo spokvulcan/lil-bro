@@ -9,6 +9,7 @@ __pycache__/
 *.bin
 !assets/**/*.bin
 training/training_dynamic/train
+training/training_dynamic/probe_dispatch
 results/*.png
 results/*.json
 !results/README.md

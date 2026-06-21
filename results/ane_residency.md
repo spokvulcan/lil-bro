@@ -148,16 +148,55 @@ buckets, and the levers left are **architectural, not cosmetic**:
 
 | Bucket | ms | Real lever (not yet tried) | Cost |
 |---|---:|---|---|
-| `ane_fwd`+`ane_bwd` | ~51 | **Fewer ANE evals** — fuse adjacent kernels so the ~96 eval/step dispatch count drops (per-eval overhead is now the suspect, not compute-per-eval); or genuinely less compute. | high (kernel fusion) |
+| `ane_fwd`+`ane_bwd` | ~51 | **Fewer ANE evals (kernel fusion)** — MEASURED dispatch-bound: ~0.12 ms fixed overhead/eval, compute near-free to n=1024, fusion PoC saves 38% on 2 matmuls (see below). ~96 evals/step ⇒ ~11 ms is pure dispatch. **The top lever.** | high (kernel fusion) |
 | `io_fwd`+`io_bwd` | ~14 | **Keep activations ANE-resident** between kernels so the host↔ANE fp16 round-trip isn't paid per kernel. | high (residency rework) |
 | `cls` | ~14 | classifier GEMM+CE → ANE (huge-vocab fp32-island LSE). | high |
 | `silu`,`rms`/`rms_bwd` | ~11 | elementwise/reduction → ANE hardware `sigmoid` / reduction. | medium |
 
-*Next experiment (recommended):* a cheap **dispatch-overhead probe** — measure how
-`ane_bwd` scales with eval count (e.g. time one isolated kernel eval vs the full
-chain) to confirm per-eval dispatch is the suspect *before* committing to kernel
-fusion. If dispatch dominates → fusion is the big win; if compute dominates → the
-51 ms is a hard floor and the reachable wins are the CPU buckets (cls, silu, rms).
+### Dispatch-overhead probe — RESULT: the ANE is DISPATCH-BOUND; fusion is the lever
+
+`probe_dispatch.m` (standalone) times real single-input matmul kernels in a tight
+eval loop. Two measurements, both stable across runs:
+
+**[1] Per-eval time is flat across 1000× of compute.** Square `ic=oc=n` matmul at
+`seq=256`, per-eval ms:
+
+| n | 32 | 64 | 128 | 256 | 512 | 768 | 1024 | 2048 |
+|---|---|---|---|---|---|---|---|---|
+| FLOPs ×768 | .002 | .007 | .028 | .111 | .444 | 1.0 | 1.78 | 7.11 |
+| ms/eval | ~0.30 | ~0.30 | ~0.30 | ~0.22 | ~0.16 | **0.15** | ~0.19 | ~0.46 |
+
+From n=32 to n=1024 the FLOPs rise ~1000× yet per-eval time is **flat ~0.15–0.30 ms**
+(n=512/768 are the *fastest*). It only rises at n=2048 (and that surface is 9.4 MB —
+likely memory bandwidth, not compute). Caching is ruled out: a cache would keep
+n=2048 flat too. ⇒ **matmul compute is nearly free; the per-eval cost is fixed
+dispatch/overhead.**
+
+**[2] Fusion PoC — 2 matmuls in one eval vs two evals (n=768):**
+
+| | ms |
+|---|---|
+| 1 matmul / eval | 0.153 |
+| 2 matmuls / eval (fused, single dispatch) | 0.189 |
+| 2 separate evals | 0.307 |
+| **fused saves** | **0.118 ms (38%)** |
+
+The 2nd matmul added only **0.035 ms** of marginal compute; a separate eval would
+have added 0.153 ms. So **~0.12 ms of every eval is pure dispatch overhead** that
+fusion eliminates, and ~77% of a 768-eval's cost is dispatch, ~23% compute.
+
+**THE LEVER (measured, not assumed): kernel fusion.** The step does ~96 ANE
+evals (≈8 kernels × 12 layers); at ~0.12 ms dispatch each that's **~11 ms of pure
+dispatch** in the 52 ms `ane_fwd`+`ane_bwd` bucket, *plus* the inter-kernel
+host↔ANE staging fusion also removes from `io_fwd`+`io_bwd` (~14 ms). Fusing
+adjacent matmuls (e.g. the per-layer QKV projections into one kernel, or the FFN
+backward matmuls) cuts the dispatch count directly. This is the first lever this
+session with measured headroom and a working mechanism — and it needs no
+multi-input binding (a fused kernel is one single-input program with a bigger
+packed surface, exactly the n=2048-class kernels that already eval fine).
+*Incidental:* the ANE rejects very small/odd program shapes with the same
+`status=0x1d` (e.g. 16×16×16) — so 0x1d is a general "program rejected", not
+unique to multi-input; the multi-input wall may yet be a plumbing detail (below).
 
 **Why the multi-input request fails (open, for the next attempt).** Status
 `0x1d` is opaque. Two hypotheses, untested: (a) the private
