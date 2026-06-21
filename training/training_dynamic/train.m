@@ -22,6 +22,31 @@ typedef struct {
 #endif
 } DynLayerKernels;
 
+#if FUSE_SILU_BWD == 2
+// Non-clamp SiLU backward, recomputed CPU-side in the async dW closure (mode 2):
+//   dh3 = dsilu * silu(h1) ;  dh1 = dsilu * h3 * silu'(h1)
+// with silu = h1*sig, silu'(h1) = sig*(1 + h1*(1-sig)). Vectorized sigmoid
+// (vvexpf — scalar expf over HIDDEN*SEQ*NLAYERS would cost tens of ms) then a
+// fused FMA sweep, bit-matching train.m's inline #else CPU path. Runs on the
+// (slack) serial dw_q so it overlaps the next layers' ANE evals.
+static void silu_bwd_recompute(float *dh1, float *dh3, const float *dsilu,
+                               const float *h1, const float *h3, int n) {
+    float *sig = (float*)malloc((size_t)n*4);
+    float minus1 = -1.0f, one = 1.0f;
+    vDSP_vsmul(h1, 1, &minus1, sig, 1, (vDSP_Length)n);
+    int nn = n; vvexpf(sig, sig, &nn);
+    vDSP_vsadd(sig, 1, &one, sig, 1, (vDSP_Length)n);
+    vvrecf(sig, sig, &nn);                       // sig = sigmoid(h1)
+    for (int j = 0; j < n; j++) {
+        float s = sig[j], h1v = h1[j], d = dsilu[j];
+        float siluprime = s * (h1v * (-(s - 1.0f)) + 1.0f);
+        dh3[j] = d * (h1v * s);
+        dh1[j] = (d * h3[j]) * siluprime;
+    }
+    free(sig);
+}
+#endif
+
 // Transpose W[rows,cols] → W^T[cols,rows] stored as [cols channels, rows spatial]
 static void transpose_weight(float *dst, const float *src, int rows, int cols) {
     for (int r = 0; r < rows; r++)
@@ -82,10 +107,14 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 
     // FFN backward W1^T+W3^T: [1, HIDDEN, 1, 2*SEQ+2*DIM] → [1, DIM, 1, SEQ]
     printf("  Compiling ffnBwdW13t...\n");
-#if FUSE_SILU_BWD
+#if FUSE_SILU_BWD == 1
     // Fused: input [dsilu|h1|h3|W1t|W3t] (3*SEQ+2*DIM), output concat(dx,dh1,dh3)
-    dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_fused_silu_dynamic(), @{},
+    dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_fused_silu_dynamic(1), @{},
         HIDDEN*FFN_BWD_W13T_FUSED_SP*2, (DIM+2*HIDDEN)*SEQ*2);
+#elif FUSE_SILU_BWD == 2
+    // Recompute mode: output dx only; dW closure recomputes dh1/dh3 on the dw_q.
+    dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_fused_silu_dynamic(0), @{},
+        HIDDEN*FFN_BWD_W13T_FUSED_SP*2, DIM*SEQ*2);
 #else
     dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_dynamic(), @{},
         HIDDEN*FFN_BWD_W13T_SP*2, DIM*SEQ*2);
@@ -1515,19 +1544,26 @@ int main(int argc, char *argv[]) {
 #if FUSE_SILU_BWD
                 // Fused FFN backward: dsilu stays ANE-resident (strided copy from
                 // ffnBwdW2t's output), h1/h3 are staged, and the W13t kernel does
-                // the SiLU backward + both matmuls, outputting concat(dx,dh1,dh3).
-                // The 6.4 ms CPU silu bucket vanishes; dh1/dh3 return for the dW.
+                // the SiLU backward + both matmuls. The 6.4 ms CPU silu bucket vanishes.
+                // Mode 1: kernel outputs concat(dx,dh1,dh3); dh1/dh3 read back for dW.
+                // Mode 2: kernel outputs dx only; dW closure recomputes dh1/dh3 on the
+                //   (slack) serial dw_q — needs dsilu on CPU, so read it back here.
                 t0 = mach_absolute_time();
                 copy_dsilu_into_w13t_fused(pls[L].ffnBwdW13t_in, dk.ffnBwdW2t->ioOut);
                 write_ffn_bwd_w13t_fused_h(pls[L].ffnBwdW13t_in, ac->h1, ac->h3);
+#if FUSE_SILU_BWD == 2
+                io_read_dyn(dk.ffnBwdW2t->ioOut, dsilu, HIDDEN, SEQ);  // for the closure recompute
+#endif
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.ffnBwdW13t, plr[L].ffnBwdW13t);
                 t_ane_bwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
-                io_read_fp16(dk.ffnBwdW13t->ioOut, dx_ffn, 0,          DIM,    SEQ);
+                io_read_fp16(dk.ffnBwdW13t->ioOut, dx_ffn, 0, DIM, SEQ);
+#if FUSE_SILU_BWD == 1
                 io_read_fp16(dk.ffnBwdW13t->ioOut, dh1,    DIM,        HIDDEN, SEQ);
                 io_read_fp16(dk.ffnBwdW13t->ioOut, dh3,    DIM+HIDDEN, HIDDEN, SEQ);
+#endif
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
 #else
                 t0 = mach_absolute_time();
@@ -1607,17 +1643,33 @@ int main(int argc, char *argv[]) {
                 t0 = mach_absolute_time();
                 float *capt_dffn = (float*)malloc(SEQ*DIM*4); memcpy(capt_dffn, dffn, SEQ*DIM*4);
                 float *capt_silu = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_silu, ac->silu_out, SEQ*HIDDEN*4);
+                float *capt_x2n = (float*)malloc(SEQ*DIM*4); memcpy(capt_x2n, ac->x2norm, SEQ*DIM*4);
+#if FUSE_SILU_BWD == 2
+                // Recompute mode: dh1/dh3 weren't read back — capture their inputs
+                // (dsilu, h1, h3) and reconstruct dh1/dh3 inside the closure.
+                float *capt_dsilu = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dsilu, dsilu, SEQ*HIDDEN*4);
+                float *capt_h1 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_h1, ac->h1, SEQ*HIDDEN*4);
+                float *capt_h3 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_h3, ac->h3, SEQ*HIDDEN*4);
+#else
                 float *capt_dh1 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh1, dh1, SEQ*HIDDEN*4);
                 float *capt_dh3 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh3, dh3, SEQ*HIDDEN*4);
-                float *capt_x2n = (float*)malloc(SEQ*DIM*4); memcpy(capt_x2n, ac->x2norm, SEQ*DIM*4);
+#endif
                 t_dw_copy += tb_ms(mach_absolute_time() - t0);
                 dispatch_group_async(dw_grp, dw_q, ^{
+#if FUSE_SILU_BWD == 2
+                    float *capt_dh1 = (float*)malloc(SEQ*HIDDEN*4);
+                    float *capt_dh3 = (float*)malloc(SEQ*HIDDEN*4);
+                    silu_bwd_recompute(capt_dh1, capt_dh3, capt_dsilu, capt_h1, capt_h3, HIDDEN*SEQ);
+#endif
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, HIDDEN, SEQ,
                                 1.0f, capt_dffn, SEQ, capt_silu, SEQ, 1.0f, gr->W2, HIDDEN);
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
                                 1.0f, capt_dh1, SEQ, capt_x2n, SEQ, 1.0f, gr->W1, DIM);
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
                                 1.0f, capt_dh3, SEQ, capt_x2n, SEQ, 1.0f, gr->W3, DIM);
+#if FUSE_SILU_BWD == 2
+                    free(capt_dsilu); free(capt_h1); free(capt_h3);
+#endif
                     free(capt_dffn); free(capt_silu); free(capt_dh1); free(capt_dh3); free(capt_x2n);
                 });
 

@@ -477,9 +477,13 @@ static NSString *gen_ffn_bwd_w13t_dynamic(void) {
 // dh1@W1^T + dh3@W3^T -> dx matmul, and the kernel OUTPUTS concat(dx, dh1, dh3)
 // [1, DIM+2*HIDDEN, 1, SEQ] so the async dW closure still gets dh1/dh3 without a
 // CPU recompute on the serial dw_q. dsilu arrives via a strided ANE->ANE copy.
-static NSString *gen_ffn_bwd_w13t_fused_silu_dynamic(void) {
+// emit_grads=1 (FUSE_SILU_BWD=1): output concat(dx,dh1,dh3) — the async dW reads
+//   dh1/dh3 back. emit_grads=0 (FUSE_SILU_BWD=2): output dx ONLY — the dW closure
+//   recomputes dh1/dh3 on CPU (overlapped on the serial dw_q), dropping both the
+//   dh1/dh3 read-back AND the 6x-bigger-output eval cost.
+static NSString *gen_ffn_bwd_w13t_fused_silu_dynamic(int emit_grads) {
     int sp_in = FFN_BWD_W13T_FUSED_SP;        // 3*SEQ + 2*DIM
-    int out_ch = DIM + 2*HIDDEN;              // concat(dx, dh1, dh3)
+    int out_ch = emit_grads ? (DIM + 2*HIDDEN) : DIM;   // concat(dx,dh1,dh3) | dx
     NSMutableString *m = [NSMutableString string];
     [m appendString:MIL_HDR];
     [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", HIDDEN, sp_in];
@@ -530,11 +534,16 @@ static NSString *gen_ffn_bwd_w13t_fused_silu_dynamic(void) {
     [m appendFormat:@"        tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dx = reshape(shape=ro,x=dxt)[name=string(\"dx\")];\n", DIM, SEQ];
 
-    // --- output concat(dx, dh1, dh3) along channels: [1, DIM+2*HIDDEN, 1, SEQ] ---
-    [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
-    [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(dx,dh1,dh3))[name=string(\"cat\")];\n", out_ch, SEQ];
-    [m appendString:@"    } -> (out);\n}\n"];
+    if (emit_grads) {
+        // output concat(dx, dh1, dh3) along channels: [1, DIM+2*HIDDEN, 1, SEQ]
+        [m appendString:@"        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"];
+        [m appendString:@"        bool cid = const()[name=string(\"cid\"), val=bool(false)];\n"];
+        [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = concat(axis=cax,interleave=cid,values=(dx,dh1,dh3))[name=string(\"cat\")];\n", out_ch, SEQ];
+        [m appendString:@"    } -> (out);\n}\n"];
+    } else {
+        // output dx only — dh1/dh3 are recomputed in the async dW closure
+        [m appendString:@"    } -> (dx);\n}\n"];
+    }
     return m;
 }
 

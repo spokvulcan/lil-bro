@@ -126,8 +126,12 @@
 // The fused kernel takes [dsilu|h1|h3|W1t|W3t] and emits concat(dx_ffn,dh1,dh3)
 // so the async dW closure still gets dh1/dh3 (no recompute on the SERIAL dw_q).
 // dsilu flows ffnBwdW2t->ffnBwdW13t via a strided ANE->ANE copy (no CPU bounce).
-// Moves 6.4 ms of CPU compute onto the dispatch-bound ANE (compute ~free), at the
-// cost of reading dh1/dh3 back. Works for MHA and GQA (pure FFN). 0 = CPU silu.
+// Moves 6.4 ms of CPU compute onto the dispatch-bound ANE (compute ~free).
+// 0 = CPU silu. 1 = kernel outputs concat(dx,dh1,dh3); the async dW reads dh1/dh3
+//   back (round-trip tax: +1.8 io + 1.8 ane for the 6x-bigger output). Net −2.0.
+// 2 = kernel outputs dx ONLY; the dW closure recomputes dh1/dh3 on the (slack)
+//   serial dw_q — drops both taxes, overlapping the silu math with later evals.
+// Works for MHA and GQA (pure FFN).
 #ifndef FUSE_SILU_BWD
 #define FUSE_SILU_BWD 0
 #endif
