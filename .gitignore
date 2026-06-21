@@ -24,3 +24,13 @@ training/training_dynamic/probe_chess
 training/training_dynamic/chess/perft
 training/training_dynamic/chess/test_chess
 training/training_dynamic/chess/test_heads
+
+# Chess Gumbel-MCTS build artifacts (build-step 3, ADR 0005, issue #17)
+training/training_dynamic/chess/test_mcts
+
+# Chess self-play loop build artifacts (build-step 4, ADR 0005, issue #18)
+training/training_dynamic/chess/test_selfplay
+training/training_dynamic/train_selfplay
+training/training_dynamic/chess/test_evaluator
+training/training_dynamic/chess/test_replay
+*.ckpt

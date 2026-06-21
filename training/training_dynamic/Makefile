@@ -49,9 +49,59 @@ train_chess: train_chess.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_hea
 g0: train_chess
 	./train_chess --overfit
 
+# Gumbel-AlphaZero MCTS (build-step 3, ADR 0005, issue #17). Pure C, ZERO deps:
+# mcts.c expands the engine's legal moves; the leaf evaluator is a pluggable interface
+# (stub oracle for G1). -lm for tanh/log/exp. The binary is a file target so test_mcts
+# (full component + gate suite) and g1 (the mate-suite gate, exit 0/1) share one build.
+CHESS_MCTS_DEPS = chess/mcts.c chess/mcts.h $(CHESS_DEPS)
+
+chess/test_mcts: chess/test_mcts.c $(CHESS_MCTS_DEPS)
+	$(CC) $(CHESS_CFLAGS) -o chess/test_mcts chess/test_mcts.c chess/mcts.c chess/chess.c -lm
+
+# Per-component gate (Gumbel root selection, Sequential Halving, backup sign, policy
+# readout) + the G1 mate suite.
+test_mcts: chess/test_mcts
+	./chess/test_mcts
+
+# G1 gate: Gumbel-MCTS picks the forced move on a mate-in-1/-2 suite (with distractors)
+# given the oracle value, at a stated low sim budget. Exit 0 == G1-green.
+g1: chess/test_mcts
+	./chess/test_mcts --g1
+
+# ===== Self-play loop (build-step 4, ADR 0005, issue #18) =====
+# The full single-process, one-ANE-client self-play RL loop. The hot path (self-play
+# stepping, replay, batched leaf-eval forward + learner train) is C/.m on the ANE; the
+# eval-side orchestration (config, Elo/Stockfish, run driver) is Python in lilbro/chess/.
+SELFPLAY_DEPS = chess/selfplay.c chess/selfplay.h chess/replay.c chess/replay.h \
+                $(CHESS_MCTS_DEPS)
+
+# CPU-only TDD seams (replay-buffer invariants, evaluator readout math): pure C, no ANE,
+# the fast gate before any ANE training run.
+chess/test_replay: chess/test_replay.c chess/replay.c chess/replay.h $(CHESS_DEPS)
+	$(CC) $(CHESS_CFLAGS) -o chess/test_replay chess/test_replay.c chess/replay.c chess/chess.c -lm
+
+test_replay: chess/test_replay
+	./chess/test_replay
+
+# Full self-play trainer (generation + replay + learner) on the one ANE client.
+# `make selfplay` builds; the run driver (lilbro/chess/) invokes ./train_selfplay --config ...
+train_selfplay: train_selfplay.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h \
+                chess/selfplay.h chess/replay.h chess/mcts.h chess/chess.h models/chess_g0.h \
+                chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c
+	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h -o train_selfplay train_selfplay.m \
+		chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c
+
+# G2 gate: vectorized self-play whose win-rate climbs vs a fixed random-mover then a weak
+# baseline. `make g2 [G2ARGS=...]` runs the loop's built-in eval harness and exits 0/1.
+selfplay: train_selfplay
+
+g2: train_selfplay
+	./train_selfplay --g2 $(G2ARGS)
+
 clean:
-	rm -f train probe_chess train_chess chess/perft chess/test_chess chess/test_heads
+	rm -f train probe_chess train_chess train_selfplay \
+	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay
 
 FORCE:
 
-.PHONY: clean FORCE test_engine test_heads g0
+.PHONY: clean FORCE test_engine test_heads g0 test_mcts g1 test_replay selfplay g2
