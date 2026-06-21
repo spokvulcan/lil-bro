@@ -33,9 +33,28 @@ test_engine: chess/test_chess.c $(CHESS_DEPS)
 	$(CC) $(CHESS_CFLAGS) -o chess/test_chess chess/test_chess.c chess/chess.c
 	./chess/test_chess
 
+# Gumbel-AlphaZero MCTS (build-step 3, ADR 0005, issue #17). Pure C, ZERO deps:
+# mcts.c expands the engine's legal moves; the leaf evaluator is a pluggable interface
+# (stub oracle for G1). -lm for tanh/log/exp. The binary is a file target so test_mcts
+# (full component + gate suite) and g1 (the mate-suite gate, exit 0/1) share one build.
+CHESS_MCTS_DEPS = chess/mcts.c chess/mcts.h $(CHESS_DEPS)
+
+chess/test_mcts: chess/test_mcts.c $(CHESS_MCTS_DEPS)
+	$(CC) $(CHESS_CFLAGS) -o chess/test_mcts chess/test_mcts.c chess/mcts.c chess/chess.c -lm
+
+# Per-component gate (Gumbel root selection, Sequential Halving, backup sign, policy
+# readout) + the G1 mate suite.
+test_mcts: chess/test_mcts
+	./chess/test_mcts
+
+# G1 gate: Gumbel-MCTS picks the forced move on a mate-in-1/-2 suite (with distractors)
+# given the oracle value, at a stated low sim budget. Exit 0 == G1-green.
+g1: chess/test_mcts
+	./chess/test_mcts --g1
+
 clean:
-	rm -f train probe_chess chess/perft chess/test_chess
+	rm -f train probe_chess chess/perft chess/test_chess chess/test_mcts
 
 FORCE:
 
-.PHONY: clean FORCE test_engine
+.PHONY: clean FORCE test_engine test_mcts g1

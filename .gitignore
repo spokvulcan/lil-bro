@@ -22,3 +22,6 @@ training/training_dynamic/probe_chess
 # Chess engine build artifacts (build-step 1, ADR 0005)
 training/training_dynamic/chess/perft
 training/training_dynamic/chess/test_chess
+
+# Chess Gumbel-MCTS build artifacts (build-step 3, ADR 0005, issue #17)
+training/training_dynamic/chess/test_mcts
