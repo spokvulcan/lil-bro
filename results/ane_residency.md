@@ -80,6 +80,7 @@ wall-clock — never a token-efficiency claim.
 | 2026-06-21 | ~~woFwd → function-param IOSurface (`WO_FUNCPARAM`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
 | 2026-06-21 | ~~ffnBwdW2t → function-param (`W2T_FUNCPARAM`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
 | 2026-06-21 | ~~conv datapath on ffnBwdW2t (`CONV_PROBE`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
+| 2026-06-21 | conv via SINGLE-input on wotBwd (`CONV1IN`, fixed gate) | R0 ✓ / R1 **cos 1.00000** (real clean-build diff) | `ane_bwd` 31.2→31.0 (=1) / 31.4 (=2) | **correct, but a WASH; transposes refuted as bottleneck** |
 
 > ### ⚠️ CORRECTION (2026-06-21) — the func-param + conv "confirmations" were false passes
 >
@@ -119,18 +120,44 @@ wall-clock — never a token-efficiency claim.
 > faster" conv timing was the kernel *erroring out early*, not real work. The
 > baseline buckets, determinism, and the SiLU fold are unaffected and stand.
 
-**Revised hypothesis for the real wall-clock (still open).** `ane_fwd`(20) +
-`ane_bwd`(31) = 51 ms is the ANE matmul datapath, and `gen_dyn_matmul` wraps
-every matmul in **two transposes** (`reshape→transpose→matmul→transpose→reshape`)
-to reach `[SEQ,IC]@[IC,OC]`. The ANE is natively a conv engine; a **1×1 conv**
-consumes `[1,IC,1,SEQ]` with no transpose (PRD #26). That still targets the
-biggest bucket — but it must be reached **without** the multi-input binding.
-*Next experiment:* `gen_conv_1in` — pack `[act | weight]` into ONE input surface
-(exactly as `gen_dyn_matmul` already does for matmul), `slice`+`reshape` the
-weight to `[OC,IC,1,1]` inside the MIL, and conv. Single-input binding = the
-working path. Gate it with the **fixed** `gate_placement.zsh`. If `cos 1.0` AND
-faster → the conv lever is real; if `cos 0.0` → MIL conv won't take a non-const
-weight and the lever is dead for training. Either way it's now an honest test.
+### Conv datapath (PRD #26) — RESOLVED: correct on single-input, but a WASH
+
+The conv reframe was retested honestly via the single-input binding (`CONV1IN`,
+`gen_conv_1in_mil`), the only conv path that evals here. Result, with the **fixed**
+gate (real clean-build `=0` vs `=1`/`=2` diffs) and independent timing:
+
+- **Correct.** `cos 1.00000 / R1 PASS` for both `=1` (conv, one in-MIL weight
+  transpose) and `=2` (conv, weight pre-transposed in CPU staging → ZERO in-MIL
+  transposes). Conv compiles *and* evals on the single-input binding — MIL `conv`
+  *does* accept a non-const weight sliced from the packed input. So PRD #26 was
+  blocked only by the dead 2-in binding, not by conv itself.
+- **But a wash.** `ane_bwd` median (stories110m, wotBwd, square IC=OC=768):
+  matmul **31.2**, conv-1-transpose **31.0**, conv-0-transpose **31.4** ms — all
+  inside run-to-run noise.
+- **The transposes were never the bottleneck.** `=2` removes *all* transposes and
+  is no faster than matmul. So `ane_fwd`+`ane_bwd` ≈ 51 ms is **ANE matmul
+  compute + fixed per-eval dispatch**, not data layout. The "two transposes are
+  the cost" hypothesis is **refuted by direct measurement.** Conv only wins where
+  the activation dominates the weight (tall-skinny: large SEQ or IC≫OC) — and no
+  current kernel is that shape (the classifier is the opposite, OC=32000≫).
+
+**Strategic consequence — the easy/data-layout levers are exhausted.** Every
+weight-layout idea (func-param IOSurface, conv, transpose elimination) is either
+broken on this HW or a wash. The remaining wall-clock is real work in three
+buckets, and the levers left are **architectural, not cosmetic**:
+
+| Bucket | ms | Real lever (not yet tried) | Cost |
+|---|---:|---|---|
+| `ane_fwd`+`ane_bwd` | ~51 | **Fewer ANE evals** — fuse adjacent kernels so the ~96 eval/step dispatch count drops (per-eval overhead is now the suspect, not compute-per-eval); or genuinely less compute. | high (kernel fusion) |
+| `io_fwd`+`io_bwd` | ~14 | **Keep activations ANE-resident** between kernels so the host↔ANE fp16 round-trip isn't paid per kernel. | high (residency rework) |
+| `cls` | ~14 | classifier GEMM+CE → ANE (huge-vocab fp32-island LSE). | high |
+| `silu`,`rms`/`rms_bwd` | ~11 | elementwise/reduction → ANE hardware `sigmoid` / reduction. | medium |
+
+*Next experiment (recommended):* a cheap **dispatch-overhead probe** — measure how
+`ane_bwd` scales with eval count (e.g. time one isolated kernel eval vs the full
+chain) to confirm per-eval dispatch is the suspect *before* committing to kernel
+fusion. If dispatch dominates → fusion is the big win; if compute dominates → the
+51 ms is a hard floor and the reachable wins are the CPU buckets (cls, silu, rms).
 
 **Why the multi-input request fails (open, for the next attempt).** Status
 `0x1d` is opaque. Two hypotheses, untested: (a) the private

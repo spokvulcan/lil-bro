@@ -88,6 +88,17 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 #if CONV_DATAPATH
     dk->wotBwd = compile_kern_mil_2in(gen_conv_2in(DIM, Q_DIM, SEQ),
         DIM*SEQ*2, DIM*Q_DIM*2, Q_DIM*SEQ*2);
+#elif CONV1IN == 2
+    // PRD #26 Step B: conv with weight pre-transposed in staging -> zero in-MIL
+    // transposes. SAME packed input surface (only the weight region's layout
+    // differs, handled by stage_wot_bwd_weights_convB).
+    dk->wotBwd = compile_kern_mil_w(gen_conv_1in_mil_B(DIM, Q_DIM, SEQ), @{},
+        DIM*WOT_BWD_SP*2, Q_DIM*SEQ*2);
+#elif CONV1IN
+    // PRD #26 Step A single-input conv: SAME packed input surface + staging as
+    // the matmul path (DIM*WOT_BWD_SP*2 in, Q_DIM*SEQ*2 out) — only the MIL swaps.
+    dk->wotBwd = compile_kern_mil_w(gen_conv_1in_mil(DIM, Q_DIM, SEQ), @{},
+        DIM*WOT_BWD_SP*2, Q_DIM*SEQ*2);
 #else
     dk->wotBwd = compile_kern_mil_w(gen_wot_dynamic(), @{},
         DIM*WOT_BWD_SP*2, Q_DIM*SEQ*2);
@@ -1268,7 +1279,11 @@ int main(int argc, char *argv[]) {
             { static float t_q_i[DIM*Q_DIM]; transpose_weight(t_q_i, lw[L].Wq, Q_DIM, DIM);
               io_write_fp16_at(pls[L].qBwd_w, 0, t_q_i, DIM, Q_DIM); }      // conv weight = Wq^T [OC=DIM,IC=Q_DIM,1,1]
 #else
+#if CONV1IN == 2
+            stage_wot_bwd_weights_convB(pls[L].wotBwd_in, lw[L].Wo);
+#else
             stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
+#endif
             stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
 #endif
             stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);
@@ -1965,7 +1980,11 @@ int main(int argc, char *argv[]) {
                     { static float t_q_r[DIM*Q_DIM]; transpose_weight(t_q_r, lw[L].Wq, Q_DIM, DIM);
                       io_write_fp16_at(pls[L].qBwd_w, 0, t_q_r, DIM, Q_DIM); }
 #else
+#if CONV1IN == 2
+                    stage_wot_bwd_weights_convB(pls[L].wotBwd_in, lw[L].Wo);
+#else
                     stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
+#endif
                     stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
 #endif
                     stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);

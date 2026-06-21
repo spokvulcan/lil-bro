@@ -325,6 +325,25 @@ static void write_wot_bwd_acts(IOSurfaceRef s, const float *dy) {
         cvt_f32_f16(buf + d*WOT_BWD_SP, dy + d*SEQ, SEQ);
     IOSurfaceUnlock(s, 0, NULL);
 }
+#if CONV1IN == 2
+// Step-B staging (PRD #26): write the weight region pre-transposed so the conv
+// MIL (gen_conv_1in_mil_B) reshapes the weight slice [1,IC,1,OC] straight to the
+// conv kernel [OC,IC,1,1] = W[o,i]=M[i,o] with NO in-MIL transpose. Wo is M
+// [DIM=IC, Q_DIM=OC]. The reshape preserves logical-flat order, so conv-kernel
+// flat p=o*IC+i must hold M[i,o], i.e. sliced element [0,p/OC,0,p%OC] =
+// buf[(p/OC)*WOT_BWD_SP + SEQ + (p%OC)]. (IC==OC here, but written generally.)
+static void stage_wot_bwd_weights_convB(IOSurfaceRef s, const float *Wo) {
+    const int IC = DIM, OC = Q_DIM;
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int o = 0; o < OC; o++)
+        for (int i = 0; i < IC; i++) {
+            int p = o*IC + i;            // conv-kernel logical-flat index
+            buf[(p/OC)*WOT_BWD_SP + SEQ + (p%OC)] = (_Float16)Wo[i*OC + o];  // M[i,o]
+        }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+#endif
 
 // qBwd: [1, Q_DIM, 1, SEQ+DIM] fp16 — Wq is [Q_DIM, DIM], matmul gives Wq^T @ dq
 #define Q_BWD_SP (SEQ + DIM)

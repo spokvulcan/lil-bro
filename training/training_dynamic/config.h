@@ -86,6 +86,22 @@
 #ifndef CONV_DATAPATH
 #define CONV_DATAPATH 0
 #endif
+// PRD #26 retry on the SINGLE-input binding (the only conv path that evals on
+// this box — CORRECT here, cos 1.00000 / R1 PASS, unlike the 2-in attempts).
+// Emits wotBwd's backward matmul as a 1x1 conv that consumes the packed
+// activation [1,IC,1,SEQ] directly and outputs [1,OC,1,SEQ] — dropping BOTH
+// activation transposes gen_dyn_matmul pays. 0 = matmul; 1 = conv with one
+// in-MIL weight transpose; 2 = conv with the weight pre-transposed in CPU
+// staging (gen_conv_1in_mil_B, ZERO in-MIL transposes).
+// MEASURED RESULT (stories110m, square IC=OC=768): ane_bwd 31.2 / 31.0 / 31.4 ms
+// for 0/1/2 — a WASH within run-to-run noise. And =2 (no transposes at all) is
+// no faster than matmul, so the transposes were never the bottleneck: ane_bwd is
+// ANE matmul compute + fixed per-eval dispatch, not data layout. Conv only wins
+// where the activation dominates the weight (tall-skinny: large SEQ or IC>>OC);
+// no current kernel is that shape. Kept default-0 as a proven-correct datapath.
+#ifndef CONV1IN
+#define CONV1IN 0
+#endif
 // Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
 // emits this for generated headers; fallback keeps hand-written headers compiling.
 #ifndef MTP_DEPTH

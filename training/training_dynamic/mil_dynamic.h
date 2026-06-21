@@ -262,6 +262,77 @@ static NSString *gen_conv_2in(int ic, int oc, int seq) {
     return m;
 }
 
+// Single-input conv matmul (PRD #26, the binding that actually evals here): same
+// packed input [1,IC,1,SEQ+OC] as gen_dyn_matmul_mil (act [ic,seq] | weight
+// [ic,oc] channel-major), but emitted as a 1x1 conv. The conv consumes the
+// activation slice [1,IC,1,SEQ] with NO transpose and emits [1,OC,1,SEQ] with
+// NO transpose — vs gen_dyn_matmul's two activation transposes (mm_a3, mm_yt).
+// Cost: ONE in-MIL weight transpose (w3). Provably equal to the matmul:
+// conv y[o,s]=Σ_i W[o,i]act[i,s] with conv-kernel W[o,i]=packed_weight[i,o]
+// equals matmul y[o,s]=Σ_i M[i,o]act[i,s]. Conv op syntax copied from gen_conv_2in.
+static NSString *gen_conv_1in_mil(int ic, int oc, int seq) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    int sp = seq + oc;
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", ic, sp];
+    // act = slice [1,ic,1,seq]  — conv input, NO transpose
+    [m appendString:@"        tensor<int32, [4]> c_ba = const()[name=string(\"c_ba\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendFormat:@"        tensor<int32, [4]> c_sa = const()[name=string(\"c_sa\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", ic, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> c_act = slice_by_size(x=x,begin=c_ba,size=c_sa)[name=string(\"c_act\")];\n", ic, seq];
+    // wt = slice [1,ic,1,oc]
+    [m appendFormat:@"        tensor<int32, [4]> c_bw = const()[name=string(\"c_bw\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", seq];
+    [m appendFormat:@"        tensor<int32, [4]> c_sw = const()[name=string(\"c_sw\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", ic, oc];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> c_wt = slice_by_size(x=x,begin=c_bw,size=c_sw)[name=string(\"c_wt\")];\n", ic, oc];
+    // w2 = reshape [1,1,ic,oc]
+    [m appendFormat:@"        tensor<int32, [4]> c_rw = const()[name=string(\"c_rw\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", ic, oc];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> c_w2 = reshape(shape=c_rw,x=c_wt)[name=string(\"c_w2\")];\n", ic, oc];
+    // w3 = transpose perm=[0,1,3,2] -> [1,1,oc,ic]  (the ONE weight transpose)
+    [m appendString:@"        tensor<int32, [4]> c_pm = const()[name=string(\"c_pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> c_w3 = transpose(perm=c_pm,x=c_w2)[name=string(\"c_w3\")];\n", oc, ic];
+    // W = reshape [oc,ic,1,1]  (conv kernel)
+    [m appendFormat:@"        tensor<int32, [4]> c_rk = const()[name=string(\"c_rk\"), val=tensor<int32, [4]>([%d,%d,1,1])];\n", oc, ic];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> c_W = reshape(shape=c_rk,x=c_w3)[name=string(\"c_W\")];\n", oc, ic];
+    // conv  (syntax + const style copied from gen_conv_2in)
+    [m appendString:@"        tensor<int32, [2]> c_st = const()[name=string(\"c_st\"), val=tensor<int32, [2]>([1,1])];\n"];
+    [m appendString:@"        tensor<int32, [2]> c_di = const()[name=string(\"c_di\"), val=tensor<int32, [2]>([1,1])];\n"];
+    [m appendString:@"        tensor<int32, [4]> c_pd = const()[name=string(\"c_pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendString:@"        string c_pt = const()[name=string(\"c_pt\"), val=string(\"valid\")];\n"];
+    [m appendString:@"        int32 c_gr = const()[name=string(\"c_gr\"), val=int32(1)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> c_y = conv(x=c_act, weight=c_W, strides=c_st, pad_type=c_pt, pad=c_pd, dilations=c_di, groups=c_gr)[name=string(\"c_y\")];\n", oc, seq];
+    [m appendString:@"    } -> (c_y);\n}\n"];
+    return m;
+}
+
+// Step B (PRD #26): conv with ZERO in-MIL transposes. The weight region of the
+// packed input is staged pre-transposed on the CPU (stage_wot_bwd_weights_convB,
+// ~free since weights are staged every step anyway) so that reshaping the weight
+// slice [1,ic,1,oc] straight to the conv kernel [oc,ic,1,1] already yields
+// W[o,i]=M[i,o]. Drops the c_w3 transpose vs gen_conv_1in_mil. The gate catches a
+// wrong staging permutation (cos must stay ~1.0).
+static NSString *gen_conv_1in_mil_B(int ic, int oc, int seq) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    int sp = seq + oc;
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", ic, sp];
+    [m appendString:@"        tensor<int32, [4]> c_ba = const()[name=string(\"c_ba\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendFormat:@"        tensor<int32, [4]> c_sa = const()[name=string(\"c_sa\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", ic, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> c_act = slice_by_size(x=x,begin=c_ba,size=c_sa)[name=string(\"c_act\")];\n", ic, seq];
+    [m appendFormat:@"        tensor<int32, [4]> c_bw = const()[name=string(\"c_bw\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", seq];
+    [m appendFormat:@"        tensor<int32, [4]> c_sw = const()[name=string(\"c_sw\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", ic, oc];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> c_wt = slice_by_size(x=x,begin=c_bw,size=c_sw)[name=string(\"c_wt\")];\n", ic, oc];
+    // weight already pre-transposed on CPU -> reshape straight to conv kernel, NO transpose
+    [m appendFormat:@"        tensor<int32, [4]> c_rk = const()[name=string(\"c_rk\"), val=tensor<int32, [4]>([%d,%d,1,1])];\n", oc, ic];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> c_W = reshape(shape=c_rk,x=c_wt)[name=string(\"c_W\")];\n", oc, ic];
+    [m appendString:@"        tensor<int32, [2]> c_st = const()[name=string(\"c_st\"), val=tensor<int32, [2]>([1,1])];\n"];
+    [m appendString:@"        tensor<int32, [2]> c_di = const()[name=string(\"c_di\"), val=tensor<int32, [2]>([1,1])];\n"];
+    [m appendString:@"        tensor<int32, [4]> c_pd = const()[name=string(\"c_pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendString:@"        string c_pt = const()[name=string(\"c_pt\"), val=string(\"valid\")];\n"];
+    [m appendString:@"        int32 c_gr = const()[name=string(\"c_gr\"), val=int32(1)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> c_y = conv(x=c_act, weight=c_W, strides=c_st, pad_type=c_pt, pad=c_pd, dilations=c_di, groups=c_gr)[name=string(\"c_y\")];\n", oc, seq];
+    [m appendString:@"    } -> (c_y);\n}\n"];
+    return m;
+}
+
 // ===== Fused FFN forward: W1,W3 + SiLU + W2 + residual =====
 // Same structure as before, just with Qwen3 DIM=1024, HIDDEN=3072
 static NSString *gen_ffn_fused_dynamic(void) {
