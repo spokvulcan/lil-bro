@@ -21,11 +21,17 @@ HERE=${0:A:h}
 cd "$HERE"
 
 echo "== build CPU ($KNOB=0) =="
+# CRITICAL: `make clean` first. The Makefile keys only on source mtimes, and
+# EXTRA (-D flags) is NOT a prerequisite — so without a clean, a second
+# `make EXTRA=...` with unchanged sources is a no-op and the KNOB=1 build never
+# happens, silently diffing the KNOB=0 binary against itself (a vacuous cos=1.0).
+make clean >/dev/null
 make MODEL="$MODEL" EXTRA="-D${KNOB}=0" >/dev/null
 ./train --scratch --overfit --dump-grads /tmp/g_cpu.bin >/tmp/gate_cpu.log 2>&1 \
   || { echo "CPU run failed:"; tail -20 /tmp/gate_cpu.log; exit 3; }
 
 echo "== build ANE ($KNOB=1) =="
+make clean >/dev/null
 make MODEL="$MODEL" EXTRA="-D${KNOB}=1" >/dev/null
 ./train --scratch --overfit --dump-grads /tmp/g_ane.bin >/tmp/gate_ane.log 2>&1 \
   || { echo "ANE run failed:"; tail -20 /tmp/gate_ane.log; exit 3; }

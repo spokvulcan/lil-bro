@@ -52,6 +52,15 @@
 #ifndef N_HC
 #define N_HC 1
 #endif
+// ⚠️ BROKEN ON THIS HARDWARE — the four placement knobs below (WO_FUNCPARAM,
+// W2T_FUNCPARAM, CONV_PROBE, CONV_DATAPATH) all route the weight through a
+// multi-input ANE request (io.h make_request_2in), which is REJECTED at
+// inference on M3 Max / Darwin 25.5 (ANEProgramProcessRequestDirect status=0x1d,
+// "Program Inference error"). Enabling any of them now aborts loudly via
+// ane_eval_check rather than silently training on zeros (the earlier "cos
+// 1.00000" passes were a gate comparing a binary against itself). Kept default-0
+// only as a starting point for a future multi-input fix or the single-input conv
+// path (gen_conv_1in). Full post-mortem: results/ane_residency.md "CORRECTION".
 // V2 placement knob (issue #12): pass woFwd's Wo as a function-parameter
 // IOSurface instead of packing it into the activation surface's spatial dim,
 // removing the in-kernel weight slice/reshape (upstream PR #22 lever). 0 = the
@@ -68,6 +77,14 @@
 // Probed on ffnBwdW2t under (W2T_FUNCPARAM && CONV_PROBE).
 #ifndef CONV_PROBE
 #define CONV_PROBE 0
+#endif
+// (RETRACTED conv "rollout" — see the ⚠️ block above.) Was meant to extend the
+// conv datapath (PRD #26) to wotBwd + qBwd, but delivers the weight via the
+// func-param multi-input request, so it hits the same status=0x1d wall and emits
+// zeros. Left wired (default-0) as scaffolding for the single-input gen_conv_1in
+// retry, which is the only path proven to eval on this box.
+#ifndef CONV_DATAPATH
+#define CONV_DATAPATH 0
 #endif
 // Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
 // emits this for generated headers; fallback keeps hand-written headers compiling.
@@ -134,7 +151,7 @@ typedef struct { void *model; IOSurfaceRef ioIn, ioIn1, ioOut; void *request; vo
 typedef struct {
     IOSurfaceRef sdpaFwd_in, woFwd_in, ffnFused_in;
     IOSurfaceRef ffnBwdW2t_in, ffnBwdW13t_in, wotBwd_in, qBwd_in, kvBwd_in;
-    IOSurfaceRef woFwd_w, ffnBwdW2t_w;
+    IOSurfaceRef woFwd_w, ffnBwdW2t_w, wotBwd_w, qBwd_w;
 } PerLayerSurfaces;
 
 // Per-layer ANE requests (bound to per-layer IOSurfaces)

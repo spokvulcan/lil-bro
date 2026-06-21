@@ -85,8 +85,13 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 
     // Wo^T backward: [1, DIM, 1, SEQ+Q_DIM] → [1, Q_DIM, 1, SEQ]
     printf("  Compiling wotBwd...\n");
+#if CONV_DATAPATH
+    dk->wotBwd = compile_kern_mil_2in(gen_conv_2in(DIM, Q_DIM, SEQ),
+        DIM*SEQ*2, DIM*Q_DIM*2, Q_DIM*SEQ*2);
+#else
     dk->wotBwd = compile_kern_mil_w(gen_wot_dynamic(), @{},
         DIM*WOT_BWD_SP*2, Q_DIM*SEQ*2);
+#endif
     if (!dk->wotBwd) return false;
 
     // SDPA bwd1 (weight-free, has mask): [1, 4*Q_DIM, 1, SEQ] → [1, Q_DIM+2*SCORE_CH, 1, SEQ]
@@ -103,8 +108,13 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 
     // Q backward: [1, Q_DIM, 1, SEQ+DIM] → [1, DIM, 1, SEQ]
     printf("  Compiling qBwd...\n");
+#if CONV_DATAPATH
+    dk->qBwd = compile_kern_mil_2in(gen_conv_2in(Q_DIM, DIM, SEQ),
+        Q_DIM*SEQ*2, Q_DIM*DIM*2, DIM*SEQ*2);
+#else
     dk->qBwd = compile_kern_mil_w(gen_q_bwd_dynamic(), @{},
         Q_DIM*Q_BWD_SP*2, DIM*SEQ*2);
+#endif
     if (!dk->qBwd) return false;
 
     // KV backward: [1, KV_DIM, 1, 2*SEQ+2*DIM] → [1, DIM, 1, SEQ]
@@ -1198,8 +1208,15 @@ int main(int argc, char *argv[]) {
             pls[L].ffnBwdW2t_in  = make_surface(DIM*FFN_BWD_W2T_SP*2);
 #endif
             pls[L].ffnBwdW13t_in = make_surface(HIDDEN*FFN_BWD_W13T_SP*2);
+#if CONV_DATAPATH
+            pls[L].wotBwd_in     = make_surface(DIM*SEQ*2);
+            pls[L].wotBwd_w      = make_surface(DIM*Q_DIM*2);
+            pls[L].qBwd_in       = make_surface(Q_DIM*SEQ*2);
+            pls[L].qBwd_w        = make_surface(Q_DIM*DIM*2);
+#else
             pls[L].wotBwd_in     = make_surface(DIM*WOT_BWD_SP*2);
             pls[L].qBwd_in       = make_surface(Q_DIM*Q_BWD_SP*2);
+#endif
             pls[L].kvBwd_in      = make_surface(KV_DIM*KV_BWD_SP*2);
 
             plr[L].sdpaFwd   = make_request(dk.sdpaFwd,   pls[L].sdpaFwd_in);
@@ -1215,8 +1232,13 @@ int main(int argc, char *argv[]) {
             plr[L].ffnBwdW2t = make_request(dk.ffnBwdW2t, pls[L].ffnBwdW2t_in);
 #endif
             plr[L].ffnBwdW13t= make_request(dk.ffnBwdW13t,pls[L].ffnBwdW13t_in);
+#if CONV_DATAPATH
+            plr[L].wotBwd    = make_request_2in(dk.wotBwd, pls[L].wotBwd_in, pls[L].wotBwd_w);
+            plr[L].qBwd      = make_request_2in(dk.qBwd,   pls[L].qBwd_in,   pls[L].qBwd_w);
+#else
             plr[L].wotBwd    = make_request(dk.wotBwd,    pls[L].wotBwd_in);
             plr[L].qBwd      = make_request(dk.qBwd,      pls[L].qBwd_in);
+#endif
             plr[L].kvBwd     = make_request(dk.kvBwd,     pls[L].kvBwd_in);
         }
 
@@ -1240,8 +1262,15 @@ int main(int argc, char *argv[]) {
             stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
 #endif
             stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#if CONV_DATAPATH
+            { static float t_wot_i[Q_DIM*DIM]; transpose_weight(t_wot_i, lw[L].Wo, DIM, Q_DIM);
+              io_write_fp16_at(pls[L].wotBwd_w, 0, t_wot_i, Q_DIM, DIM); }  // conv weight = Wo^T [OC=Q_DIM,IC=DIM,1,1]
+            { static float t_q_i[DIM*Q_DIM]; transpose_weight(t_q_i, lw[L].Wq, Q_DIM, DIM);
+              io_write_fp16_at(pls[L].qBwd_w, 0, t_q_i, DIM, Q_DIM); }      // conv weight = Wq^T [OC=DIM,IC=Q_DIM,1,1]
+#else
             stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
             stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
+#endif
             stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);
         }
         printf("Per-layer weight staging complete\n\n");
@@ -1538,7 +1567,11 @@ int main(int argc, char *argv[]) {
                 float *dx2_scaled = (float*)malloc(SEQ*DIM*4);
                 vDSP_vsmul(dx2, 1, &res_alpha, dx2_scaled, 1, (vDSP_Length)(SEQ*DIM));
                 t0 = mach_absolute_time();
+#if CONV_DATAPATH
+                io_write_fp16_at(pls[L].wotBwd_in, 0, dx2_scaled, DIM, SEQ);
+#else
                 write_wot_bwd_acts(pls[L].wotBwd_in, dx2_scaled);
+#endif
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.wotBwd, plr[L].wotBwd);
@@ -1653,7 +1686,11 @@ int main(int argc, char *argv[]) {
 
                 // Q backward (ANE): dq[Q_DIM] @ Wq → dx_q[DIM]
                 t0 = mach_absolute_time();
+#if CONV_DATAPATH
+                io_write_fp16_at(pls[L].qBwd_in, 0, dq, Q_DIM, SEQ);
+#else
                 write_q_bwd_acts(pls[L].qBwd_in, dq);
+#endif
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.qBwd, plr[L].qBwd);
@@ -1922,8 +1959,15 @@ int main(int argc, char *argv[]) {
                     stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
 #endif
                     stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#if CONV_DATAPATH
+                    { static float t_wot_r[Q_DIM*DIM]; transpose_weight(t_wot_r, lw[L].Wo, DIM, Q_DIM);
+                      io_write_fp16_at(pls[L].wotBwd_w, 0, t_wot_r, Q_DIM, DIM); }
+                    { static float t_q_r[DIM*Q_DIM]; transpose_weight(t_q_r, lw[L].Wq, Q_DIM, DIM);
+                      io_write_fp16_at(pls[L].qBwd_w, 0, t_q_r, DIM, Q_DIM); }
+#else
                     stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
                     stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
+#endif
                     stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);
                 }
                 adam_update(rms_final, grms_final, &arms_final, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);

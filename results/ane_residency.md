@@ -76,51 +76,76 @@ wall-clock — never a token-efficiency claim.
 | Date | Change | Gate | Before → after | Verdict |
 |---|---|---|---|---|
 | 2026-06-21 | baseline (stories110m, plain Muon) | R0 ✓ falls 9.14→7.07 | **~102 ms/step** | baseline |
-| 2026-06-21 | fuse SiLU-bwd 9 vDSP passes → 1 loop | R0 ✓ / R1 cos 0.99944 | `silu` 6.5→5.8 ms (−0.7) | keep (minor) |
-| 2026-06-21 | woFwd → function-param IOSurface (`WO_FUNCPARAM`) | R0 ✓ / R1 **cos 1.00000** | no Δ (smallest weight) | mechanism proven; default-off |
-| 2026-06-21 | ffnBwdW2t → function-param (`W2T_FUNCPARAM`, W2=768×2048) | R0 ✓ / R1 **cos 1.00000** | `ane_bwd` 31.0→30.5, `io_bwd` 9.8→10.0 (noise) | **lever refuted here**; default-off |
+| 2026-06-21 | fuse SiLU-bwd 9 vDSP passes → 1 loop | R0 ✓ / R1 **cos 0.99944** (clean re-verify) | `silu` 6.5→5.8 ms (−0.7) | **keep (verified, default-on)** |
+| 2026-06-21 | ~~woFwd → function-param IOSurface (`WO_FUNCPARAM`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
+| 2026-06-21 | ~~ffnBwdW2t → function-param (`W2T_FUNCPARAM`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
+| 2026-06-21 | ~~conv datapath on ffnBwdW2t (`CONV_PROBE`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
 
-**IOSurface function-param lever — REFUTED on this config (measured).** Removing the
-in-kernel weight slice/reshape gives **no wall-clock delta** on either the smallest
-weight (woFwd, 768×768) *or* the largest simple weight (ffnBwdW2t, 768×2048) — both
-bitwise-correct, both ~0 ms. The per-kernel unpack is not a measurable fraction of
-eval time on the M3 Max ANE (most likely the compiler already constant-folds the
-static-offset slice). The upstream PR #22 −30% does **not** reproduce on
-stories110m/M3 Max. The full multi-kernel rollout is therefore **not worth it** — the
-measurement saved that effort. The multi-input *mechanism* (`compile_kern_mil_2in`,
-`gen_matmul_2in`) is kept: the SiLU-fold and ANE-classifier need it to move *compute*
-(not just weight layout) onto the ANE, a different value proposition.
+> ### ⚠️ CORRECTION (2026-06-21) — the func-param + conv "confirmations" were false passes
+>
+> Three of the rows above were **retracted after the equivalence gate was found
+> broken**. Re-derived from primary evidence this session:
+>
+> 1. **The gate was comparing a binary against itself.** `gate_placement.zsh`
+>    built `KNOB=0`, then `KNOB=1`, with **no `make clean` between** — and the
+>    Makefile keys on source mtime, with `EXTRA` (`-D` flags) **not** a
+>    prerequisite. So the second build was a no-op: both dumps came from the
+>    `KNOB=0` binary. A self-compare returns *exactly* `cos 1.00000` — which is
+>    why every "perfect" pass looked perfect. (Sanity control after the fix:
+>    clean `KNOB=0` vs clean `KNOB=0` → `cos 1.00000, rel_l2 0`; clean `KNOB=0`
+>    vs clean `W2T_FUNCPARAM=1` → **`cos 0.00000 @ L0.W1`**.) *Fixed:* `make
+>    clean` before each build in `gate_placement.zsh`.
+>
+> 2. **The multi-input ANE binding does not execute on this hardware.** Every
+>    func-param / conv kernel routed through `make_request_2in` (a 2-input
+>    `requestWithInputs:@[act,W] inputIndices:@[@0,@1]`). That request is
+>    **rejected at inference** on this M3 Max / Darwin 25.5:
+>    `ANEProgramProcessRequestDirect() Failed with status=0x1d : statusType=0x9:
+>    Program Inference error` (Code=8). The output surface stays zero → grads are
+>    zero → `cos 0.0`. Compile succeeds; **eval fails**. Single-input
+>    (`make_request`) evals fine — it is specifically the 2-input request.
+>
+> 3. **The failure was silent.** `ane_eval`/`ane_eval_req` discarded the
+>    `evaluateWithQoS` `BOOL` and never printed the `NSError`, so a failed eval
+>    looked identical to a successful one. *Fixed:* `ane_eval_check` now prints
+>    the kernel + error and `abort()`s on `ok==NO` (`io.h`). Verified: a
+>    `W2T_FUNCPARAM=1` build now aborts loudly with the status-0x1d error instead
+>    of training on zeros.
+>
+> **Net:** the IOSurface function-param lever is **not "refuted by no-speedup"**
+> — the mechanism never ran here (multi-input inference is the wall). The conv
+> datapath is **neither confirmed nor refuted — it is UNTESTED**: the only conv
+> path tried delivered its runtime weight as a 2nd input (broken). The "~1 ms
+> faster" conv timing was the kernel *erroring out early*, not real work. The
+> baseline buckets, determinism, and the SiLU fold are unaffected and stand.
 
-**Revised hypothesis for the real wall-clock:** `ane_fwd`(20)+`ane_bwd`(31)=51 ms is
-the ANE matmul datapath itself, and `gen_dyn_matmul` wraps every matmul in **two
-transposes** (`reshape→transpose→matmul→transpose→reshape`) to hit the `[SEQ,IC]@[IC,OC]`
-orientation. The ANE is natively a convolution engine; a **1×1 conv** consumes the
-`[1,IC,1,SEQ]` layout directly with no transpose (PRD #26). That targets the *biggest*
-bucket (51 ms).
+**Revised hypothesis for the real wall-clock (still open).** `ane_fwd`(20) +
+`ane_bwd`(31) = 51 ms is the ANE matmul datapath, and `gen_dyn_matmul` wraps
+every matmul in **two transposes** (`reshape→transpose→matmul→transpose→reshape`)
+to reach `[SEQ,IC]@[IC,OC]`. The ANE is natively a conv engine; a **1×1 conv**
+consumes `[1,IC,1,SEQ]` with no transpose (PRD #26). That still targets the
+biggest bucket — but it must be reached **without** the multi-input binding.
+*Next experiment:* `gen_conv_1in` — pack `[act | weight]` into ONE input surface
+(exactly as `gen_dyn_matmul` already does for matmul), `slice`+`reshape` the
+weight to `[OC,IC,1,1]` inside the MIL, and conv. Single-input binding = the
+working path. Gate it with the **fixed** `gate_placement.zsh`. If `cos 1.0` AND
+faster → the conv lever is real; if `cos 0.0` → MIL conv won't take a non-const
+weight and the lever is dead for training. Either way it's now an honest test.
 
-| 2026-06-21 | conv datapath on ffnBwdW2t (`CONV_PROBE`) | R0 ✓ / R1 **cos 1.00000** | `ane_bwd` 31.0→**29.4**, `io_bwd` 9.8→9.4 | **CONFIRMED — conv wins** |
+**Why the multi-input request fails (open, for the next attempt).** Status
+`0x1d` is opaque. Two hypotheses, untested: (a) the private
+`requestWithInputs:inputIndices:…procedureIndex:` path genuinely doesn't honor a
+2-input procedure on this OS; (b) the compiled MIL `func main(x, w)` signature /
+input-index mapping doesn't match the request binding. Upstream PR #22 (the
+function-param IOSurface lever) reportedly works elsewhere, so it may be OS/HW
+version or a plumbing detail — but on *this* box, single-input is the only path
+proven to eval.
 
-**Conv datapath — CONFIRMED (the real lever).** MIL `conv` *does* accept a runtime
-func-param weight (`gen_conv_2in`), and `conv(x=[1,IC,1,SEQ], W=[OC,IC,1,1])` is
-**bitwise-identical** to matmul+2-transposes (cos 1.0) while **~1 ms faster per kernel**
-(no transposes, native NCHW). On `ffnBwdW2t` alone: `ane_bwd` 31.0→29.4, and `io_bwd`
-also dipped. This is the opposite of the IOSurface result — it actually moves wall-clock.
-Weight is `Wᵀ` as the conv kernel `[OC,IC,1,1]`. **Next: roll conv out to the other
-matmul kernels** — the standalone backward matmuls (`wotBwd`, `qBwd`) are the same easy
-pattern; the forward `sdpaFwd`/`ffnFused` internal matmuls are the big-transpose wins.
-Projected aggregate if ~1 ms holds across ~10 matmul sites: **~8–10 ms (~10%)**.
-
-**IOSurface lever — mechanism proven.** Multi-input MIL binding works: a
-`func main(x, Wo)` with `requestWithInputs:@[act,Wo] inputIndices:@[@0,@1]` and `Wo^T`
-staged as a contiguous `[1,1,Q_DIM,DIM]` surface gives **bitwise-identical** grads
-(cos 1.0, rel_l2 0). woFwd alone is unmeasurable (Wo is 768×768, the smallest weight),
-but this unlocks the −30% rollout to the big-weight kernels (FFN W1/W2/W3 = 768×2048,
-SDPA Wq/Wk/Wv) and is the same multi-surface plumbing the SiLU-fold and classifier need.
-Reusable: `compile_kern_mil_2in`, `make_request_2in` (`io.h`), `gen_wo_fwd_2in` (`mil_dynamic.h`).
-
-**SiLU finding:** the bucket is *not* dominated by the 9 elementwise passes (fusing
-them saved only 0.7 ms) — it's dominated by the **sigmoid setup** (`vvexpf` + `vvrecf`,
-4 vectorized passes left intact). So the real lever for `silu` is the ANE's hardware
-`sigmoid`, i.e. folding SiLU-backward into the FFN-bwd ANE kernel (P3), not CPU
-micro-opt. R1 cos 0.99944 (not 1.0) is benign FMA contraction at -O2 — *more* accurate
-than the separate-rounding vDSP, well inside the cos≥0.99 gate.
+**SiLU finding (stands, re-verified clean).** Pre-fusion (`561cb78`, 9-pass
+vDSP) vs current fused default → **`cos 0.99944 @ L2.rms_ffn, R1 PASS`**
+(separate clean builds, not a self-compare — a self-compare would be exactly
+1.0). The bucket is *not* dominated by the 9 elementwise passes (fusing saved
+only 0.7 ms) — it's the **sigmoid setup** (`vvexpf`+`vvrecf`). The real `silu`
+lever is the ANE's hardware `sigmoid` (fold SiLU-bwd into the FFN-bwd ANE kernel,
+P3), not CPU micro-opt. The 0.99944 (not 1.0) is benign FMA contraction at -O2 —
+*more* accurate than separate-rounding vDSP, well inside the cos≥0.99 gate.

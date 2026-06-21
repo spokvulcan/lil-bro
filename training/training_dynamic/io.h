@@ -169,13 +169,27 @@ static void free_kern(Kern *k) {
     CFRelease(k->model); CFRelease(k->request); CFRelease(k->tmpDir);
     free(k);
 }
+// A failed ANE eval returns NO and leaves the output surface untouched (stale /
+// zero). Silently discarding that BOOL is how a broken kernel masquerades as
+// "bitwise-correct" — the eval never runs, the output stays zero, and a naive
+// equivalence check passes. Fail LOUD: print the kernel + NSError and abort, so
+// "silently wrong gradients" can never hide behind a green gate again.
+static void ane_eval_check(id mdl, id req) {
+    NSError *e = nil;
+    BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+        mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    if (!ok) {
+        fprintf(stderr, "\n[ANE EVAL FAILED] evaluateWithQoS returned NO — output "
+                "surface is STALE/ZERO, not a real result.\n  error: %s\n",
+                e ? [[e description] UTF8String] : "(nil)");
+        abort();
+    }
+}
 static void ane_eval(Kern *k) {
-    id mdl = (__bridge id)k->model; id req = (__bridge id)k->request; NSError *e = nil;
-    ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    ane_eval_check((__bridge id)k->model, (__bridge id)k->request);
 }
 static void ane_eval_req(Kern *k, void *request) {
-    id mdl = (__bridge id)k->model; id req = (__bridge id)request; NSError *e = nil;
-    ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    ane_eval_check((__bridge id)k->model, (__bridge id)request);
 }
 static void *make_request(Kern *k, IOSurfaceRef ioIn) {
     id wI = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioIn);
@@ -359,6 +373,9 @@ static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {
 #endif
 #if W2T_FUNCPARAM
         CFRelease(pls[L].ffnBwdW2t_w);
+#endif
+#if CONV_DATAPATH
+        CFRelease(pls[L].wotBwd_w); CFRelease(pls[L].qBwd_w);
 #endif
         CFRelease(pls[L].ffnBwdW2t_in); CFRelease(pls[L].ffnBwdW13t_in);
         CFRelease(pls[L].wotBwd_in); CFRelease(pls[L].qBwd_in); CFRelease(pls[L].kvBwd_in);
