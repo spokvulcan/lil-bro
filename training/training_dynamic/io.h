@@ -137,14 +137,16 @@ static Kern *compile_kern_mil_w(NSString *mil, NSDictionary *weights, int ic_byt
 static Kern *compile_kern_mil_2in(NSString *mil, int ic0_bytes, int ic1_bytes, int oc_bytes) {
     Kern *k = compile_kern_mil_w(mil, @{}, ic0_bytes, oc_bytes);
     if (!k) return NULL;
-    CFRelease(k->request);  // drop the single-input template request
-    k->ioIn1 = make_surface(ic1_bytes);
-    id wI0 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn);
-    id wI1 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn1);
-    id wO  = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioOut);
-    k->request = (void*)CFBridgingRetain(((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
-        @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
-        @[wI0, wI1], @[@0, @1], @[wO], @[@0], nil, nil, @0));
+    @autoreleasepool {
+        CFRelease(k->request);  // drop the single-input template request
+        k->ioIn1 = make_surface(ic1_bytes);
+        id wI0 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn);
+        id wI1 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn1);
+        id wO  = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioOut);
+        k->request = (void*)CFBridgingRetain(((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            @[wI0, wI1], @[@0, @1], @[wO], @[@0], nil, nil, @0));
+    }
     return k;
 }
 // Per-layer request binding two input surfaces (act @0, weight @1) to one output.

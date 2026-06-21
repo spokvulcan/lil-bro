@@ -64,6 +64,11 @@
 #ifndef W2T_FUNCPARAM
 #define W2T_FUNCPARAM 0
 #endif
+// Experiment: emit the matmul kernels as 1x1 convs (PRD #26, no transposes).
+// Probed on ffnBwdW2t under (W2T_FUNCPARAM && CONV_PROBE).
+#ifndef CONV_PROBE
+#define CONV_PROBE 0
+#endif
 // Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
 // emits this for generated headers; fallback keeps hand-written headers compiling.
 #ifndef MTP_DEPTH
