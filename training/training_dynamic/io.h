@@ -131,22 +131,65 @@ static Kern *compile_kern_mil_w(NSString *mil, NSDictionary *weights, int ic_byt
     return k;
     }
 }
+// Two-input variant: compile a MIL func main(x, w) and bind both input
+// surfaces (indices 0,1) in the template request. Additive — single-input
+// compile_kern_mil_w is untouched. Used by the function-parameter weight path.
+static Kern *compile_kern_mil_2in(NSString *mil, int ic0_bytes, int ic1_bytes, int oc_bytes) {
+    Kern *k = compile_kern_mil_w(mil, @{}, ic0_bytes, oc_bytes);
+    if (!k) return NULL;
+    @autoreleasepool {
+        CFRelease(k->request);  // drop the single-input template request
+        k->ioIn1 = make_surface(ic1_bytes);
+        id wI0 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn);
+        id wI1 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn1);
+        id wO  = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioOut);
+        k->request = (void*)CFBridgingRetain(((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+            @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+            @[wI0, wI1], @[@0, @1], @[wO], @[@0], nil, nil, @0));
+    }
+    return k;
+}
+// Per-layer request binding two input surfaces (act @0, weight @1) to one output.
+static void *make_request_2in(Kern *k, IOSurfaceRef in0, IOSurfaceRef in1) {
+    id wI0 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), in0);
+    id wI1 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), in1);
+    id wO  = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioOut);
+    id req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+        @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+        @[wI0, wI1], @[@0, @1], @[wO], @[@0], nil, nil, @0);
+    return (void*)CFBridgingRetain(req);
+}
 static void free_kern(Kern *k) {
     if (!k) return;
     id mdl = (__bridge id)k->model; NSError *e = nil;
     ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(mdl, @selector(unloadWithQoS:error:), 21, &e);
     CFRelease(k->ioIn); CFRelease(k->ioOut);
+    if (k->ioIn1) CFRelease(k->ioIn1);
     [[NSFileManager defaultManager] removeItemAtPath:(__bridge id)k->tmpDir error:nil];
     CFRelease(k->model); CFRelease(k->request); CFRelease(k->tmpDir);
     free(k);
 }
+// A failed ANE eval returns NO and leaves the output surface untouched (stale /
+// zero). Silently discarding that BOOL is how a broken kernel masquerades as
+// "bitwise-correct" — the eval never runs, the output stays zero, and a naive
+// equivalence check passes. Fail LOUD: print the kernel + NSError and abort, so
+// "silently wrong gradients" can never hide behind a green gate again.
+static void ane_eval_check(id mdl, id req) {
+    NSError *e = nil;
+    BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+        mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    if (!ok) {
+        fprintf(stderr, "\n[ANE EVAL FAILED] evaluateWithQoS returned NO — output "
+                "surface is STALE/ZERO, not a real result.\n  error: %s\n",
+                e ? [[e description] UTF8String] : "(nil)");
+        abort();
+    }
+}
 static void ane_eval(Kern *k) {
-    id mdl = (__bridge id)k->model; id req = (__bridge id)k->request; NSError *e = nil;
-    ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    ane_eval_check((__bridge id)k->model, (__bridge id)k->request);
 }
 static void ane_eval_req(Kern *k, void *request) {
-    id mdl = (__bridge id)k->model; id req = (__bridge id)request; NSError *e = nil;
-    ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    ane_eval_check((__bridge id)k->model, (__bridge id)request);
 }
 static void *make_request(Kern *k, IOSurfaceRef ioIn) {
     id wI = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), ioIn);
@@ -194,6 +237,15 @@ static void write_wo_fwd_acts(IOSurfaceRef s, const float *attn_out) {
     for (int d = 0; d < Q_DIM; d++)
         cvt_f32_f16(buf + d*WO_FWD_SP, attn_out + d*SEQ, SEQ);
     IOSurfaceUnlock(s, 0, NULL);
+}
+// Function-parameter woFwd (WO_FUNCPARAM): the act surface holds only attn_out
+// [1,Q_DIM,1,SEQ] (no packed weight); Wo^T arrives as its own [1,1,Q_DIM,DIM]
+// surface, already in matmul shape, so the kernel skips the weight slice/reshape.
+static void write_wo_fwd_acts_fp(IOSurfaceRef s, const float *attn_out) {
+    io_write_fp16_at(s, 0, attn_out, Q_DIM, SEQ);   // contiguous [Q_DIM, SEQ]
+}
+static void stage_wo_fwd_w_fp(IOSurfaceRef s, const float *Wot) {
+    io_write_fp16_at(s, 0, Wot, Q_DIM, DIM);        // contiguous [Q_DIM, DIM] = Wo^T
 }
 
 // ffnFused: [1, DIM, 1, 2*SEQ+3*HIDDEN] fp16
@@ -257,6 +309,44 @@ static void write_ffn_bwd_w13t_acts(IOSurfaceRef s, const float *dh1, const floa
     IOSurfaceUnlock(s, 0, NULL);
 }
 
+// FUSE_SILU_BWD: ffnBwdW13t input grows to [dsilu | h1 | h3 | W1t | W3t] —
+// SP = 3*SEQ + 2*DIM (one extra SEQ-wide region vs FFN_BWD_W13T_SP). Same
+// spatial-strided layout. dsilu is filled by copy_dsilu_into_w13t_fused; h1,h3
+// by write_ffn_bwd_w13t_fused_h; W1,W3 (weights) by the staging fn below.
+#define FFN_BWD_W13T_FUSED_SP (3*SEQ + 2*DIM)
+static void stage_ffn_bwd_w13t_fused_weights(IOSurfaceRef s, const float *W1, const float *W3) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < HIDDEN; d++) {
+        cvt_f32_f16(buf + d*FFN_BWD_W13T_FUSED_SP + 3*SEQ,       W1 + d*DIM, DIM);
+        cvt_f32_f16(buf + d*FFN_BWD_W13T_FUSED_SP + 3*SEQ + DIM, W3 + d*DIM, DIM);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_ffn_bwd_w13t_fused_h(IOSurfaceRef s, const float *h1, const float *h3) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < HIDDEN; d++) {
+        cvt_f32_f16(buf + d*FFN_BWD_W13T_FUSED_SP + SEQ,   h1 + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*FFN_BWD_W13T_FUSED_SP + 2*SEQ, h3 + d*SEQ, SEQ);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+// Strided ANE->ANE copy: dsilu lives in ffnBwdW2t's OUTPUT as contiguous
+// [HIDDEN,SEQ] (stride SEQ); place it at offset 0 of each channel of the fused
+// W13t input (stride FFN_BWD_W13T_FUSED_SP). fp16->fp16, no conversion, no CPU
+// round-trip — the silu-bwd math never leaves the ANE.
+static void copy_dsilu_into_w13t_fused(IOSurfaceRef dst, IOSurfaceRef src) {
+    IOSurfaceLock(dst, 0, NULL);
+    IOSurfaceLock(src, kIOSurfaceLockReadOnly, NULL);
+    _Float16 *db = (_Float16*)IOSurfaceGetBaseAddress(dst);
+    _Float16 *sb = (_Float16*)IOSurfaceGetBaseAddress(src);
+    for (int d = 0; d < HIDDEN; d++)
+        memcpy(db + d*FFN_BWD_W13T_FUSED_SP, sb + d*SEQ, SEQ * sizeof(_Float16));
+    IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
+    IOSurfaceUnlock(dst, 0, NULL);
+}
+
 // wotBwd: [1, DIM, 1, SEQ+Q_DIM] fp16 — Wo is [DIM, Q_DIM], matmul gives Wo^T @ dy
 #define WOT_BWD_SP (SEQ + Q_DIM)
 static void stage_wot_bwd_weights(IOSurfaceRef s, const float *Wo) {
@@ -273,6 +363,25 @@ static void write_wot_bwd_acts(IOSurfaceRef s, const float *dy) {
         cvt_f32_f16(buf + d*WOT_BWD_SP, dy + d*SEQ, SEQ);
     IOSurfaceUnlock(s, 0, NULL);
 }
+#if CONV1IN == 2
+// Step-B staging (PRD #26): write the weight region pre-transposed so the conv
+// MIL (gen_conv_1in_mil_B) reshapes the weight slice [1,IC,1,OC] straight to the
+// conv kernel [OC,IC,1,1] = W[o,i]=M[i,o] with NO in-MIL transpose. Wo is M
+// [DIM=IC, Q_DIM=OC]. The reshape preserves logical-flat order, so conv-kernel
+// flat p=o*IC+i must hold M[i,o], i.e. sliced element [0,p/OC,0,p%OC] =
+// buf[(p/OC)*WOT_BWD_SP + SEQ + (p%OC)]. (IC==OC here, but written generally.)
+static void stage_wot_bwd_weights_convB(IOSurfaceRef s, const float *Wo) {
+    const int IC = DIM, OC = Q_DIM;
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int o = 0; o < OC; o++)
+        for (int i = 0; i < IC; i++) {
+            int p = o*IC + i;            // conv-kernel logical-flat index
+            buf[(p/OC)*WOT_BWD_SP + SEQ + (p%OC)] = (_Float16)Wo[i*OC + o];  // M[i,o]
+        }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+#endif
 
 // qBwd: [1, Q_DIM, 1, SEQ+DIM] fp16 — Wq is [Q_DIM, DIM], matmul gives Wq^T @ dq
 #define Q_BWD_SP (SEQ + DIM)
@@ -312,15 +421,63 @@ static void write_kv_bwd_acts(IOSurfaceRef s, const float *dk, const float *dv) 
     IOSurfaceUnlock(s, 0, NULL);
 }
 
+#if FUSE_QKVBWD
+// qkvBwd (fused, MHA-only): one packed surface [1, DIM, 1, 3*SEQ+3*DIM] fp16 =
+// [dq | dk | dv | Wq | Wk | Wv]. Requires Q_DIM==KV_DIM==DIM (#error in config.h
+// otherwise), so all three projections share IC=DIM. Activations dq/dk/dv are
+// [DIM,SEQ]; weights Wq/Wk/Wv are [DIM rows, DIM cols] — the SAME layouts the
+// split stage_q_bwd_weights / stage_kv_bwd_weights / write_*_bwd_acts use, so
+// the fused matmuls are byte-identical math to qBwd + kvBwd, summed in-kernel.
+#define QKV_BWD_SP (3*SEQ + 3*DIM)
+static void stage_qkv_bwd_weights(IOSurfaceRef s, const float *Wq,
+                                  const float *Wk, const float *Wv) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ,         Wq + d*DIM, DIM);
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ + DIM,   Wk + d*DIM, DIM);
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ + 2*DIM, Wv + d*DIM, DIM);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_qkv_bwd_acts(IOSurfaceRef s, const float *dq,
+                               const float *dk, const float *dv) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*QKV_BWD_SP,         dq + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*QKV_BWD_SP + SEQ,   dk + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 2*SEQ, dv + d*SEQ, SEQ);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+#endif
+
 // Free per-layer surfaces and requests
 static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {
     for (int L = 0; L < NLAYERS; L++) {
         CFRelease(pls[L].sdpaFwd_in); CFRelease(pls[L].woFwd_in); CFRelease(pls[L].ffnFused_in);
+#if WO_FUNCPARAM
+        CFRelease(pls[L].woFwd_w);
+#endif
+#if W2T_FUNCPARAM
+        CFRelease(pls[L].ffnBwdW2t_w);
+#endif
+#if CONV_DATAPATH
+        CFRelease(pls[L].wotBwd_w); CFRelease(pls[L].qBwd_w);
+#endif
         CFRelease(pls[L].ffnBwdW2t_in); CFRelease(pls[L].ffnBwdW13t_in);
-        CFRelease(pls[L].wotBwd_in); CFRelease(pls[L].qBwd_in); CFRelease(pls[L].kvBwd_in);
+        CFRelease(pls[L].wotBwd_in);
         CFRelease(plr[L].sdpaFwd); CFRelease(plr[L].woFwd); CFRelease(plr[L].ffnFused);
         CFRelease(plr[L].ffnBwdW2t); CFRelease(plr[L].ffnBwdW13t);
-        CFRelease(plr[L].wotBwd); CFRelease(plr[L].qBwd); CFRelease(plr[L].kvBwd);
+        CFRelease(plr[L].wotBwd);
+#if FUSE_QKVBWD
+        CFRelease(pls[L].qkvBwd_in);
+        CFRelease(plr[L].qkvBwd);
+#else
+        CFRelease(pls[L].qBwd_in); CFRelease(pls[L].kvBwd_in);
+        CFRelease(plr[L].qBwd); CFRelease(plr[L].kvBwd);
+#endif
     }
 }
 

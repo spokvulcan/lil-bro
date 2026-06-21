@@ -17,7 +17,35 @@ typedef struct {
     Kern *sdpaBwd2;    // probs,dp,Q,K → dQ,dK_full (weight-free)
     Kern *qBwd;        // dq @ Wq → dx_q (Q_DIM → DIM)
     Kern *kvBwd;       // dk@Wk + dv@Wv → dx_kv (KV_DIM → DIM)
+#if FUSE_QKVBWD
+    Kern *qkvBwd;      // fused: dq@Wq + dk@Wk + dv@Wv → dx_attn (one eval, MHA-only)
+#endif
 } DynLayerKernels;
+
+#if FUSE_SILU_BWD == 2
+// Non-clamp SiLU backward, recomputed CPU-side in the async dW closure (mode 2):
+//   dh3 = dsilu * silu(h1) ;  dh1 = dsilu * h3 * silu'(h1)
+// with silu = h1*sig, silu'(h1) = sig*(1 + h1*(1-sig)). Vectorized sigmoid
+// (vvexpf — scalar expf over HIDDEN*SEQ*NLAYERS would cost tens of ms) then a
+// fused FMA sweep, bit-matching train.m's inline #else CPU path. Runs on the
+// (slack) serial dw_q so it overlaps the next layers' ANE evals.
+static void silu_bwd_recompute(float *dh1, float *dh3, const float *dsilu,
+                               const float *h1, const float *h3, int n) {
+    float *sig = (float*)malloc((size_t)n*4);
+    float minus1 = -1.0f, one = 1.0f;
+    vDSP_vsmul(h1, 1, &minus1, sig, 1, (vDSP_Length)n);
+    int nn = n; vvexpf(sig, sig, &nn);
+    vDSP_vsadd(sig, 1, &one, sig, 1, (vDSP_Length)n);
+    vvrecf(sig, sig, &nn);                       // sig = sigmoid(h1)
+    for (int j = 0; j < n; j++) {
+        float s = sig[j], h1v = h1[j], d = dsilu[j];
+        float siluprime = s * (h1v * (-(s - 1.0f)) + 1.0f);
+        dh3[j] = d * (h1v * s);
+        dh1[j] = (d * h3[j]) * siluprime;
+    }
+    free(sig);
+}
+#endif
 
 // Transpose W[rows,cols] → W^T[cols,rows] stored as [cols channels, rows spatial]
 static void transpose_weight(float *dst, const float *src, int rows, int cols) {
@@ -45,8 +73,13 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 
     // Wo forward: [1, Q_DIM, 1, SEQ+DIM] → [1, DIM, 1, SEQ]
     printf("  Compiling woFwd...\n");
+#if WO_FUNCPARAM
+    dk->woFwd = compile_kern_mil_2in(gen_wo_fwd_2in(),
+        Q_DIM*SEQ*2, Q_DIM*DIM*2, DIM*SEQ*2);
+#else
     dk->woFwd = compile_kern_mil_w(gen_wo_fwd_dynamic(), @{},
         Q_DIM*WO_FWD_SP*2, DIM*SEQ*2);
+#endif
     if (!dk->woFwd) return false;
 
     // Fused FFN: [1, DIM, 1, FFN_FUSED_SP] → [1, DIM+3*HIDDEN, 1, SEQ]
@@ -58,20 +91,56 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 
     // FFN backward W2^T: [1, DIM, 1, SEQ+HIDDEN] → [1, HIDDEN, 1, SEQ]
     printf("  Compiling ffnBwdW2t...\n");
+#if W2T_FUNCPARAM
+#if CONV_PROBE
+    dk->ffnBwdW2t = compile_kern_mil_2in(gen_conv_2in(DIM, HIDDEN, SEQ),
+        DIM*SEQ*2, DIM*HIDDEN*2, HIDDEN*SEQ*2);
+#else
+    dk->ffnBwdW2t = compile_kern_mil_2in(gen_matmul_2in(DIM, HIDDEN, SEQ),
+        DIM*SEQ*2, DIM*HIDDEN*2, HIDDEN*SEQ*2);
+#endif
+#else
     dk->ffnBwdW2t = compile_kern_mil_w(gen_ffn_bwd_w2t_dynamic(), @{},
         DIM*FFN_BWD_W2T_SP*2, HIDDEN*SEQ*2);
+#endif
     if (!dk->ffnBwdW2t) return false;
 
     // FFN backward W1^T+W3^T: [1, HIDDEN, 1, 2*SEQ+2*DIM] → [1, DIM, 1, SEQ]
     printf("  Compiling ffnBwdW13t...\n");
+#if FUSE_SILU_BWD == 1
+    // Fused: input [dsilu|h1|h3|W1t|W3t] (3*SEQ+2*DIM), output concat(dx,dh1,dh3)
+    dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_fused_silu_dynamic(1), @{},
+        HIDDEN*FFN_BWD_W13T_FUSED_SP*2, (DIM+2*HIDDEN)*SEQ*2);
+#elif FUSE_SILU_BWD == 2
+    // Recompute mode: output dx only; dW closure recomputes dh1/dh3 on the dw_q.
+    dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_fused_silu_dynamic(0), @{},
+        HIDDEN*FFN_BWD_W13T_FUSED_SP*2, DIM*SEQ*2);
+#else
     dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_dynamic(), @{},
         HIDDEN*FFN_BWD_W13T_SP*2, DIM*SEQ*2);
+#endif
     if (!dk->ffnBwdW13t) return false;
 
     // Wo^T backward: [1, DIM, 1, SEQ+Q_DIM] → [1, Q_DIM, 1, SEQ]
     printf("  Compiling wotBwd...\n");
+#if CONV_DATAPATH
+    dk->wotBwd = compile_kern_mil_2in(gen_conv_2in(DIM, Q_DIM, SEQ),
+        DIM*SEQ*2, DIM*Q_DIM*2, Q_DIM*SEQ*2);
+#elif CONV1IN == 2
+    // PRD #26 Step B: conv with weight pre-transposed in staging -> zero in-MIL
+    // transposes. SAME packed input surface (only the weight region's layout
+    // differs, handled by stage_wot_bwd_weights_convB).
+    dk->wotBwd = compile_kern_mil_w(gen_conv_1in_mil_B(DIM, Q_DIM, SEQ), @{},
+        DIM*WOT_BWD_SP*2, Q_DIM*SEQ*2);
+#elif CONV1IN
+    // PRD #26 Step A single-input conv: SAME packed input surface + staging as
+    // the matmul path (DIM*WOT_BWD_SP*2 in, Q_DIM*SEQ*2 out) — only the MIL swaps.
+    dk->wotBwd = compile_kern_mil_w(gen_conv_1in_mil(DIM, Q_DIM, SEQ), @{},
+        DIM*WOT_BWD_SP*2, Q_DIM*SEQ*2);
+#else
     dk->wotBwd = compile_kern_mil_w(gen_wot_dynamic(), @{},
         DIM*WOT_BWD_SP*2, Q_DIM*SEQ*2);
+#endif
     if (!dk->wotBwd) return false;
 
     // SDPA bwd1 (weight-free, has mask): [1, 4*Q_DIM, 1, SEQ] → [1, Q_DIM+2*SCORE_CH, 1, SEQ]
@@ -86,10 +155,23 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
         (2*SCORE_CH+2*Q_DIM)*SEQ*2, 2*Q_DIM*SEQ*2);
     if (!dk->sdpaBwd2) return false;
 
+#if FUSE_QKVBWD
+    // Fused QKV backward (MHA-only): one eval replaces qBwd + kvBwd.
+    // [1, DIM, 1, 3*SEQ+3*DIM] → [1, DIM, 1, SEQ]
+    printf("  Compiling qkvBwd (fused)...\n");
+    dk->qkvBwd = compile_kern_mil_w(gen_qkv_bwd_fused_mil(), @{},
+        DIM*QKV_BWD_SP*2, DIM*SEQ*2);
+    if (!dk->qkvBwd) return false;
+#else
     // Q backward: [1, Q_DIM, 1, SEQ+DIM] → [1, DIM, 1, SEQ]
     printf("  Compiling qBwd...\n");
+#if CONV_DATAPATH
+    dk->qBwd = compile_kern_mil_2in(gen_conv_2in(Q_DIM, DIM, SEQ),
+        Q_DIM*SEQ*2, Q_DIM*DIM*2, DIM*SEQ*2);
+#else
     dk->qBwd = compile_kern_mil_w(gen_q_bwd_dynamic(), @{},
         Q_DIM*Q_BWD_SP*2, DIM*SEQ*2);
+#endif
     if (!dk->qBwd) return false;
 
     // KV backward: [1, KV_DIM, 1, 2*SEQ+2*DIM] → [1, DIM, 1, SEQ]
@@ -97,6 +179,7 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
     dk->kvBwd = compile_kern_mil_w(gen_kv_bwd_dynamic(), @{},
         KV_DIM*KV_BWD_SP*2, DIM*SEQ*2);
     if (!dk->kvBwd) return false;
+#endif
 
     return true;
 }
@@ -530,7 +613,11 @@ static void forward_hidden(
 
         // Wo forward (ANE)
         t0 = mach_absolute_time();
+#if WO_FUNCPARAM
+        write_wo_fwd_acts_fp(pls[L].woFwd_in, ac->attn_out);
+#else
         write_wo_fwd_acts(pls[L].woFwd_in, ac->attn_out);
+#endif
         r_io += tb_ms(mach_absolute_time() - t0);
         t0 = mach_absolute_time();
         ane_eval_req(dk->woFwd, plr[L].woFwd);
@@ -1165,34 +1252,114 @@ int main(int argc, char *argv[]) {
         PerLayerRequests plr[NLAYERS];
         for (int L = 0; L < NLAYERS; L++) {
             pls[L].sdpaFwd_in    = make_surface(DIM*SDPA_FWD_SP*2);
+#if WO_FUNCPARAM
+            pls[L].woFwd_in      = make_surface(Q_DIM*SEQ*2);
+            pls[L].woFwd_w       = make_surface(Q_DIM*DIM*2);
+#else
             pls[L].woFwd_in      = make_surface(Q_DIM*WO_FWD_SP*2);
+#endif
             pls[L].ffnFused_in   = make_surface(DIM*FFN_FUSED_SP*2);
+#if W2T_FUNCPARAM
+            pls[L].ffnBwdW2t_in  = make_surface(DIM*SEQ*2);
+            pls[L].ffnBwdW2t_w   = make_surface(DIM*HIDDEN*2);
+#else
             pls[L].ffnBwdW2t_in  = make_surface(DIM*FFN_BWD_W2T_SP*2);
+#endif
+#if FUSE_SILU_BWD
+            pls[L].ffnBwdW13t_in = make_surface(HIDDEN*FFN_BWD_W13T_FUSED_SP*2);
+#else
             pls[L].ffnBwdW13t_in = make_surface(HIDDEN*FFN_BWD_W13T_SP*2);
+#endif
+#if CONV_DATAPATH
+            pls[L].wotBwd_in     = make_surface(DIM*SEQ*2);
+            pls[L].wotBwd_w      = make_surface(DIM*Q_DIM*2);
+            pls[L].qBwd_in       = make_surface(Q_DIM*SEQ*2);
+            pls[L].qBwd_w        = make_surface(Q_DIM*DIM*2);
+#else
             pls[L].wotBwd_in     = make_surface(DIM*WOT_BWD_SP*2);
+#if !FUSE_QKVBWD
             pls[L].qBwd_in       = make_surface(Q_DIM*Q_BWD_SP*2);
+#endif
+#endif
+#if FUSE_QKVBWD
+            pls[L].qkvBwd_in     = make_surface(DIM*QKV_BWD_SP*2);
+#else
             pls[L].kvBwd_in      = make_surface(KV_DIM*KV_BWD_SP*2);
+#endif
 
             plr[L].sdpaFwd   = make_request(dk.sdpaFwd,   pls[L].sdpaFwd_in);
+#if WO_FUNCPARAM
+            plr[L].woFwd     = make_request_2in(dk.woFwd, pls[L].woFwd_in, pls[L].woFwd_w);
+#else
             plr[L].woFwd     = make_request(dk.woFwd,     pls[L].woFwd_in);
+#endif
             plr[L].ffnFused  = make_request(dk.ffnFused,  pls[L].ffnFused_in);
+#if W2T_FUNCPARAM
+            plr[L].ffnBwdW2t = make_request_2in(dk.ffnBwdW2t, pls[L].ffnBwdW2t_in, pls[L].ffnBwdW2t_w);
+#else
             plr[L].ffnBwdW2t = make_request(dk.ffnBwdW2t, pls[L].ffnBwdW2t_in);
+#endif
             plr[L].ffnBwdW13t= make_request(dk.ffnBwdW13t,pls[L].ffnBwdW13t_in);
+#if CONV_DATAPATH
+            plr[L].wotBwd    = make_request_2in(dk.wotBwd, pls[L].wotBwd_in, pls[L].wotBwd_w);
+            plr[L].qBwd      = make_request_2in(dk.qBwd,   pls[L].qBwd_in,   pls[L].qBwd_w);
+#else
             plr[L].wotBwd    = make_request(dk.wotBwd,    pls[L].wotBwd_in);
+#if !FUSE_QKVBWD
             plr[L].qBwd      = make_request(dk.qBwd,      pls[L].qBwd_in);
+#endif
+#endif
+#if FUSE_QKVBWD
+            plr[L].qkvBwd    = make_request(dk.qkvBwd,    pls[L].qkvBwd_in);
+#else
             plr[L].kvBwd     = make_request(dk.kvBwd,     pls[L].kvBwd_in);
+#endif
         }
 
         // Stage weights into per-layer surfaces
         for (int L = 0; L < NLAYERS; L++) {
             stage_sdpa_fwd_weights(pls[L].sdpaFwd_in, Wqt_buf[L], Wkt_buf[L], Wvt_buf[L]);
+#if WO_FUNCPARAM
+            stage_wo_fwd_w_fp(pls[L].woFwd_w, Wot_buf[L]);
+#else
             stage_wo_fwd_weights(pls[L].woFwd_in, Wot_buf[L]);
+#endif
             stage_ffn_fused_weights(pls[L].ffnFused_in, W1t_buf[L], W3t_buf[L], lw[L].W2);
+#if W2T_FUNCPARAM
+#if CONV_PROBE
+            { static float w2t_tmp[HIDDEN*DIM]; transpose_weight(w2t_tmp, lw[L].W2, DIM, HIDDEN);
+              io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, w2t_tmp, HIDDEN, DIM); }  // conv weight = W2^T [OC,IC,1,1]
+#else
+            io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, lw[L].W2, DIM, HIDDEN);
+#endif
+#else
             stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
+#endif
+#if FUSE_SILU_BWD
+            stage_ffn_bwd_w13t_fused_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#else
             stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#endif
+#if CONV_DATAPATH
+            { static float t_wot_i[Q_DIM*DIM]; transpose_weight(t_wot_i, lw[L].Wo, DIM, Q_DIM);
+              io_write_fp16_at(pls[L].wotBwd_w, 0, t_wot_i, Q_DIM, DIM); }  // conv weight = Wo^T [OC=Q_DIM,IC=DIM,1,1]
+            { static float t_q_i[DIM*Q_DIM]; transpose_weight(t_q_i, lw[L].Wq, Q_DIM, DIM);
+              io_write_fp16_at(pls[L].qBwd_w, 0, t_q_i, DIM, Q_DIM); }      // conv weight = Wq^T [OC=DIM,IC=Q_DIM,1,1]
+#else
+#if CONV1IN == 2
+            stage_wot_bwd_weights_convB(pls[L].wotBwd_in, lw[L].Wo);
+#else
             stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
+#endif
+#if !FUSE_QKVBWD
             stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
+#endif
+#endif
+#if FUSE_QKVBWD
+            stage_qkv_bwd_weights(pls[L].qkvBwd_in, lw[L].Wq, lw[L].Wk, lw[L].Wv);
+#else
             stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);
+#endif
         }
         printf("Per-layer weight staging complete\n\n");
 
@@ -1365,11 +1532,40 @@ int main(int argc, char *argv[]) {
 
                 // FFN backward: dffn @ W2^T → dsilu_raw
                 t0 = mach_absolute_time();
+#if W2T_FUNCPARAM
+                io_write_fp16_at(pls[L].ffnBwdW2t_in, 0, dffn, DIM, SEQ);
+#else
                 write_ffn_bwd_w2t_acts(pls[L].ffnBwdW2t_in, dffn);
+#endif
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.ffnBwdW2t, plr[L].ffnBwdW2t);
                 t_ane_bwd += tb_ms(mach_absolute_time() - t0);
+#if FUSE_SILU_BWD
+                // Fused FFN backward: dsilu stays ANE-resident (strided copy from
+                // ffnBwdW2t's output), h1/h3 are staged, and the W13t kernel does
+                // the SiLU backward + both matmuls. The 6.4 ms CPU silu bucket vanishes.
+                // Mode 1: kernel outputs concat(dx,dh1,dh3); dh1/dh3 read back for dW.
+                // Mode 2: kernel outputs dx only; dW closure recomputes dh1/dh3 on the
+                //   (slack) serial dw_q — needs dsilu on CPU, so read it back here.
+                t0 = mach_absolute_time();
+                copy_dsilu_into_w13t_fused(pls[L].ffnBwdW13t_in, dk.ffnBwdW2t->ioOut);
+                write_ffn_bwd_w13t_fused_h(pls[L].ffnBwdW13t_in, ac->h1, ac->h3);
+#if FUSE_SILU_BWD == 2
+                io_read_dyn(dk.ffnBwdW2t->ioOut, dsilu, HIDDEN, SEQ);  // for the closure recompute
+#endif
+                t_io_bwd += tb_ms(mach_absolute_time() - t0);
+                t0 = mach_absolute_time();
+                ane_eval_req(dk.ffnBwdW13t, plr[L].ffnBwdW13t);
+                t_ane_bwd += tb_ms(mach_absolute_time() - t0);
+                t0 = mach_absolute_time();
+                io_read_fp16(dk.ffnBwdW13t->ioOut, dx_ffn, 0, DIM, SEQ);
+#if FUSE_SILU_BWD == 1
+                io_read_fp16(dk.ffnBwdW13t->ioOut, dh1,    DIM,        HIDDEN, SEQ);
+                io_read_fp16(dk.ffnBwdW13t->ioOut, dh3,    DIM+HIDDEN, HIDDEN, SEQ);
+#endif
+                t_io_bwd += tb_ms(mach_absolute_time() - t0);
+#else
                 t0 = mach_absolute_time();
                 io_read_dyn(dk.ffnBwdW2t->ioOut, dsilu, HIDDEN, SEQ);
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
@@ -1408,15 +1604,25 @@ int main(int argc, char *argv[]) {
                         dh1[j] = d * h3c * gatemask * silu_tmp2[j];
                     }
 #else
-                    vDSP_vmul(ac->h1, 1, silu_tmp, 1, dh3, 1, (vDSP_Length)n);
-                    vDSP_vmul(dsilu, 1, dh3, 1, dh3, 1, (vDSP_Length)n);
-                    vDSP_vsadd(silu_tmp, 1, &minus1, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vneg(silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vmul(ac->h1, 1, silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vsadd(silu_tmp2, 1, &one, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vmul(silu_tmp, 1, silu_tmp2, 1, silu_tmp2, 1, (vDSP_Length)n);
-                    vDSP_vmul(dsilu, 1, ac->h3, 1, dh1, 1, (vDSP_Length)n);
-                    vDSP_vmul(dh1, 1, silu_tmp2, 1, dh1, 1, (vDSP_Length)n);
+                    // Fuse the 9 elementwise vDSP passes into ONE sweep. silu_tmp
+                    // holds sig from the setup above. This bucket was memory-
+                    // bandwidth-bound on the separate passes (~9 full sweeps of
+                    // HIDDEN*SEQ), not compute-bound; collapsing them to a single
+                    // read/write pass cuts the traffic. Identical math:
+                    //   dh3 = dsilu * silu ;  dh1 = dsilu * h3 * silu'(h1)
+                    // with silu = h1*sig and silu'(h1) = sig*(1 + h1*(1-sig)).
+                    // Straight-line FMA, no branches/calls -> clang auto-vectorizes.
+                    // Op order matches the vDSP passes exactly (1-sig as -(sig-1),
+                    // dh1 as (dsilu*h3)*silu'), so the result is bit-identical.
+                    (void)minus1; (void)one;
+                    for (int j = 0; j < n; j++) {
+                        float sig = silu_tmp[j];
+                        float h1v = ac->h1[j];
+                        float d   = dsilu[j];
+                        float siluprime = sig * (h1v * (-(sig - 1.0f)) + 1.0f);
+                        dh3[j] = d * (h1v * sig);
+                        dh1[j] = (d * ac->h3[j]) * siluprime;
+                    }
 #endif
                 }
                 t_silu += tb_ms(mach_absolute_time() - t0);
@@ -1431,22 +1637,39 @@ int main(int argc, char *argv[]) {
                 t0 = mach_absolute_time();
                 io_read_dyn(dk.ffnBwdW13t->ioOut, dx_ffn, DIM, SEQ);
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
+#endif
 
                 // dW FFN async
                 t0 = mach_absolute_time();
                 float *capt_dffn = (float*)malloc(SEQ*DIM*4); memcpy(capt_dffn, dffn, SEQ*DIM*4);
                 float *capt_silu = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_silu, ac->silu_out, SEQ*HIDDEN*4);
+                float *capt_x2n = (float*)malloc(SEQ*DIM*4); memcpy(capt_x2n, ac->x2norm, SEQ*DIM*4);
+#if FUSE_SILU_BWD == 2
+                // Recompute mode: dh1/dh3 weren't read back — capture their inputs
+                // (dsilu, h1, h3) and reconstruct dh1/dh3 inside the closure.
+                float *capt_dsilu = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dsilu, dsilu, SEQ*HIDDEN*4);
+                float *capt_h1 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_h1, ac->h1, SEQ*HIDDEN*4);
+                float *capt_h3 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_h3, ac->h3, SEQ*HIDDEN*4);
+#else
                 float *capt_dh1 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh1, dh1, SEQ*HIDDEN*4);
                 float *capt_dh3 = (float*)malloc(SEQ*HIDDEN*4); memcpy(capt_dh3, dh3, SEQ*HIDDEN*4);
-                float *capt_x2n = (float*)malloc(SEQ*DIM*4); memcpy(capt_x2n, ac->x2norm, SEQ*DIM*4);
+#endif
                 t_dw_copy += tb_ms(mach_absolute_time() - t0);
                 dispatch_group_async(dw_grp, dw_q, ^{
+#if FUSE_SILU_BWD == 2
+                    float *capt_dh1 = (float*)malloc(SEQ*HIDDEN*4);
+                    float *capt_dh3 = (float*)malloc(SEQ*HIDDEN*4);
+                    silu_bwd_recompute(capt_dh1, capt_dh3, capt_dsilu, capt_h1, capt_h3, HIDDEN*SEQ);
+#endif
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, DIM, HIDDEN, SEQ,
                                 1.0f, capt_dffn, SEQ, capt_silu, SEQ, 1.0f, gr->W2, HIDDEN);
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
                                 1.0f, capt_dh1, SEQ, capt_x2n, SEQ, 1.0f, gr->W1, DIM);
                     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, HIDDEN, DIM, SEQ,
                                 1.0f, capt_dh3, SEQ, capt_x2n, SEQ, 1.0f, gr->W3, DIM);
+#if FUSE_SILU_BWD == 2
+                    free(capt_dsilu); free(capt_h1); free(capt_h3);
+#endif
                     free(capt_dffn); free(capt_silu); free(capt_dh1); free(capt_dh3); free(capt_x2n);
                 });
 
@@ -1474,7 +1697,11 @@ int main(int argc, char *argv[]) {
                 float *dx2_scaled = (float*)malloc(SEQ*DIM*4);
                 vDSP_vsmul(dx2, 1, &res_alpha, dx2_scaled, 1, (vDSP_Length)(SEQ*DIM));
                 t0 = mach_absolute_time();
+#if CONV_DATAPATH
+                io_write_fp16_at(pls[L].wotBwd_in, 0, dx2_scaled, DIM, SEQ);
+#else
                 write_wot_bwd_acts(pls[L].wotBwd_in, dx2_scaled);
+#endif
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.wotBwd, plr[L].wotBwd);
@@ -1587,9 +1814,27 @@ int main(int argc, char *argv[]) {
                     free(capt_dq); free(capt_dk); free(capt_dv); free(capt_xn);
                 });
 
+#if FUSE_QKVBWD
+                // Fused QKV backward (ANE, MHA-only): one eval computes
+                // dx_attn = dq@Wq + dk@Wk + dv@Wv (summed in-kernel), replacing
+                // the split qBwd + kvBwd evals AND the CPU dx_attn += dx_kv add.
+                t0 = mach_absolute_time();
+                write_qkv_bwd_acts(pls[L].qkvBwd_in, dq, dk_buf, dv);
+                t_io_bwd += tb_ms(mach_absolute_time() - t0);
+                t0 = mach_absolute_time();
+                ane_eval_req(dk.qkvBwd, plr[L].qkvBwd);
+                t_ane_bwd += tb_ms(mach_absolute_time() - t0);
+                t0 = mach_absolute_time();
+                io_read_dyn(dk.qkvBwd->ioOut, dx_attn, DIM, SEQ);
+                t_io_bwd += tb_ms(mach_absolute_time() - t0);
+#else
                 // Q backward (ANE): dq[Q_DIM] @ Wq → dx_q[DIM]
                 t0 = mach_absolute_time();
+#if CONV_DATAPATH
+                io_write_fp16_at(pls[L].qBwd_in, 0, dq, Q_DIM, SEQ);
+#else
                 write_q_bwd_acts(pls[L].qBwd_in, dq);
+#endif
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.qBwd, plr[L].qBwd);
@@ -1613,6 +1858,7 @@ int main(int argc, char *argv[]) {
                 // dx_attn = dx_q + dx_kv
                 for(int i=0; i<SEQ*DIM; i++) dx_attn[i] += dx_kv[i];
                 free(dx_kv);
+#endif
 
                 // RMSNorm1 backward.  In mHC mode ac->layer_in is the collapsed
                 // attention input u_attn, so dx_rms1 = du_attn (no plain passthrough).
@@ -1841,13 +2087,47 @@ int main(int argc, char *argv[]) {
 
                     // Re-stage weights
                     stage_sdpa_fwd_weights(pls[L].sdpaFwd_in, Wqt_buf[L], Wkt_buf[L], Wvt_buf[L]);
+#if WO_FUNCPARAM
+                    stage_wo_fwd_w_fp(pls[L].woFwd_w, Wot_buf[L]);
+#else
                     stage_wo_fwd_weights(pls[L].woFwd_in, Wot_buf[L]);
+#endif
                     stage_ffn_fused_weights(pls[L].ffnFused_in, W1t_buf[L], W3t_buf[L], lw[L].W2);
+#if W2T_FUNCPARAM
+#if CONV_PROBE
+                    { static float w2t_rs[HIDDEN*DIM]; transpose_weight(w2t_rs, lw[L].W2, DIM, HIDDEN);
+                      io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, w2t_rs, HIDDEN, DIM); }
+#else
+                    io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, lw[L].W2, DIM, HIDDEN);
+#endif
+#else
                     stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
+#endif
+#if FUSE_SILU_BWD
+                    stage_ffn_bwd_w13t_fused_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#else
                     stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#endif
+#if CONV_DATAPATH
+                    { static float t_wot_r[Q_DIM*DIM]; transpose_weight(t_wot_r, lw[L].Wo, DIM, Q_DIM);
+                      io_write_fp16_at(pls[L].wotBwd_w, 0, t_wot_r, Q_DIM, DIM); }
+                    { static float t_q_r[DIM*Q_DIM]; transpose_weight(t_q_r, lw[L].Wq, Q_DIM, DIM);
+                      io_write_fp16_at(pls[L].qBwd_w, 0, t_q_r, DIM, Q_DIM); }
+#else
+#if CONV1IN == 2
+                    stage_wot_bwd_weights_convB(pls[L].wotBwd_in, lw[L].Wo);
+#else
                     stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
+#endif
+#if !FUSE_QKVBWD
                     stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
+#endif
+#endif
+#if FUSE_QKVBWD
+                    stage_qkv_bwd_weights(pls[L].qkvBwd_in, lw[L].Wq, lw[L].Wk, lw[L].Wv);
+#else
                     stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);
+#endif
                 }
                 adam_update(rms_final, grms_final, &arms_final, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
                 adam_update(embed, gembed, &aembed, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
@@ -1937,7 +2217,11 @@ int main(int argc, char *argv[]) {
         free_kern(dk.sdpaFwd); free_kern(dk.woFwd); free_kern(dk.ffnFused);
         free_kern(dk.ffnBwdW2t); free_kern(dk.ffnBwdW13t); free_kern(dk.wotBwd);
         free_kern(dk.sdpaBwd1); free_kern(dk.sdpaBwd2);
+#if FUSE_QKVBWD
+        free_kern(dk.qkvBwd);
+#else
         free_kern(dk.qBwd); free_kern(dk.kvBwd);
+#endif
         free(da_buf); free(k_tiled); free(v_tiled);
         free(dq_full); free(dk_full); free(dv_full);
         free(dq); free(dk_buf); free(dv);

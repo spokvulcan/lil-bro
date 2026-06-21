@@ -9,9 +9,11 @@ __pycache__/
 *.bin
 !assets/**/*.bin
 training/training_dynamic/train
+training/training_dynamic/probe_dispatch
 results/*.png
 results/*.json
 !results/README.md
 
 # Generated ANE model headers (emitted from lilbro/configs)
 training/training_dynamic/models/gen_*.h
+training/training_dynamic/probe_rms

@@ -35,6 +35,11 @@
 #ifndef QK_NORM
 #define QK_NORM 0
 #endif
+// RMSNorm epsilon, shared by QK-norm and the RMSNorm path. emit_c.py emits this
+// for generated headers; fallback keeps hand-written model headers compiling.
+#ifndef NORM_EPS
+#define NORM_EPS 1e-05f
+#endif
 #ifndef ATTN_SINK
 #define ATTN_SINK 0
 #endif
@@ -46,6 +51,97 @@
 #endif
 #ifndef N_HC
 #define N_HC 1
+#endif
+// ⚠️ BROKEN ON THIS HARDWARE — the four placement knobs below (WO_FUNCPARAM,
+// W2T_FUNCPARAM, CONV_PROBE, CONV_DATAPATH) all route the weight through a
+// multi-input ANE request (io.h make_request_2in), which is REJECTED at
+// inference on M3 Max / Darwin 25.5 (ANEProgramProcessRequestDirect status=0x1d,
+// "Program Inference error"). Enabling any of them now aborts loudly via
+// ane_eval_check rather than silently training on zeros (the earlier "cos
+// 1.00000" passes were a gate comparing a binary against itself). Kept default-0
+// only as a starting point for a future multi-input fix or the single-input conv
+// path (gen_conv_1in). Full post-mortem: results/ane_residency.md "CORRECTION".
+// V2 placement knob (issue #12): pass woFwd's Wo as a function-parameter
+// IOSurface instead of packing it into the activation surface's spatial dim,
+// removing the in-kernel weight slice/reshape (upstream PR #22 lever). 0 = the
+// original single-input spatial-packed path.
+#ifndef WO_FUNCPARAM
+#define WO_FUNCPARAM 0
+#endif
+// Same lever for the FFN-W2 backward matmul (W2 = DIM*HIDDEN, the largest simple
+// weight) — the kernel whose unpack should show the clearest signal if any does.
+#ifndef W2T_FUNCPARAM
+#define W2T_FUNCPARAM 0
+#endif
+// Experiment: emit the matmul kernels as 1x1 convs (PRD #26, no transposes).
+// Probed on ffnBwdW2t under (W2T_FUNCPARAM && CONV_PROBE).
+#ifndef CONV_PROBE
+#define CONV_PROBE 0
+#endif
+// (RETRACTED conv "rollout" — see the ⚠️ block above.) Was meant to extend the
+// conv datapath (PRD #26) to wotBwd + qBwd, but delivers the weight via the
+// func-param multi-input request, so it hits the same status=0x1d wall and emits
+// zeros. Left wired (default-0) as scaffolding for the single-input gen_conv_1in
+// retry, which is the only path proven to eval on this box.
+#ifndef CONV_DATAPATH
+#define CONV_DATAPATH 0
+#endif
+// PRD #26 retry on the SINGLE-input binding (the only conv path that evals on
+// this box — CORRECT here, cos 1.00000 / R1 PASS, unlike the 2-in attempts).
+// Emits wotBwd's backward matmul as a 1x1 conv that consumes the packed
+// activation [1,IC,1,SEQ] directly and outputs [1,OC,1,SEQ] — dropping BOTH
+// activation transposes gen_dyn_matmul pays. 0 = matmul; 1 = conv with one
+// in-MIL weight transpose; 2 = conv with the weight pre-transposed in CPU
+// staging (gen_conv_1in_mil_B, ZERO in-MIL transposes).
+// MEASURED RESULT (stories110m, square IC=OC=768): ane_bwd 31.2 / 31.0 / 31.4 ms
+// for 0/1/2 — a WASH within run-to-run noise. And =2 (no transposes at all) is
+// no faster than matmul, so the transposes were never the bottleneck: ane_bwd is
+// ANE matmul compute + fixed per-eval dispatch, not data layout. Conv only wins
+// where the activation dominates the weight (tall-skinny: large SEQ or IC>>OC);
+// no current kernel is that shape. Kept default-0 as a proven-correct datapath.
+#ifndef CONV1IN
+#define CONV1IN 0
+#endif
+// Kernel-fusion lever (results/ane_residency.md "Dispatch-overhead probe"): the
+// ANE is DISPATCH-BOUND (~0.12 ms fixed overhead/eval, compute near-free to
+// n=1024; fusion PoC saved 38% on 2 matmuls). Re-fuse the qBwd + kvBwd backward
+// projections into ONE single-input kernel (qkvBwd) computing
+// dx_attn = dq@Wq + dk@Wk + dv@Wv in one eval, removing 1 eval/layer plus the
+// CPU dx_attn += dx_kv add. They were split FROM qkvBwd in 475348a purely for
+// GQA (Q_DIM != KV_DIM); on MHA (stories110m: Q_DIM=KV_DIM=DIM=768) the fusion
+// is clean. SCOPED TO Q_DIM==KV_DIM==DIM — a build-time #error guards otherwise,
+// so qwen3/GQA must keep FUSE_QKVBWD=0. Single-input only (the multi-input
+// binding is dead here — see the CORRECTION block). 0 = the split qBwd+kvBwd.
+#ifndef FUSE_QKVBWD
+#define FUSE_QKVBWD 0
+#endif
+#if FUSE_QKVBWD && !(Q_DIM == DIM && KV_DIM == DIM)
+#error "FUSE_QKVBWD requires Q_DIM==KV_DIM==DIM (MHA, e.g. stories110m); GQA models must build with FUSE_QKVBWD=0."
+#endif
+// VERTICAL-fusion lever (the dispatch-bound corollary): fold the SiLU backward
+// — the 6.4 ms/step CPU bucket wedged BETWEEN the two FFN-backward evals
+// (ffnBwdW2t -> [silu-bwd] -> ffnBwdW13t) — INTO the ffnBwdW13t kernel. dsilu,
+// h1, h3 are all [HIDDEN,SEQ] (channel-HIDDEN), so no mixed-dim packing; the bwd
+// ops (sigmoid/mul/add) are exactly the forward SiLU's, proven ANE-expressible.
+// The fused kernel takes [dsilu|h1|h3|W1t|W3t] and emits concat(dx_ffn,dh1,dh3)
+// so the async dW closure still gets dh1/dh3 (no recompute on the SERIAL dw_q).
+// dsilu flows ffnBwdW2t->ffnBwdW13t via a strided ANE->ANE copy (no CPU bounce).
+// Moves 6.4 ms of CPU compute onto the dispatch-bound ANE (compute ~free).
+// 0 = CPU silu. 1 = kernel outputs concat(dx,dh1,dh3); the async dW reads dh1/dh3
+//   back (round-trip tax: +1.8 io + 1.8 ane for the 6x-bigger output). Net −2.0.
+// 2 = kernel outputs dx ONLY; the dW closure recomputes dh1/dh3 on the (slack)
+//   serial dw_q — drops both taxes, overlapping the silu math with later evals.
+// Works for MHA and GQA (pure FFN).
+#ifndef FUSE_SILU_BWD
+#define FUSE_SILU_BWD 0
+#endif
+#if FUSE_SILU_BWD && SWIGLU_CLAMP
+#error "FUSE_SILU_BWD implements the non-clamp SiLU backward only; build SWIGLU_CLAMP=0 or extend gen_ffn_bwd_w13t_fused_silu_dynamic with the clamp masks."
+#endif
+// Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
+// emits this for generated headers; fallback keeps hand-written headers compiling.
+#ifndef MTP_DEPTH
+#define MTP_DEPTH 0
 #endif
 // MTP auxiliary-loss weight (issue #6). Mirrors lilbro/mlx_ref/params.py MTP_LAMBDA.
 #ifndef MTP_LAMBDA
@@ -97,19 +193,29 @@ typedef struct {
     float *Wq, *Wk, *Wv, *Wo, *W1, *W2, *W3, *rms_att, *rms_ffn;
 } LayerGrads;
 
-// ANE kernel handle
-typedef struct { void *model; IOSurfaceRef ioIn, ioOut; void *request; void *tmpDir; } Kern;
+// ANE kernel handle. ioIn1 is the optional second input surface for the
+// function-parameter path (multi-input MIL func, e.g. woFwd with Wo as a
+// separate IOSurface param); NULL for single-input kernels.
+typedef struct { void *model; IOSurfaceRef ioIn, ioIn1, ioOut; void *request; void *tmpDir; } Kern;
 
-// Per-layer IOSurfaces for pre-staged weights
+// Per-layer IOSurfaces for pre-staged weights. woFwd_w is the function-param
+// weight surface (Wo as its own IOSurface) used only when WO_FUNCPARAM is set.
 typedef struct {
     IOSurfaceRef sdpaFwd_in, woFwd_in, ffnFused_in;
     IOSurfaceRef ffnBwdW2t_in, ffnBwdW13t_in, wotBwd_in, qBwd_in, kvBwd_in;
+    IOSurfaceRef woFwd_w, ffnBwdW2t_w, wotBwd_w, qBwd_w;
+#if FUSE_QKVBWD
+    IOSurfaceRef qkvBwd_in;   // fused [dq|dk|dv|Wq|Wk|Wv] packed surface
+#endif
 } PerLayerSurfaces;
 
 // Per-layer ANE requests (bound to per-layer IOSurfaces)
 typedef struct {
     void *sdpaFwd, *woFwd, *ffnFused;
     void *ffnBwdW2t, *ffnBwdW13t, *wotBwd, *qBwd, *kvBwd;
+#if FUSE_QKVBWD
+    void *qkvBwd;             // fused qBwd+kvBwd request (replaces both)
+#endif
 } PerLayerRequests;
 
 // Checkpoint header
