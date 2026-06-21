@@ -59,6 +59,11 @@
 #ifndef WO_FUNCPARAM
 #define WO_FUNCPARAM 0
 #endif
+// Same lever for the FFN-W2 backward matmul (W2 = DIM*HIDDEN, the largest simple
+// weight) — the kernel whose unpack should show the clearest signal if any does.
+#ifndef W2T_FUNCPARAM
+#define W2T_FUNCPARAM 0
+#endif
 // Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
 // emits this for generated headers; fallback keeps hand-written headers compiling.
 #ifndef MTP_DEPTH
@@ -124,7 +129,7 @@ typedef struct { void *model; IOSurfaceRef ioIn, ioIn1, ioOut; void *request; vo
 typedef struct {
     IOSurfaceRef sdpaFwd_in, woFwd_in, ffnFused_in;
     IOSurfaceRef ffnBwdW2t_in, ffnBwdW13t_in, wotBwd_in, qBwd_in, kvBwd_in;
-    IOSurfaceRef woFwd_w;
+    IOSurfaceRef woFwd_w, ffnBwdW2t_w;
 } PerLayerSurfaces;
 
 // Per-layer ANE requests (bound to per-layer IOSurfaces)

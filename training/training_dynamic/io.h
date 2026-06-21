@@ -355,6 +355,9 @@ static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {
 #if WO_FUNCPARAM
         CFRelease(pls[L].woFwd_w);
 #endif
+#if W2T_FUNCPARAM
+        CFRelease(pls[L].ffnBwdW2t_w);
+#endif
         CFRelease(pls[L].ffnBwdW2t_in); CFRelease(pls[L].ffnBwdW13t_in);
         CFRelease(pls[L].wotBwd_in); CFRelease(pls[L].qBwd_in); CFRelease(pls[L].kvBwd_in);
         CFRelease(plr[L].sdpaFwd); CFRelease(plr[L].woFwd); CFRelease(plr[L].ffnFused);

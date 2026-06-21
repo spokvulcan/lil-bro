@@ -63,8 +63,13 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 
     // FFN backward W2^T: [1, DIM, 1, SEQ+HIDDEN] → [1, HIDDEN, 1, SEQ]
     printf("  Compiling ffnBwdW2t...\n");
+#if W2T_FUNCPARAM
+    dk->ffnBwdW2t = compile_kern_mil_2in(gen_matmul_2in(DIM, HIDDEN, SEQ),
+        DIM*SEQ*2, DIM*HIDDEN*2, HIDDEN*SEQ*2);
+#else
     dk->ffnBwdW2t = compile_kern_mil_w(gen_ffn_bwd_w2t_dynamic(), @{},
         DIM*FFN_BWD_W2T_SP*2, HIDDEN*SEQ*2);
+#endif
     if (!dk->ffnBwdW2t) return false;
 
     // FFN backward W1^T+W3^T: [1, HIDDEN, 1, 2*SEQ+2*DIM] → [1, DIM, 1, SEQ]
@@ -1181,7 +1186,12 @@ int main(int argc, char *argv[]) {
             pls[L].woFwd_in      = make_surface(Q_DIM*WO_FWD_SP*2);
 #endif
             pls[L].ffnFused_in   = make_surface(DIM*FFN_FUSED_SP*2);
+#if W2T_FUNCPARAM
+            pls[L].ffnBwdW2t_in  = make_surface(DIM*SEQ*2);
+            pls[L].ffnBwdW2t_w   = make_surface(DIM*HIDDEN*2);
+#else
             pls[L].ffnBwdW2t_in  = make_surface(DIM*FFN_BWD_W2T_SP*2);
+#endif
             pls[L].ffnBwdW13t_in = make_surface(HIDDEN*FFN_BWD_W13T_SP*2);
             pls[L].wotBwd_in     = make_surface(DIM*WOT_BWD_SP*2);
             pls[L].qBwd_in       = make_surface(Q_DIM*Q_BWD_SP*2);
@@ -1194,7 +1204,11 @@ int main(int argc, char *argv[]) {
             plr[L].woFwd     = make_request(dk.woFwd,     pls[L].woFwd_in);
 #endif
             plr[L].ffnFused  = make_request(dk.ffnFused,  pls[L].ffnFused_in);
+#if W2T_FUNCPARAM
+            plr[L].ffnBwdW2t = make_request_2in(dk.ffnBwdW2t, pls[L].ffnBwdW2t_in, pls[L].ffnBwdW2t_w);
+#else
             plr[L].ffnBwdW2t = make_request(dk.ffnBwdW2t, pls[L].ffnBwdW2t_in);
+#endif
             plr[L].ffnBwdW13t= make_request(dk.ffnBwdW13t,pls[L].ffnBwdW13t_in);
             plr[L].wotBwd    = make_request(dk.wotBwd,    pls[L].wotBwd_in);
             plr[L].qBwd      = make_request(dk.qBwd,      pls[L].qBwd_in);
@@ -1210,7 +1224,11 @@ int main(int argc, char *argv[]) {
             stage_wo_fwd_weights(pls[L].woFwd_in, Wot_buf[L]);
 #endif
             stage_ffn_fused_weights(pls[L].ffnFused_in, W1t_buf[L], W3t_buf[L], lw[L].W2);
+#if W2T_FUNCPARAM
+            io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, lw[L].W2, DIM, HIDDEN);
+#else
             stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
+#endif
             stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
             stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
             stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
@@ -1387,7 +1405,11 @@ int main(int argc, char *argv[]) {
 
                 // FFN backward: dffn @ W2^T → dsilu_raw
                 t0 = mach_absolute_time();
+#if W2T_FUNCPARAM
+                io_write_fp16_at(pls[L].ffnBwdW2t_in, 0, dffn, DIM, SEQ);
+#else
                 write_ffn_bwd_w2t_acts(pls[L].ffnBwdW2t_in, dffn);
+#endif
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.ffnBwdW2t, plr[L].ffnBwdW2t);
@@ -1879,7 +1901,11 @@ int main(int argc, char *argv[]) {
                     stage_wo_fwd_weights(pls[L].woFwd_in, Wot_buf[L]);
 #endif
                     stage_ffn_fused_weights(pls[L].ffnFused_in, W1t_buf[L], W3t_buf[L], lw[L].W2);
+#if W2T_FUNCPARAM
+                    io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, lw[L].W2, DIM, HIDDEN);
+#else
                     stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
+#endif
                     stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
                     stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
                     stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);

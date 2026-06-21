@@ -218,26 +218,28 @@ static NSString *gen_wo_fwd_dynamic(void) {
     return gen_dyn_matmul_mil(Q_DIM, DIM, SEQ);
 }
 
-// Function-parameter woFwd (WO_FUNCPARAM): y = attn_out @ Wo, with Wo passed as
-// a second MIL func input already in matmul shape [1,1,Q_DIM,DIM] (= Wo^T). The
-// in-kernel weight slice+reshape that gen_dyn_matmul pays every eval disappears
-// (upstream PR #22 lever). x = attn_out [1,Q_DIM,1,SEQ]; output o_out [1,DIM,1,SEQ].
-static NSString *gen_wo_fwd_2in(void) {
+// Function-parameter matmul (the IOSurface lever, upstream PR #22): y = x @ W
+// with W passed as a second MIL func input already in matmul shape [1,1,ic,oc],
+// so the in-kernel weight slice+reshape gen_dyn_matmul pays every eval is gone.
+// x = [1,ic,1,seq]; output y = [1,oc,1,seq]. Generalizes the woFwd proof to any
+// simple matmul kernel (woFwd, ffnBwdW2t, wotBwd, qBwd...).
+static NSString *gen_matmul_2in(int ic, int oc, int seq) {
     NSMutableString *m = [NSMutableString string];
     [m appendString:MIL_HDR];
-    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x, tensor<fp16, [1, 1, %d, %d]> Wo) {\n", Q_DIM, SEQ, Q_DIM, DIM];
-    [m appendFormat:@"        tensor<int32, [4]> rA = const()[name=string(\"rA\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", Q_DIM, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> a2 = reshape(shape=rA,x=x)[name=string(\"a2\")];\n", Q_DIM, SEQ];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x, tensor<fp16, [1, 1, %d, %d]> W) {\n", ic, seq, ic, oc];
+    [m appendFormat:@"        tensor<int32, [4]> rA = const()[name=string(\"rA\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n", ic, seq];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> a2 = reshape(shape=rA,x=x)[name=string(\"a2\")];\n", ic, seq];
     [m appendString:@"        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> a3 = transpose(perm=pm,x=a2)[name=string(\"a3\")];\n", SEQ, Q_DIM];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> a3 = transpose(perm=pm,x=a2)[name=string(\"a3\")];\n", seq, ic];
     [m appendString:@"        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> yh = matmul(transpose_x=bF,transpose_y=bF,x=a3,y=Wo)[name=string(\"yh\")];\n", SEQ, DIM];
-    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> yt = transpose(perm=pm,x=yh)[name=string(\"yt\")];\n", DIM, SEQ];
-    [m appendFormat:@"        tensor<int32, [4]> rO = const()[name=string(\"rO\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> y = reshape(shape=rO,x=yt)[name=string(\"y\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> yh = matmul(transpose_x=bF,transpose_y=bF,x=a3,y=W)[name=string(\"yh\")];\n", seq, oc];
+    [m appendFormat:@"        tensor<fp16, [1,1,%d,%d]> yt = transpose(perm=pm,x=yh)[name=string(\"yt\")];\n", oc, seq];
+    [m appendFormat:@"        tensor<int32, [4]> rO = const()[name=string(\"rO\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", oc, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> y = reshape(shape=rO,x=yt)[name=string(\"y\")];\n", oc, seq];
     [m appendString:@"    } -> (y);\n}\n"];
     return m;
 }
+static NSString *gen_wo_fwd_2in(void) { return gen_matmul_2in(Q_DIM, DIM, SEQ); }
 
 // ===== Fused FFN forward: W1,W3 + SiLU + W2 + residual =====
 // Same structure as before, just with Qwen3 DIM=1024, HIDDEN=3072

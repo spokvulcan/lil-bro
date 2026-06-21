@@ -78,6 +78,25 @@ wall-clock — never a token-efficiency claim.
 | 2026-06-21 | baseline (stories110m, plain Muon) | R0 ✓ falls 9.14→7.07 | **~102 ms/step** | baseline |
 | 2026-06-21 | fuse SiLU-bwd 9 vDSP passes → 1 loop | R0 ✓ / R1 cos 0.99944 | `silu` 6.5→5.8 ms (−0.7) | keep (minor) |
 | 2026-06-21 | woFwd → function-param IOSurface (`WO_FUNCPARAM`) | R0 ✓ / R1 **cos 1.00000** | no Δ (smallest weight) | mechanism proven; default-off |
+| 2026-06-21 | ffnBwdW2t → function-param (`W2T_FUNCPARAM`, W2=768×2048) | R0 ✓ / R1 **cos 1.00000** | `ane_bwd` 31.0→30.5, `io_bwd` 9.8→10.0 (noise) | **lever refuted here**; default-off |
+
+**IOSurface function-param lever — REFUTED on this config (measured).** Removing the
+in-kernel weight slice/reshape gives **no wall-clock delta** on either the smallest
+weight (woFwd, 768×768) *or* the largest simple weight (ffnBwdW2t, 768×2048) — both
+bitwise-correct, both ~0 ms. The per-kernel unpack is not a measurable fraction of
+eval time on the M3 Max ANE (most likely the compiler already constant-folds the
+static-offset slice). The upstream PR #22 −30% does **not** reproduce on
+stories110m/M3 Max. The full multi-kernel rollout is therefore **not worth it** — the
+measurement saved that effort. The multi-input *mechanism* (`compile_kern_mil_2in`,
+`gen_matmul_2in`) is kept: the SiLU-fold and ANE-classifier need it to move *compute*
+(not just weight layout) onto the ANE, a different value proposition.
+
+**Revised hypothesis for the real wall-clock:** `ane_fwd`(20)+`ane_bwd`(31)=51 ms is
+the ANE matmul datapath itself, and `gen_dyn_matmul` wraps every matmul in **two
+transposes** (`reshape→transpose→matmul→transpose→reshape`) to hit the `[SEQ,IC]@[IC,OC]`
+orientation. The ANE is natively a convolution engine; a **1×1 conv** consumes the
+`[1,IC,1,SEQ]` layout directly with no transpose (PRD #26). That targets the *biggest*
+bucket (51 ms) and is the next experiment.
 
 **IOSurface lever — mechanism proven.** Multi-input MIL binding works: a
 `func main(x, Wo)` with `requestWithInputs:@[act,Wo] inputIndices:@[@0,@1]` and `Wo^T`
