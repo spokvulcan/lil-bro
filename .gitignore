@@ -17,3 +17,4 @@ results/*.json
 # Generated ANE model headers (emitted from lilbro/configs)
 training/training_dynamic/models/gen_*.h
 training/training_dynamic/probe_rms
+training/training_dynamic/probe_chess

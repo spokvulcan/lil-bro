@@ -1,6 +1,16 @@
 # Handoff — Chess RL self-play on the ANE (v1)
 
-**Date:** 2026-06-21 · **Status:** design ratified, **zero implementation** · **Next action:** the throughput probe (build-step 0).
+**Date:** 2026-06-21 · **Status:** design ratified · **build-step 0 (throughput probe) DONE — gate PASS** · **Next action:** build-step 1 (C engine + perft).
+
+> **Build-step 0 result (2026-06-21):** the probe is built + measured.
+> **Verdict: DAYS, not never — GO.** The loop is **ANE-bound** (not CPU-bound as suspected):
+> the CPU tree/movegen stub is ~300× too cheap to bottleneck; the dispatch-bound forward
+> (18–24 sequential evals) is the long pole, yet still delivers **~9,900 chess-pos/sec**
+> (r2_small, batched) → **~0.27–0.54 M games/day** at n=16–32. Two hard ANE walls found:
+> **batch ceiling B ≤ 170** (max tensor dim 16384) and the **dispatch tax** (fuse the forward) —
+> both are future-kernel targets, neither blocks the build. Recommend trunk = **r2_small**,
+> B≈128–170, n=16–32. Full evidence + caveats: [`../../results/chess_throughput_probe.md`](../../results/chess_throughput_probe.md)
+> · probe: [`../../training/training_dynamic/probe_chess.m`](../../training/training_dynamic/probe_chess.m).
 
 **Authoritative docs:** [`../adr/0005-chess-rl-self-play-on-ane.md`](../adr/0005-chess-rl-self-play-on-ane.md) (14 decisions + gate ladder + build order) · [`CONTEXT.md`](CONTEXT.md) (glossary) · [`../../CONTEXT-MAP.md`](../../CONTEXT-MAP.md) (sibling contexts) · PRD = `spokvulcan/lil-bro#14`.
 
@@ -22,10 +32,10 @@ A method-first, search-guided (AlphaZero / Gumbel-MCTS) chess RL self-play train
 - Glossary (`docs/chess/CONTEXT.md`), context map (`CONTEXT-MAP.md`), PRD (`#14`).
 - **No code.**
 
-## Build order (probe-gated) — all not-done
+## Build order (probe-gated)
 
-0. **Throughput probe** ← **START HERE** (details below)
-1. C engine — bitboard movegen + Gumbel-MCTS; **perft**-green
+0. **Throughput probe** ✅ **DONE — gate PASS** (`results/chess_throughput_probe.md`)
+1. C engine — bitboard movegen + Gumbel-MCTS; **perft**-green ← **START HERE NEXT**
 2. Heads + loss on the ANE — policy 8×8×73 + WDL value + 2D posenc + AZ loss; **G0**-green
 3. Search correctness — Gumbel-MCTS on tactics; **G1**-green
 4. The loop — vectorized self-play + replay + learner; **G2**-green

@@ -1,0 +1,120 @@
+# ============================================================
+# CHESS RL SELF-PLAY THROUGHPUT PROBE (build-step 0, ADR 0005)
+# ============================================================
+# Machine: M-series ANE.  ONE ANE client.  fp16.  LOCAL eval.
+# Chess position = 77 real tokens -> padded to 96 (mult-of-32).
+# Forward = 3 ANE evals/layer (sdpaFwd, woFwd, ffnFused); RMSNorm/embed/head on CPU.
+# Batch B positions packed into the spatial (token) dim: seq = B*96.
+
+## [0a] Warming the ANE (power-up; first kernel pays a cold-start tax)...
+## [0b] Per-eval DISPATCH FLOOR (min over tiny warm matmuls):
+   floors: 64x32@32=0.2032  256x96@96=0.2063  128x64@64=0.2888  ->  floor ~= 0.2032 ms/eval
+   (prior/memory: ~0.12 ms; this is the live warm number on this box)
+
+## [0c] ANE max spatial dim (caps batch B; B_max = seq_max/96):
+   seq=96     (B~1   ) : OK
+   seq=1536   (B~16  ) : OK
+   seq=6144   (B~64  ) : OK
+   seq=12288  (B~128 ) : OK
+   seq=12384  (B~129 ) : OK
+   seq=16320  (B~170 ) : OK
+   seq=16384  (B~170 ) : OK
+)}}}
+   seq=16416  (B~171 ) : REJECTED
+)}}}
+   seq=24576  (B~256 ) : REJECTED
+)}}}
+   seq=32768  (B~341 ) : REJECTED
+   => seq_max ~= 16384  => B_max ~= 170 positions/forward
+
+## [A] ANE batched forward — r2_small  (DIM=256 HEADS=8 HD=32 HIDDEN=768 L=6, ~5.1M trunk params)
+   B      qkv ms    wo ms     ffup ms   ffdn ms   attn~ms   | fwd ms     fwd/pos ms  pos/s       
+   1      0.2991    0.1682    0.1282    0.2163    0.0160    | 4.408      4.4083      227         
+   16     0.1221    0.2225    0.2227    0.1476    0.0278    | 4.058      0.2536      3943        
+   64     0.3557    0.1759    0.5157    0.4135    0.0645    | 8.096      0.1265      7905        
+   128    0.5399    0.3297    0.8043    0.6272    0.1005    | 13.191     0.1031      9704        
+   170    0.6283    0.3846    1.0857    0.8194    0.1357    | 17.103     0.1006      9940        
+
+## [A] ANE batched forward — r2_mid  (DIM=512 HEADS=16 HD=32 HIDDEN=1408 L=8, ~25.7M trunk params)
+   B      qkv ms    wo ms     ffup ms   ffdn ms   attn~ms   | fwd ms     fwd/pos ms  pos/s       
+   1      0.1501    0.1572    0.2040    0.1744    0.0139    | 4.995      4.9954      200         
+   16     0.3599    0.1695    0.4788    0.4135    0.0326    | 10.279     0.6424      1557        
+   64     0.9166    0.4289    1.4006    1.0779    0.0955    | 29.731     0.4645      2153        
+   128    1.5029    0.7059    2.4892    1.9057    0.1697    | 52.562     0.4106      2435        
+   170    1.9080    0.8655    3.2065    2.3794    0.2186    | 66.998     0.3941      2537        
+
+## [B] CPU stub: movegen + Gumbel-MCTS bookkeeping (no ANE). depth=12, MAXMOVES=40
+   B      ms/sim-step    ms/sim/game(us) 
+   1      0.00047        0.4687          
+   16     0.00738        0.4611          
+   64     0.02738        0.4278          
+   128    0.05486        0.4286          
+   170    0.07487        0.4404          
+   (movegen is a STUB — real bitboard movegen speed is the C-engine/perft gate, build-step 1. FLAGGED.)
+   BREAK-EVEN: CPU flips to the bottleneck only if real (movegen+tree)/sim/game exceeds
+   t_ane(B)/B = the 'fwd/pos ms' above (e.g. ~0.14 ms = 140 us/sim at r2_small B=64).
+   The stub is ~0.4 us/sim/game, so movegen must be ~300x slower than the stub to flip it.
+
+## [C] COMBINE -> games/day  (plies/game=100 [est], pipelined = max(ANE,CPU)/sim-step)
+# games/day = B * 86.4e6 / (plies * n * max(t_ane(B), t_cpu(B)))
+# Also report SERIAL (t_ane+t_cpu) as the pessimistic bound.
+
+### r2_small
+   B      n     t_ane ms   t_cpu ms   bound   ms/move(max)  games/day(max) games/day(serial)
+   1      8     4.408      0.000      ANE     35.27         24499          24497       
+   1      16    4.408      0.000      ANE     70.53         12250          12248       
+   1      32    4.408      0.000      ANE     141.07        6125           6124        
+   1      64    4.408      0.000      ANE     282.13        3062           3062        
+   1      128   4.408      0.000      ANE     564.26        1531           1531        
+   16     8     4.058      0.007      ANE     32.46         425864         425091      
+   16     16    4.058      0.007      ANE     64.92         212932         212546      
+   16     32    4.058      0.007      ANE     129.84        106466         106273      
+   16     64    4.058      0.007      ANE     259.69        53233          53136       
+   16     128   4.058      0.007      ANE     519.38        26617          26568       
+   64     8     8.096      0.027      ANE     64.77         853704         850827      
+   64     16    8.096      0.027      ANE     129.54        426852         425413      
+   64     32    8.096      0.027      ANE     259.09        213426         212707      
+   64     64    8.096      0.027      ANE     518.17        106713         106353      
+   64     128   8.096      0.027      ANE     1036.35       53356          53177       
+   128    8     13.191     0.055      ANE     105.53        1048014        1043674     
+   128    16    13.191     0.055      ANE     211.05        524007         521837      
+   128    32    13.191     0.055      ANE     422.10        262004         260918      
+   128    64    13.191     0.055      ANE     844.20        131002         130459      
+   128    128   13.191     0.055      ANE     1688.40       65501          65230       
+   170    8     17.103     0.075      ANE     136.82        1073515        1068836     
+   170    16    17.103     0.075      ANE     273.64        536757         534418      
+   170    32    17.103     0.075      ANE     547.29        268379         267209      
+   170    64    17.103     0.075      ANE     1094.57       134189         133604      
+   170    128   17.103     0.075      ANE     2189.15       67095          66802       
+
+### r2_mid
+   B      n     t_ane ms   t_cpu ms   bound   ms/move(max)  games/day(max) games/day(serial)
+   1      8     4.995      0.000      ANE     39.96         21620          21618       
+   1      16    4.995      0.000      ANE     79.93         10810          10809       
+   1      32    4.995      0.000      ANE     159.85        5405           5404        
+   1      64    4.995      0.000      ANE     319.71        2702           2702        
+   1      128   4.995      0.000      ANE     639.41        1351           1351        
+   16     8     10.279     0.007      ANE     82.23         168112         167992      
+   16     16    10.279     0.007      ANE     164.46        84056          83996       
+   16     32    10.279     0.007      ANE     328.92        42028          41998       
+   16     64    10.279     0.007      ANE     657.85        21014          20999       
+   16     128   10.279     0.007      ANE     1315.69       10507          10499       
+   64     8     29.731     0.027      ANE     237.85        232487         232273      
+   64     16    29.731     0.027      ANE     475.69        116244         116137      
+   64     32    29.731     0.027      ANE     951.38        58122          58068       
+   64     64    29.731     0.027      ANE     1902.76       29061          29034       
+   64     128   29.731     0.027      ANE     3805.53       14530          14517       
+   128    8     52.562     0.055      ANE     420.49        263005         262731      
+   128    16    52.562     0.055      ANE     840.99        131503         131366      
+   128    32    52.562     0.055      ANE     1681.97       65751          65683       
+   128    64    52.562     0.055      ANE     3363.95       32876          32841       
+   128    128   52.562     0.055      ANE     6727.90       16438          16421       
+   170    8     66.998     0.075      ANE     535.99        274036         273730      
+   170    16    66.998     0.075      ANE     1071.98       137018         136865      
+   170    32    66.998     0.075      ANE     2143.95       68509          68433       
+   170    64    66.998     0.075      ANE     4287.90       34255          34216       
+   170    128   66.998     0.075      ANE     8575.80       17127          17108       
+
+# NOTE: t_ane batches B leaves into 1 forward/sim; t_cpu is B games' tree work/sim.
+# Cross-check the ANE-bound rows with: sudo powermetrics --samplers ane_power -i 1000
+# during  ./probe_chess --sustain --B=128 --sec=20
