@@ -9,6 +9,7 @@ __pycache__/
 *.bin
 !assets/**/*.bin
 training/training_dynamic/train
+training/training_dynamic/train_chess
 training/training_dynamic/probe_dispatch
 results/*.png
 results/*.json
@@ -19,6 +20,7 @@ training/training_dynamic/models/gen_*.h
 training/training_dynamic/probe_rms
 training/training_dynamic/probe_chess
 
-# Chess engine build artifacts (build-step 1, ADR 0005)
+# Chess engine build artifacts (build-step 1 & 2, ADR 0005)
 training/training_dynamic/chess/perft
 training/training_dynamic/chess/test_chess
+training/training_dynamic/chess/test_heads

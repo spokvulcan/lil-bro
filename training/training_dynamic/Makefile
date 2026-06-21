@@ -33,9 +33,25 @@ test_engine: chess/test_chess.c $(CHESS_DEPS)
 	$(CC) $(CHESS_CFLAGS) -o chess/test_chess chess/test_chess.c chess/chess.c
 	./chess/test_chess
 
+# Chess heads FD gate (build-step 2, issue #16): analytic-vs-numeric backward check
+# on the policy/value/posenc heads. Pure C, no ANE — the fast TDD gate before G0.
+test_heads: chess/test_heads_cpu.c chess/chess_heads.h
+	$(CC) $(CHESS_CFLAGS) -o chess/test_heads chess/test_heads_cpu.c -lm
+	./chess/test_heads
+
+# Chess G0 trainer (build-step 2, issue #16): policy + WDL value heads + 2D posenc
+# + AlphaZero loss on the ANE. The trunk matmuls run on the ANE via gen_dyn_matmul_mil
+# (the same primitive train.m's woFwd/qBwd/wotBwd use); heads + loss on the CPU floor.
+# `make g0` builds and runs the overfit gate (both losses -> ~0 == G0-green).
+train_chess: train_chess.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h chess/chess.h models/chess_g0.h $(CHESS_DEPS)
+	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h -o train_chess train_chess.m chess/chess.c
+
+g0: train_chess
+	./train_chess --overfit
+
 clean:
-	rm -f train probe_chess chess/perft chess/test_chess
+	rm -f train probe_chess train_chess chess/perft chess/test_chess chess/test_heads
 
 FORCE:
 
-.PHONY: clean FORCE test_engine
+.PHONY: clean FORCE test_engine test_heads g0
