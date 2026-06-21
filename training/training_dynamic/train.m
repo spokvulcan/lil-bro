@@ -64,8 +64,13 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
     // FFN backward W2^T: [1, DIM, 1, SEQ+HIDDEN] → [1, HIDDEN, 1, SEQ]
     printf("  Compiling ffnBwdW2t...\n");
 #if W2T_FUNCPARAM
+#if CONV_PROBE
+    dk->ffnBwdW2t = compile_kern_mil_2in(gen_conv_2in(DIM, HIDDEN, SEQ),
+        DIM*SEQ*2, DIM*HIDDEN*2, HIDDEN*SEQ*2);
+#else
     dk->ffnBwdW2t = compile_kern_mil_2in(gen_matmul_2in(DIM, HIDDEN, SEQ),
         DIM*SEQ*2, DIM*HIDDEN*2, HIDDEN*SEQ*2);
+#endif
 #else
     dk->ffnBwdW2t = compile_kern_mil_w(gen_ffn_bwd_w2t_dynamic(), @{},
         DIM*FFN_BWD_W2T_SP*2, HIDDEN*SEQ*2);
@@ -1225,7 +1230,12 @@ int main(int argc, char *argv[]) {
 #endif
             stage_ffn_fused_weights(pls[L].ffnFused_in, W1t_buf[L], W3t_buf[L], lw[L].W2);
 #if W2T_FUNCPARAM
+#if CONV_PROBE
+            { static float w2t_tmp[HIDDEN*DIM]; transpose_weight(w2t_tmp, lw[L].W2, DIM, HIDDEN);
+              io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, w2t_tmp, HIDDEN, DIM); }  // conv weight = W2^T [OC,IC,1,1]
+#else
             io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, lw[L].W2, DIM, HIDDEN);
+#endif
 #else
             stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
 #endif
@@ -1902,7 +1912,12 @@ int main(int argc, char *argv[]) {
 #endif
                     stage_ffn_fused_weights(pls[L].ffnFused_in, W1t_buf[L], W3t_buf[L], lw[L].W2);
 #if W2T_FUNCPARAM
+#if CONV_PROBE
+                    { static float w2t_rs[HIDDEN*DIM]; transpose_weight(w2t_rs, lw[L].W2, DIM, HIDDEN);
+                      io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, w2t_rs, HIDDEN, DIM); }
+#else
                     io_write_fp16_at(pls[L].ffnBwdW2t_w, 0, lw[L].W2, DIM, HIDDEN);
+#endif
 #else
                     stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
 #endif

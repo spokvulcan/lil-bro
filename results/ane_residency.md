@@ -96,7 +96,19 @@ the ANE matmul datapath itself, and `gen_dyn_matmul` wraps every matmul in **two
 transposes** (`reshape→transpose→matmul→transpose→reshape`) to hit the `[SEQ,IC]@[IC,OC]`
 orientation. The ANE is natively a convolution engine; a **1×1 conv** consumes the
 `[1,IC,1,SEQ]` layout directly with no transpose (PRD #26). That targets the *biggest*
-bucket (51 ms) and is the next experiment.
+bucket (51 ms).
+
+| 2026-06-21 | conv datapath on ffnBwdW2t (`CONV_PROBE`) | R0 ✓ / R1 **cos 1.00000** | `ane_bwd` 31.0→**29.4**, `io_bwd` 9.8→9.4 | **CONFIRMED — conv wins** |
+
+**Conv datapath — CONFIRMED (the real lever).** MIL `conv` *does* accept a runtime
+func-param weight (`gen_conv_2in`), and `conv(x=[1,IC,1,SEQ], W=[OC,IC,1,1])` is
+**bitwise-identical** to matmul+2-transposes (cos 1.0) while **~1 ms faster per kernel**
+(no transposes, native NCHW). On `ffnBwdW2t` alone: `ane_bwd` 31.0→29.4, and `io_bwd`
+also dipped. This is the opposite of the IOSurface result — it actually moves wall-clock.
+Weight is `Wᵀ` as the conv kernel `[OC,IC,1,1]`. **Next: roll conv out to the other
+matmul kernels** — the standalone backward matmuls (`wotBwd`, `qBwd`) are the same easy
+pattern; the forward `sdpaFwd`/`ffnFused` internal matmuls are the big-transpose wins.
+Projected aggregate if ~1 ms holds across ~10 matmul sites: **~8–10 ms (~10%)**.
 
 **IOSurface lever — mechanism proven.** Multi-input MIL binding works: a
 `func main(x, Wo)` with `requestWithInputs:@[act,Wo] inputIndices:@[@0,@1]` and `Wo^T`

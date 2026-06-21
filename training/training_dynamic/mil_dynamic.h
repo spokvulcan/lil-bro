@@ -241,6 +241,27 @@ static NSString *gen_matmul_2in(int ic, int oc, int seq) {
 }
 static NSString *gen_wo_fwd_2in(void) { return gen_matmul_2in(Q_DIM, DIM, SEQ); }
 
+// Conv-datapath matmul (PRD #26): y = x @ W expressed as a 1x1 conv. The ANE is
+// natively a conv engine, and [1,IC,1,SEQ] is already NCHW — so conv consumes
+// the activation and emits [1,OC,1,SEQ] with NO reshape/transpose (gen_matmul_2in
+// pays two transposes per eval). Weight is the conv kernel [OC,IC,1,1] = W^T of
+// the matmul weight. Open question this probes: does MIL conv accept a *runtime*
+// (func-param) weight, or only a const? If runtime works, this targets the 51 ms
+// ANE-compute bucket directly.
+static NSString *gen_conv_2in(int ic, int oc, int seq) {
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x, tensor<fp16, [%d, %d, 1, 1]> W) {\n", ic, seq, oc, ic];
+    [m appendString:@"        tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"];
+    [m appendString:@"        tensor<int32, [2]> di = const()[name=string(\"di\"), val=tensor<int32, [2]>([1,1])];\n"];
+    [m appendString:@"        tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendString:@"        string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"];
+    [m appendString:@"        int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> y = conv(x=x, weight=W, strides=st, pad_type=pt, pad=pd, dilations=di, groups=gr)[name=string(\"y\")];\n", oc, seq];
+    [m appendString:@"    } -> (y);\n}\n"];
+    return m;
+}
+
 // ===== Fused FFN forward: W1,W3 + SiLU + W2 + residual =====
 // Same structure as before, just with Qwen3 DIM=1024, HIDDEN=3072
 static NSString *gen_ffn_fused_dynamic(void) {
