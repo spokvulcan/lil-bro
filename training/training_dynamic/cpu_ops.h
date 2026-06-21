@@ -6,7 +6,8 @@ static float *g_rms_tmp = NULL;
 
 static void rmsnorm(float *out, const float *x, const float *w, int d, int S) {
     if (!g_rms_tmp) g_rms_tmp = (float*)malloc(S*4);
-    float *ss = (float*)calloc(S, sizeof(float));
+    float ss[S];
+    memset(ss, 0, (size_t)S*4);
     for (int i=0; i<d; i++) {
         vDSP_vmul(x+i*S, 1, x+i*S, 1, g_rms_tmp, 1, (vDSP_Length)S);
         vDSP_vadd(g_rms_tmp, 1, ss, 1, ss, 1, (vDSP_Length)S);
@@ -18,21 +19,22 @@ static void rmsnorm(float *out, const float *x, const float *w, int d, int S) {
         vDSP_vmul(x+i*S, 1, ss, 1, out+i*S, 1, (vDSP_Length)S);
         vDSP_vsmul(out+i*S, 1, &w[i], out+i*S, 1, (vDSP_Length)S);
     }
-    free(ss);
 }
 
 static void rmsnorm_bwd(float *dx, float *dw, const float *dy, const float *x, const float *w, int d, int S) {
     if (!g_rms_tmp) g_rms_tmp = (float*)malloc(S*4);
-    float *ss = (float*)calloc(S, sizeof(float));
+    float ss[S];
+    memset(ss, 0, (size_t)S*4);
     for (int i=0; i<d; i++) {
         vDSP_vmul(x+i*S, 1, x+i*S, 1, g_rms_tmp, 1, (vDSP_Length)S);
         vDSP_vadd(g_rms_tmp, 1, ss, 1, ss, 1, (vDSP_Length)S);
     }
     float invd = 1.0f/d, eps=1e-5f;
     vDSP_vsmsa(ss, 1, &invd, &eps, ss, 1, (vDSP_Length)S);
-    float *rrms = (float*)malloc(S*4);
+    float rrms[S];
     int n = S; vvrsqrtf(rrms, ss, &n);
-    float *dot = (float*)calloc(S, sizeof(float));
+    float dot[S];
+    memset(dot, 0, (size_t)S*4);
     for (int i=0; i<d; i++) {
         vDSP_vmul(dy+i*S, 1, x+i*S, 1, g_rms_tmp, 1, (vDSP_Length)S);
         vDSP_vsma(g_rms_tmp, 1, &w[i], dot, 1, dot, 1, (vDSP_Length)S);
@@ -50,7 +52,6 @@ static void rmsnorm_bwd(float *dx, float *dw, const float *dy, const float *x, c
         float s; vDSP_sve(g_rms_tmp, 1, &s, (vDSP_Length)S);
         dw[i] += s;
     }
-    free(ss); free(rrms); free(dot);
 }
 
 static void adam_update(float *w, const float *g, AdamState *s, int t, float lr, float b1, float b2, float eps, float wd) {
@@ -254,6 +255,65 @@ static void vocab_scatter_grads(float *full_gembed, const float *compact_gembed,
 static void vocab_update_full(float *full_embed, const float *compact_embed, const VocabMap *vm, int dim) {
     for (int c = 0; c < vm->compact_vocab; c++)
         memcpy(full_embed + vm->compact_to_full[c]*dim, compact_embed + c*dim, dim*4);
+}
+
+static void vocab_compact_embed_into(float *compact_embed, const float *full_embed, const VocabMap *vm, int dim) {
+    for (int c = 0; c < vm->compact_vocab; c++)
+        memcpy(compact_embed + c*dim, full_embed + vm->compact_to_full[c]*dim, dim*4);
+}
+
+static void vocab_scatter_scale_active_grads(float *full_gembed, const float *compact_gembed,
+                                             const VocabMap *vm, int dim, float scale) {
+    for (int c = 0; c < vm->compact_vocab; c++) {
+        float *fg = full_gembed + (size_t)vm->compact_to_full[c]*dim;
+        const float *cg = compact_gembed + (size_t)c*dim;
+        vDSP_vadd(fg, 1, cg, 1, fg, 1, (vDSP_Length)dim);
+        vDSP_vsmul(fg, 1, &scale, fg, 1, (vDSP_Length)dim);
+    }
+}
+
+static float vocab_active_dotpr(const float *full_gembed, const VocabMap *vm, int dim) {
+    float acc = 0, s;
+    for (int c = 0; c < vm->compact_vocab; c++) {
+        const float *fg = full_gembed + (size_t)vm->compact_to_full[c]*dim;
+        vDSP_dotpr(fg, 1, fg, 1, &s, (vDSP_Length)dim);
+        acc += s;
+    }
+    return acc;
+}
+
+static void vocab_active_vsmul(float *full_gembed, const VocabMap *vm, int dim, float scale) {
+    for (int c = 0; c < vm->compact_vocab; c++) {
+        float *fg = full_gembed + (size_t)vm->compact_to_full[c]*dim;
+        vDSP_vsmul(fg, 1, &scale, fg, 1, (vDSP_Length)dim);
+    }
+}
+
+static void vocab_zero_active_grads(float *full_gembed, float *compact_gembed, const VocabMap *vm, int dim) {
+    for (int c = 0; c < vm->compact_vocab; c++)
+        memset(full_gembed + (size_t)vm->compact_to_full[c]*dim, 0, (size_t)dim*4);
+    memset(compact_gembed, 0, (size_t)vm->compact_vocab*dim*4);
+}
+
+static void adam_update_vocab_active(float *full_embed, float *compact_embed, const float *full_gembed,
+                                     AdamState *aembed, const VocabMap *vm, int dim, int t,
+                                     float lr, float b1, float b2, float eps, float wd) {
+    float bc1 = 1.0f - powf(b1, t), bc2 = 1.0f - powf(b2, t);
+    for (int c = 0; c < vm->compact_vocab; c++) {
+        int fv = vm->compact_to_full[c];
+        float *w = full_embed + (size_t)fv*dim;
+        const float *g = full_gembed + (size_t)fv*dim;
+        float *m = aembed->m + (size_t)fv*dim;
+        float *v = aembed->v + (size_t)fv*dim;
+        float *cw = compact_embed + (size_t)c*dim;
+        for (int d = 0; d < dim; d++) {
+            m[d] = b1*m[d] + (1-b1)*g[d];
+            v[d] = b2*v[d] + (1-b2)*g[d]*g[d];
+            float mh = m[d]/bc1, vh = v[d]/bc2;
+            w[d] -= lr * (mh / (sqrtf(vh) + eps) + wd * w[d]);
+            cw[d] = w[d];
+        }
+    }
 }
 
 static void embed_lookup(float *x, const float *embed, const uint16_t *tokens, int dim, int seq) {

@@ -11,11 +11,13 @@ MODEL_HDR = models/$(MODEL).h
 # (the V4 knobs are #ifndef-guarded in config.h / the emitted header, so a -D wins).
 EXTRA ?=
 
-train: train.m config.h io.h cpu_ops.h mil_dynamic.h $(MODEL_HDR)
+train: FORCE train.m config.h io.h cpu_ops.h mil_dynamic.h $(MODEL_HDR)
 	@echo "Building for model: $(MODEL) $(EXTRA)"
 	$(CC) $(CFLAGS) $(EXTRA) -include $(MODEL_HDR) -o train train.m
 
 clean:
 	rm -f train
 
-.PHONY: clean
+FORCE:
+
+.PHONY: clean FORCE

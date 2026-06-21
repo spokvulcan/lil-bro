@@ -107,16 +107,23 @@
 // n=1024; fusion PoC saved 38% on 2 matmuls). Re-fuse the qBwd + kvBwd backward
 // projections into ONE single-input kernel (qkvBwd) computing
 // dx_attn = dq@Wq + dk@Wk + dv@Wv in one eval, removing 1 eval/layer plus the
-// CPU dx_attn += dx_kv add. They were split FROM qkvBwd in 475348a purely for
-// GQA (Q_DIM != KV_DIM); on MHA (stories110m: Q_DIM=KV_DIM=DIM=768) the fusion
-// is clean. SCOPED TO Q_DIM==KV_DIM==DIM — a build-time #error guards otherwise,
-// so qwen3/GQA must keep FUSE_QKVBWD=0. Single-input only (the multi-input
-// binding is dead here — see the CORRECTION block). 0 = the split qBwd+kvBwd.
+// CPU dx_attn += dx_kv add. For GQA, the fused surface uses Q_DIM channels and
+// the K/V slices address the first KV_DIM channels; only the real K/V rows are
+// staged/written. Single-input only (the multi-input binding is dead here — see
+// the CORRECTION block). Default on for MHA and GQA.
 #ifndef FUSE_QKVBWD
-#define FUSE_QKVBWD 0
+#define FUSE_QKVBWD 1
 #endif
-#if FUSE_QKVBWD && !(Q_DIM == DIM && KV_DIM == DIM)
-#error "FUSE_QKVBWD requires Q_DIM==KV_DIM==DIM (MHA, e.g. stories110m); GQA models must build with FUSE_QKVBWD=0."
+// Attention-backward IO lever: bwd1 produces dV/probs/dp and bwd2 consumes
+// probs/dp to produce dQ/dK. Keeping that score-sized handoff on IOSurfaces moves
+// multiple MB/layer through CPU-visible memory. Mode 1 tries one all-in graph
+// (dQ,dK,dV) but currently hits an ANE compiler "cycle path" internal error on
+// this box. Mode 2 keeps two evals but recomputes attention in the dQ/dK kernel,
+// so probs/dp never leave the ANE; it compiles but measured slower on qwen3_06b
+// (345.8ms/step vs 343.0 split after the IO/capture cleanup). 0 = faster current
+// split handoff.
+#ifndef FUSE_SDPA_BWD
+#define FUSE_SDPA_BWD 0
 #endif
 // VERTICAL-fusion lever (the dispatch-bound corollary): fold the SiLU backward
 // — the 6.4 ms/step CPU bucket wedged BETWEEN the two FFN-backward evals
@@ -127,16 +134,26 @@
 // so the async dW closure still gets dh1/dh3 (no recompute on the SERIAL dw_q).
 // dsilu flows ffnBwdW2t->ffnBwdW13t via a strided ANE->ANE copy (no CPU bounce).
 // Moves 6.4 ms of CPU compute onto the dispatch-bound ANE (compute ~free).
+// Default-on when SWIGLU_CLAMP is off: measured after the optimizer/update
+// cleanup at qwen3_06b 373.9ms/step vs 377.0 and stories110m 106.6 vs 109.9.
 // 0 = CPU silu. 1 = kernel outputs concat(dx,dh1,dh3); the async dW reads dh1/dh3
 //   back (round-trip tax: +1.8 io + 1.8 ane for the 6x-bigger output). Net −2.0.
-// 2 = kernel outputs dx ONLY; the dW closure recomputes dh1/dh3 on the (slack)
-//   serial dw_q — drops both taxes, overlapping the silu math with later evals.
+// 2 = kernel outputs dx ONLY; the dW closure recomputes dh1/dh3 on the serial
+//   dw_q. It still loses after persistent sigmoid scratch: qwen3_06b 422.6ms/step
+//   vs 334.1 for mode 1, because the recompute stretches overlap too far.
 // Works for MHA and GQA (pure FFN).
 #ifndef FUSE_SILU_BWD
-#define FUSE_SILU_BWD 0
+#define FUSE_SILU_BWD (!SWIGLU_CLAMP)
 #endif
 #if FUSE_SILU_BWD && SWIGLU_CLAMP
 #error "FUSE_SILU_BWD implements the non-clamp SiLU backward only; build SWIGLU_CLAMP=0 or extend gen_ffn_bwd_w13t_fused_silu_dynamic with the clamp masks."
+#endif
+// Experimental W13 implementation: keep the same fused-SiLU math/output contract
+// but express dh1@W1^T and dh3@W3^T as 1x1 convs. Measured rejected on qwen3_06b:
+// 472.0ms/step train, W13 eval 88.9ms vs ~334ms/step and ~33ms W13 for matmul.
+// 0 = matmul path.
+#ifndef W13_CONV1IN
+#define W13_CONV1IN 0
 #endif
 // Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
 // emits this for generated headers; fallback keeps hand-written headers compiling.
@@ -305,4 +322,37 @@ static void layer_grads_zero(LayerGrads *g) {
 static void layer_grads_free(LayerGrads *g) {
     free(g->Wq);free(g->Wk);free(g->Wv);free(g->Wo);
     free(g->W1);free(g->W2);free(g->W3);free(g->rms_att);free(g->rms_ffn);
+}
+
+typedef struct {
+    float *dffn, *dh1, *dh3;
+#if FUSE_SILU_BWD == 2
+    float *dsilu, *sig;
+#endif
+    float *dwo;
+    float *dq, *dk, *dv;
+} DwCapture;
+
+static DwCapture dw_capture_alloc(void) {
+    DwCapture c;
+    c.dffn=(float*)malloc(SEQ*DIM*4);
+    c.dh1=(float*)malloc(SEQ*HIDDEN*4);
+    c.dh3=(float*)malloc(SEQ*HIDDEN*4);
+#if FUSE_SILU_BWD == 2
+    c.dsilu=(float*)malloc(SEQ*HIDDEN*4);
+    c.sig=(float*)malloc(SEQ*HIDDEN*4);
+#endif
+    c.dwo=(float*)malloc(SEQ*DIM*4);
+    c.dq=(float*)malloc(SEQ*Q_DIM*4);
+    c.dk=(float*)malloc(SEQ*KV_DIM*4);
+    c.dv=(float*)malloc(SEQ*KV_DIM*4);
+    return c;
+}
+static void dw_capture_free(DwCapture *c) {
+    free(c->dffn);free(c->dh1);free(c->dh3);
+#if FUSE_SILU_BWD == 2
+    free(c->dsilu);free(c->sig);
+#endif
+    free(c->dwo);
+    free(c->dq);free(c->dk);free(c->dv);
 }
