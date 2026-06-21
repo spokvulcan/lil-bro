@@ -538,6 +538,65 @@ static NSString *gen_ffn_bwd_w13t_fused_silu_dynamic(void) {
     return m;
 }
 
+// RMSNorm BACKWARD on ANE (RMSNORM_BWD_ANE, P1 pathfinder — issue #12 / ADR 0004).
+// Ports the static ane_rmsnorm_bwd.h to the dynamic trainer's compile-once model:
+// the static kernel BAKED rms_w as a const() BLOBFILE (a recompile each step here),
+// so instead we pack w as a RUNTIME spatial input. Per-channel layout
+// [dy(SEQ) | x(SEQ) | w(1)], SP = 2*SEQ+1, channel = DIM.
+//   rrms = 1/sqrt(mean_c(x^2) + eps)                 (reduce over axis=1 = channels)
+//   dot  = invd * rrms^2 * sum_c(dy*w*x)
+//   dx   = w * rrms * (dy - x*dot)                   (matches CPU rmsnorm_bwd exactly)
+// Output is concat(dx, rrms) [1, DIM+1, 1, SEQ] so the CPU dw loop (which stays on
+// CPU — it reduces over SEQ and accumulates across steps) reuses the kernel's rrms
+// without recomputing the sum-of-squares. NB the reduce_sum is over the CHANNEL
+// axis — the ANE's "wrong axis"; this kernel is the measurement of whether that
+// (plus the per-eval dispatch, the ANE being dispatch-bound) is a win or a wash.
+static NSString *gen_rmsnorm_bwd_dynamic(void) {
+    float invd = 1.0f / (float)DIM;
+    // [dy(SEQ) | x(SEQ) | w(1) | pad] — the ANE requires the packed spatial dim to
+    // be a MULTIPLE OF 32 (probe_rms.m SP sweep: 512/544/576 OK, 513..528 rejected
+    // 0x1d). 2*SEQ is already 32-aligned; the +1 weight column rounds up to +32.
+    int sp_in = ((2*SEQ + 1 + 31) / 32) * 32;   // SEQ=256 -> 544
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> inp) {\n", DIM, sp_in];
+    // slices: dy [DIM,SEQ] @0, x [DIM,SEQ] @SEQ, w [DIM,1] @2*SEQ
+    [m appendFormat:@"        tensor<int32, [4]> sz = const()[name=string(\"sz\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", DIM, SEQ];
+    [m appendString:@"        tensor<int32, [4]> b0 = const()[name=string(\"b0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dy = slice_by_size(x=inp,begin=b0,size=sz)[name=string(\"sdy\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> b1 = const()[name=string(\"b1\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> x = slice_by_size(x=inp,begin=b1,size=sz)[name=string(\"sx\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<int32, [4]> szw = const()[name=string(\"szw\"), val=tensor<int32, [4]>([1,%d,1,1])];\n", DIM];
+    [m appendFormat:@"        tensor<int32, [4]> b2 = const()[name=string(\"b2\"), val=tensor<int32, [4]>([0,0,0,%d])];\n", 2*SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,1]> w = slice_by_size(x=inp,begin=b2,size=szw)[name=string(\"sw\")];\n", DIM];
+    // rrms = pow(mean_c(x^2)+eps, -0.5)
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sq = mul(x=x,y=x)[name=string(\"sq\")];\n", DIM, SEQ];
+    [m appendString:@"        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n"];
+    [m appendString:@"        bool kd = const()[name=string(\"kd\"), val=bool(true)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss = reduce_sum(x=sq,axes=rax,keep_dims=kd)[name=string(\"ss\")];\n", SEQ];
+    [m appendFormat:@"        fp16 invd = const()[name=string(\"invd\"), val=fp16(%f)];\n", invd];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n", SEQ];
+    [m appendString:@"        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n", SEQ];
+    [m appendString:@"        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];\n", SEQ];
+    // dot = invd * rrms^2 * sum_c(dy*w*x)
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dyw = mul(x=dy,y=w)[name=string(\"dyw\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dywx = mul(x=dyw,y=x)[name=string(\"dywx\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> dot_sum = reduce_sum(x=dywx,axes=rax,keep_dims=kd)[name=string(\"ds\")];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> dot_sc = mul(x=dot_sum,y=invd)[name=string(\"dsc\")];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms2 = mul(x=rrms,y=rrms)[name=string(\"rr2\")];\n", SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> coeff = mul(x=dot_sc,y=rrms2)[name=string(\"cof\")];\n", SEQ];
+    // dx = (dy*w - x*coeff) * rrms
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xc = mul(x=x,y=coeff)[name=string(\"xc\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> diff = sub(x=dyw,y=xc)[name=string(\"dif\")];\n", DIM, SEQ];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dx = mul(x=diff,y=rrms)[name=string(\"dxo\")];\n", DIM, SEQ];
+    // output dx [1, DIM, 1, SEQ] (even channels). rrms is recomputed CPU-side for
+    // the dw loop — concat(dx,rrms) gave an odd 769-ch output the ANE rejects (0x1d).
+    [m appendString:@"    } -> (dx);\n}\n"];
+    return m;
+}
+
 // wotBwd: dy @ Wo → da (IC=DIM, OC=Q_DIM)
 static NSString *gen_wot_dynamic(void) {
     return gen_dyn_matmul_mil(DIM, Q_DIM, SEQ);
