@@ -77,6 +77,15 @@ wall-clock — never a token-efficiency claim.
 |---|---|---|---|---|
 | 2026-06-21 | baseline (stories110m, plain Muon) | R0 ✓ falls 9.14→7.07 | **~102 ms/step** | baseline |
 | 2026-06-21 | fuse SiLU-bwd 9 vDSP passes → 1 loop | R0 ✓ / R1 cos 0.99944 | `silu` 6.5→5.8 ms (−0.7) | keep (minor) |
+| 2026-06-21 | woFwd → function-param IOSurface (`WO_FUNCPARAM`) | R0 ✓ / R1 **cos 1.00000** | no Δ (smallest weight) | mechanism proven; default-off |
+
+**IOSurface lever — mechanism proven.** Multi-input MIL binding works: a
+`func main(x, Wo)` with `requestWithInputs:@[act,Wo] inputIndices:@[@0,@1]` and `Wo^T`
+staged as a contiguous `[1,1,Q_DIM,DIM]` surface gives **bitwise-identical** grads
+(cos 1.0, rel_l2 0). woFwd alone is unmeasurable (Wo is 768×768, the smallest weight),
+but this unlocks the −30% rollout to the big-weight kernels (FFN W1/W2/W3 = 768×2048,
+SDPA Wq/Wk/Wv) and is the same multi-surface plumbing the SiLU-fold and classifier need.
+Reusable: `compile_kern_mil_2in`, `make_request_2in` (`io.h`), `gen_wo_fwd_2in` (`mil_dynamic.h`).
 
 **SiLU finding:** the bucket is *not* dominated by the 9 elementwise passes (fusing
 them saved only 0.7 ms) — it's dominated by the **sigmoid setup** (`vvexpf` + `vvrecf`,

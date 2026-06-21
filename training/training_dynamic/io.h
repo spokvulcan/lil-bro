@@ -131,11 +131,38 @@ static Kern *compile_kern_mil_w(NSString *mil, NSDictionary *weights, int ic_byt
     return k;
     }
 }
+// Two-input variant: compile a MIL func main(x, w) and bind both input
+// surfaces (indices 0,1) in the template request. Additive — single-input
+// compile_kern_mil_w is untouched. Used by the function-parameter weight path.
+static Kern *compile_kern_mil_2in(NSString *mil, int ic0_bytes, int ic1_bytes, int oc_bytes) {
+    Kern *k = compile_kern_mil_w(mil, @{}, ic0_bytes, oc_bytes);
+    if (!k) return NULL;
+    CFRelease(k->request);  // drop the single-input template request
+    k->ioIn1 = make_surface(ic1_bytes);
+    id wI0 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn);
+    id wI1 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioIn1);
+    id wO  = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioOut);
+    k->request = (void*)CFBridgingRetain(((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+        @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+        @[wI0, wI1], @[@0, @1], @[wO], @[@0], nil, nil, @0));
+    return k;
+}
+// Per-layer request binding two input surfaces (act @0, weight @1) to one output.
+static void *make_request_2in(Kern *k, IOSurfaceRef in0, IOSurfaceRef in1) {
+    id wI0 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), in0);
+    id wI1 = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), in1);
+    id wO  = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(g_AIO, @selector(objectWithIOSurface:), k->ioOut);
+    id req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(g_AR,
+        @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
+        @[wI0, wI1], @[@0, @1], @[wO], @[@0], nil, nil, @0);
+    return (void*)CFBridgingRetain(req);
+}
 static void free_kern(Kern *k) {
     if (!k) return;
     id mdl = (__bridge id)k->model; NSError *e = nil;
     ((BOOL(*)(id,SEL,unsigned int,NSError**))objc_msgSend)(mdl, @selector(unloadWithQoS:error:), 21, &e);
     CFRelease(k->ioIn); CFRelease(k->ioOut);
+    if (k->ioIn1) CFRelease(k->ioIn1);
     [[NSFileManager defaultManager] removeItemAtPath:(__bridge id)k->tmpDir error:nil];
     CFRelease(k->model); CFRelease(k->request); CFRelease(k->tmpDir);
     free(k);
@@ -194,6 +221,15 @@ static void write_wo_fwd_acts(IOSurfaceRef s, const float *attn_out) {
     for (int d = 0; d < Q_DIM; d++)
         cvt_f32_f16(buf + d*WO_FWD_SP, attn_out + d*SEQ, SEQ);
     IOSurfaceUnlock(s, 0, NULL);
+}
+// Function-parameter woFwd (WO_FUNCPARAM): the act surface holds only attn_out
+// [1,Q_DIM,1,SEQ] (no packed weight); Wo^T arrives as its own [1,1,Q_DIM,DIM]
+// surface, already in matmul shape, so the kernel skips the weight slice/reshape.
+static void write_wo_fwd_acts_fp(IOSurfaceRef s, const float *attn_out) {
+    io_write_fp16_at(s, 0, attn_out, Q_DIM, SEQ);   // contiguous [Q_DIM, SEQ]
+}
+static void stage_wo_fwd_w_fp(IOSurfaceRef s, const float *Wot) {
+    io_write_fp16_at(s, 0, Wot, Q_DIM, DIM);        // contiguous [Q_DIM, DIM] = Wo^T
 }
 
 // ffnFused: [1, DIM, 1, 2*SEQ+3*HIDDEN] fp16
@@ -316,6 +352,9 @@ static void write_kv_bwd_acts(IOSurfaceRef s, const float *dk, const float *dv) 
 static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {
     for (int L = 0; L < NLAYERS; L++) {
         CFRelease(pls[L].sdpaFwd_in); CFRelease(pls[L].woFwd_in); CFRelease(pls[L].ffnFused_in);
+#if WO_FUNCPARAM
+        CFRelease(pls[L].woFwd_w);
+#endif
         CFRelease(pls[L].ffnBwdW2t_in); CFRelease(pls[L].ffnBwdW13t_in);
         CFRelease(pls[L].wotBwd_in); CFRelease(pls[L].qBwd_in); CFRelease(pls[L].kvBwd_in);
         CFRelease(plr[L].sdpaFwd); CFRelease(plr[L].woFwd); CFRelease(plr[L].ffnFused);

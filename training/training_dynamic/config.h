@@ -52,6 +52,13 @@
 #ifndef N_HC
 #define N_HC 1
 #endif
+// V2 placement knob (issue #12): pass woFwd's Wo as a function-parameter
+// IOSurface instead of packing it into the activation surface's spatial dim,
+// removing the in-kernel weight slice/reshape (upstream PR #22 lever). 0 = the
+// original single-input spatial-packed path.
+#ifndef WO_FUNCPARAM
+#define WO_FUNCPARAM 0
+#endif
 // Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
 // emits this for generated headers; fallback keeps hand-written headers compiling.
 #ifndef MTP_DEPTH
@@ -107,13 +114,17 @@ typedef struct {
     float *Wq, *Wk, *Wv, *Wo, *W1, *W2, *W3, *rms_att, *rms_ffn;
 } LayerGrads;
 
-// ANE kernel handle
-typedef struct { void *model; IOSurfaceRef ioIn, ioOut; void *request; void *tmpDir; } Kern;
+// ANE kernel handle. ioIn1 is the optional second input surface for the
+// function-parameter path (multi-input MIL func, e.g. woFwd with Wo as a
+// separate IOSurface param); NULL for single-input kernels.
+typedef struct { void *model; IOSurfaceRef ioIn, ioIn1, ioOut; void *request; void *tmpDir; } Kern;
 
-// Per-layer IOSurfaces for pre-staged weights
+// Per-layer IOSurfaces for pre-staged weights. woFwd_w is the function-param
+// weight surface (Wo as its own IOSurface) used only when WO_FUNCPARAM is set.
 typedef struct {
     IOSurfaceRef sdpaFwd_in, woFwd_in, ffnFused_in;
     IOSurfaceRef ffnBwdW2t_in, ffnBwdW13t_in, wotBwd_in, qBwd_in, kvBwd_in;
+    IOSurfaceRef woFwd_w;
 } PerLayerSurfaces;
 
 // Per-layer ANE requests (bound to per-layer IOSurfaces)

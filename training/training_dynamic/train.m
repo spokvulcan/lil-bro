@@ -45,8 +45,13 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 
     // Wo forward: [1, Q_DIM, 1, SEQ+DIM] → [1, DIM, 1, SEQ]
     printf("  Compiling woFwd...\n");
+#if WO_FUNCPARAM
+    dk->woFwd = compile_kern_mil_2in(gen_wo_fwd_2in(),
+        Q_DIM*SEQ*2, Q_DIM*DIM*2, DIM*SEQ*2);
+#else
     dk->woFwd = compile_kern_mil_w(gen_wo_fwd_dynamic(), @{},
         Q_DIM*WO_FWD_SP*2, DIM*SEQ*2);
+#endif
     if (!dk->woFwd) return false;
 
     // Fused FFN: [1, DIM, 1, FFN_FUSED_SP] → [1, DIM+3*HIDDEN, 1, SEQ]
@@ -530,7 +535,11 @@ static void forward_hidden(
 
         // Wo forward (ANE)
         t0 = mach_absolute_time();
+#if WO_FUNCPARAM
+        write_wo_fwd_acts_fp(pls[L].woFwd_in, ac->attn_out);
+#else
         write_wo_fwd_acts(pls[L].woFwd_in, ac->attn_out);
+#endif
         r_io += tb_ms(mach_absolute_time() - t0);
         t0 = mach_absolute_time();
         ane_eval_req(dk->woFwd, plr[L].woFwd);
@@ -1165,7 +1174,12 @@ int main(int argc, char *argv[]) {
         PerLayerRequests plr[NLAYERS];
         for (int L = 0; L < NLAYERS; L++) {
             pls[L].sdpaFwd_in    = make_surface(DIM*SDPA_FWD_SP*2);
+#if WO_FUNCPARAM
+            pls[L].woFwd_in      = make_surface(Q_DIM*SEQ*2);
+            pls[L].woFwd_w       = make_surface(Q_DIM*DIM*2);
+#else
             pls[L].woFwd_in      = make_surface(Q_DIM*WO_FWD_SP*2);
+#endif
             pls[L].ffnFused_in   = make_surface(DIM*FFN_FUSED_SP*2);
             pls[L].ffnBwdW2t_in  = make_surface(DIM*FFN_BWD_W2T_SP*2);
             pls[L].ffnBwdW13t_in = make_surface(HIDDEN*FFN_BWD_W13T_SP*2);
@@ -1174,7 +1188,11 @@ int main(int argc, char *argv[]) {
             pls[L].kvBwd_in      = make_surface(KV_DIM*KV_BWD_SP*2);
 
             plr[L].sdpaFwd   = make_request(dk.sdpaFwd,   pls[L].sdpaFwd_in);
+#if WO_FUNCPARAM
+            plr[L].woFwd     = make_request_2in(dk.woFwd, pls[L].woFwd_in, pls[L].woFwd_w);
+#else
             plr[L].woFwd     = make_request(dk.woFwd,     pls[L].woFwd_in);
+#endif
             plr[L].ffnFused  = make_request(dk.ffnFused,  pls[L].ffnFused_in);
             plr[L].ffnBwdW2t = make_request(dk.ffnBwdW2t, pls[L].ffnBwdW2t_in);
             plr[L].ffnBwdW13t= make_request(dk.ffnBwdW13t,pls[L].ffnBwdW13t_in);
@@ -1186,7 +1204,11 @@ int main(int argc, char *argv[]) {
         // Stage weights into per-layer surfaces
         for (int L = 0; L < NLAYERS; L++) {
             stage_sdpa_fwd_weights(pls[L].sdpaFwd_in, Wqt_buf[L], Wkt_buf[L], Wvt_buf[L]);
+#if WO_FUNCPARAM
+            stage_wo_fwd_w_fp(pls[L].woFwd_w, Wot_buf[L]);
+#else
             stage_wo_fwd_weights(pls[L].woFwd_in, Wot_buf[L]);
+#endif
             stage_ffn_fused_weights(pls[L].ffnFused_in, W1t_buf[L], W3t_buf[L], lw[L].W2);
             stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
             stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
@@ -1851,7 +1873,11 @@ int main(int argc, char *argv[]) {
 
                     // Re-stage weights
                     stage_sdpa_fwd_weights(pls[L].sdpaFwd_in, Wqt_buf[L], Wkt_buf[L], Wvt_buf[L]);
+#if WO_FUNCPARAM
+                    stage_wo_fwd_w_fp(pls[L].woFwd_w, Wot_buf[L]);
+#else
                     stage_wo_fwd_weights(pls[L].woFwd_in, Wot_buf[L]);
+#endif
                     stage_ffn_fused_weights(pls[L].ffnFused_in, W1t_buf[L], W3t_buf[L], lw[L].W2);
                     stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
                     stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
