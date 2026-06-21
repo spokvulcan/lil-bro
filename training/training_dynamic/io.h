@@ -383,6 +383,38 @@ static void write_kv_bwd_acts(IOSurfaceRef s, const float *dk, const float *dv) 
     IOSurfaceUnlock(s, 0, NULL);
 }
 
+#if FUSE_QKVBWD
+// qkvBwd (fused, MHA-only): one packed surface [1, DIM, 1, 3*SEQ+3*DIM] fp16 =
+// [dq | dk | dv | Wq | Wk | Wv]. Requires Q_DIM==KV_DIM==DIM (#error in config.h
+// otherwise), so all three projections share IC=DIM. Activations dq/dk/dv are
+// [DIM,SEQ]; weights Wq/Wk/Wv are [DIM rows, DIM cols] — the SAME layouts the
+// split stage_q_bwd_weights / stage_kv_bwd_weights / write_*_bwd_acts use, so
+// the fused matmuls are byte-identical math to qBwd + kvBwd, summed in-kernel.
+#define QKV_BWD_SP (3*SEQ + 3*DIM)
+static void stage_qkv_bwd_weights(IOSurfaceRef s, const float *Wq,
+                                  const float *Wk, const float *Wv) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ,         Wq + d*DIM, DIM);
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ + DIM,   Wk + d*DIM, DIM);
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ + 2*DIM, Wv + d*DIM, DIM);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_qkv_bwd_acts(IOSurfaceRef s, const float *dq,
+                               const float *dk, const float *dv) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < DIM; d++) {
+        cvt_f32_f16(buf + d*QKV_BWD_SP,         dq + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*QKV_BWD_SP + SEQ,   dk + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 2*SEQ, dv + d*SEQ, SEQ);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+#endif
+
 // Free per-layer surfaces and requests
 static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {
     for (int L = 0; L < NLAYERS; L++) {
@@ -397,10 +429,17 @@ static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {
         CFRelease(pls[L].wotBwd_w); CFRelease(pls[L].qBwd_w);
 #endif
         CFRelease(pls[L].ffnBwdW2t_in); CFRelease(pls[L].ffnBwdW13t_in);
-        CFRelease(pls[L].wotBwd_in); CFRelease(pls[L].qBwd_in); CFRelease(pls[L].kvBwd_in);
+        CFRelease(pls[L].wotBwd_in);
         CFRelease(plr[L].sdpaFwd); CFRelease(plr[L].woFwd); CFRelease(plr[L].ffnFused);
         CFRelease(plr[L].ffnBwdW2t); CFRelease(plr[L].ffnBwdW13t);
-        CFRelease(plr[L].wotBwd); CFRelease(plr[L].qBwd); CFRelease(plr[L].kvBwd);
+        CFRelease(plr[L].wotBwd);
+#if FUSE_QKVBWD
+        CFRelease(pls[L].qkvBwd_in);
+        CFRelease(plr[L].qkvBwd);
+#else
+        CFRelease(pls[L].qBwd_in); CFRelease(pls[L].kvBwd_in);
+        CFRelease(plr[L].qBwd); CFRelease(plr[L].kvBwd);
+#endif
     }
 }
 

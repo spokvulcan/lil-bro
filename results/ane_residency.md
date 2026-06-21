@@ -81,6 +81,7 @@ wall-clock — never a token-efficiency claim.
 | 2026-06-21 | ~~ffnBwdW2t → function-param (`W2T_FUNCPARAM`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
 | 2026-06-21 | ~~conv datapath on ffnBwdW2t (`CONV_PROBE`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
 | 2026-06-21 | conv via SINGLE-input on wotBwd (`CONV1IN`, fixed gate) | R0 ✓ / R1 **cos 1.00000** (real clean-build diff) | `ane_bwd` 31.2→31.0 (=1) / 31.4 (=2) | **correct, but a WASH; transposes refuted as bottleneck** |
+| 2026-06-21 | **kernel fusion**: re-fuse qBwd+kvBwd → 1 eval (`FUSE_QKVBWD`) | R0 ✓ / R1 **cos 0.99996** (fixed gate, both verified independently) | **`ane_bwd` 31.1→29.1 ms (−2.0/step, −6.3%)** | **WIN — first validated speedup; lever confirmed** |
 
 > ### ⚠️ CORRECTION (2026-06-21) — the func-param + conv "confirmations" were false passes
 >
@@ -197,6 +198,36 @@ packed surface, exactly the n=2048-class kernels that already eval fine).
 *Incidental:* the ANE rejects very small/odd program shapes with the same
 `status=0x1d` (e.g. 16×16×16) — so 0x1d is a general "program rejected", not
 unique to multi-input; the multi-input wall may yet be a plumbing detail (below).
+
+### Fusion lever VALIDATED — qkvBwd re-fusion, −2.0 ms/step (`FUSE_QKVBWD`)
+
+First fusion applied and measured end-to-end. `qBwd` (dq@Wq → dx_attn) and
+`kvBwd` (dk@Wk + dv@Wv → dx_kv, then CPU `dx_attn += dx_kv`) are independent
+backward projections that sum into `dxnorm`; they were split from one `qkvBwd`
+kernel in `475348a` purely for GQA (Q_DIM≠KV_DIM), not correctness. Re-fused on
+MHA (stories110m) into ONE single-input kernel computing
+`dx_attn = dq@Wq + dk@Wk + dv@Wv` (`gen_qkv_bwd_fused_mil`), removing 1 eval/layer
+(×12) + the CPU add + one fp16 pack.
+
+- **Correct** (fixed gate, verified twice independently): `R1 PASS, cos 0.99996
+  @L0.rms_ffn` (rel_l2 0.0092). Not exactly 1.0 — and that's the *honest*
+  signature of a real fused-vs-split diff: the 3-way in-kernel fp16 `add` reorders
+  the reduction vs the split's 2-way+CPU-fp32 add. Same benign class as the SiLU
+  fold (0.99944), well inside the cos≥0.99 gate. R0 overfit trains to loss 1.43.
+- **−2.0 ms/step** (independently measured, 9 samples each): `ane_bwd` median
+  31.1 → 29.1 (mean 32.7 → 30.4; min 30.3 → 28.8 — every order statistic shifts
+  down ~2 ms). Matches the prediction: 12 evals × ~0.12 ms dispatch + the removed
+  CPU add. Default-0 (opt-in); MHA-only (`#error` guards GQA).
+
+**This converts the dispatch-bound hypothesis into a banked win and a rollout
+rationale.** Caveat for the rollout: the *easy* horizontal fusions are limited —
+the forward is already fused (sdpaFwd packs QKV+attention, ffnFused packs
+W1+W3+SiLU+W2), and the remaining backward kernels are mostly *sequential*
+(ffnBwdW2t→ffnBwdW13t; wotBwd→attn-bwd→qkvBwd), which can't share one eval. The
+larger headroom is **vertical fusion** (folding a sequential chain into one
+kernel, as sdpaFwd already does) — higher value but harder, and gated by whether
+the intermediates (softmax-bwd, SiLU-bwd) are ANE-expressible. qkvBwd was the
+cleanest first cut; it proves the mechanism and the measurement.
 
 **Why the multi-input request fails (open, for the next attempt).** Status
 `0x1d` is opaque. Two hypotheses, untested: (a) the private

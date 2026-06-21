@@ -17,6 +17,9 @@ typedef struct {
     Kern *sdpaBwd2;    // probs,dp,Q,K → dQ,dK_full (weight-free)
     Kern *qBwd;        // dq @ Wq → dx_q (Q_DIM → DIM)
     Kern *kvBwd;       // dk@Wk + dv@Wv → dx_kv (KV_DIM → DIM)
+#if FUSE_QKVBWD
+    Kern *qkvBwd;      // fused: dq@Wq + dk@Wk + dv@Wv → dx_attn (one eval, MHA-only)
+#endif
 } DynLayerKernels;
 
 // Transpose W[rows,cols] → W^T[cols,rows] stored as [cols channels, rows spatial]
@@ -117,6 +120,14 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
         (2*SCORE_CH+2*Q_DIM)*SEQ*2, 2*Q_DIM*SEQ*2);
     if (!dk->sdpaBwd2) return false;
 
+#if FUSE_QKVBWD
+    // Fused QKV backward (MHA-only): one eval replaces qBwd + kvBwd.
+    // [1, DIM, 1, 3*SEQ+3*DIM] → [1, DIM, 1, SEQ]
+    printf("  Compiling qkvBwd (fused)...\n");
+    dk->qkvBwd = compile_kern_mil_w(gen_qkv_bwd_fused_mil(), @{},
+        DIM*QKV_BWD_SP*2, DIM*SEQ*2);
+    if (!dk->qkvBwd) return false;
+#else
     // Q backward: [1, Q_DIM, 1, SEQ+DIM] → [1, DIM, 1, SEQ]
     printf("  Compiling qBwd...\n");
 #if CONV_DATAPATH
@@ -133,6 +144,7 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
     dk->kvBwd = compile_kern_mil_w(gen_kv_bwd_dynamic(), @{},
         KV_DIM*KV_BWD_SP*2, DIM*SEQ*2);
     if (!dk->kvBwd) return false;
+#endif
 
     return true;
 }
@@ -1226,9 +1238,15 @@ int main(int argc, char *argv[]) {
             pls[L].qBwd_w        = make_surface(Q_DIM*DIM*2);
 #else
             pls[L].wotBwd_in     = make_surface(DIM*WOT_BWD_SP*2);
+#if !FUSE_QKVBWD
             pls[L].qBwd_in       = make_surface(Q_DIM*Q_BWD_SP*2);
 #endif
+#endif
+#if FUSE_QKVBWD
+            pls[L].qkvBwd_in     = make_surface(DIM*QKV_BWD_SP*2);
+#else
             pls[L].kvBwd_in      = make_surface(KV_DIM*KV_BWD_SP*2);
+#endif
 
             plr[L].sdpaFwd   = make_request(dk.sdpaFwd,   pls[L].sdpaFwd_in);
 #if WO_FUNCPARAM
@@ -1248,9 +1266,15 @@ int main(int argc, char *argv[]) {
             plr[L].qBwd      = make_request_2in(dk.qBwd,   pls[L].qBwd_in,   pls[L].qBwd_w);
 #else
             plr[L].wotBwd    = make_request(dk.wotBwd,    pls[L].wotBwd_in);
+#if !FUSE_QKVBWD
             plr[L].qBwd      = make_request(dk.qBwd,      pls[L].qBwd_in);
 #endif
+#endif
+#if FUSE_QKVBWD
+            plr[L].qkvBwd    = make_request(dk.qkvBwd,    pls[L].qkvBwd_in);
+#else
             plr[L].kvBwd     = make_request(dk.kvBwd,     pls[L].kvBwd_in);
+#endif
         }
 
         // Stage weights into per-layer surfaces
@@ -1284,9 +1308,15 @@ int main(int argc, char *argv[]) {
 #else
             stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
 #endif
+#if !FUSE_QKVBWD
             stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
 #endif
+#endif
+#if FUSE_QKVBWD
+            stage_qkv_bwd_weights(pls[L].qkvBwd_in, lw[L].Wq, lw[L].Wk, lw[L].Wv);
+#else
             stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);
+#endif
         }
         printf("Per-layer weight staging complete\n\n");
 
@@ -1699,6 +1729,20 @@ int main(int argc, char *argv[]) {
                     free(capt_dq); free(capt_dk); free(capt_dv); free(capt_xn);
                 });
 
+#if FUSE_QKVBWD
+                // Fused QKV backward (ANE, MHA-only): one eval computes
+                // dx_attn = dq@Wq + dk@Wk + dv@Wv (summed in-kernel), replacing
+                // the split qBwd + kvBwd evals AND the CPU dx_attn += dx_kv add.
+                t0 = mach_absolute_time();
+                write_qkv_bwd_acts(pls[L].qkvBwd_in, dq, dk_buf, dv);
+                t_io_bwd += tb_ms(mach_absolute_time() - t0);
+                t0 = mach_absolute_time();
+                ane_eval_req(dk.qkvBwd, plr[L].qkvBwd);
+                t_ane_bwd += tb_ms(mach_absolute_time() - t0);
+                t0 = mach_absolute_time();
+                io_read_dyn(dk.qkvBwd->ioOut, dx_attn, DIM, SEQ);
+                t_io_bwd += tb_ms(mach_absolute_time() - t0);
+#else
                 // Q backward (ANE): dq[Q_DIM] @ Wq → dx_q[DIM]
                 t0 = mach_absolute_time();
 #if CONV_DATAPATH
@@ -1729,6 +1773,7 @@ int main(int argc, char *argv[]) {
                 // dx_attn = dx_q + dx_kv
                 for(int i=0; i<SEQ*DIM; i++) dx_attn[i] += dx_kv[i];
                 free(dx_kv);
+#endif
 
                 // RMSNorm1 backward.  In mHC mode ac->layer_in is the collapsed
                 // attention input u_attn, so dx_rms1 = du_attn (no plain passthrough).
@@ -1985,9 +2030,15 @@ int main(int argc, char *argv[]) {
 #else
                     stage_wot_bwd_weights(pls[L].wotBwd_in, lw[L].Wo);
 #endif
+#if !FUSE_QKVBWD
                     stage_q_bwd_weights(pls[L].qBwd_in, lw[L].Wq);
 #endif
+#endif
+#if FUSE_QKVBWD
+                    stage_qkv_bwd_weights(pls[L].qkvBwd_in, lw[L].Wq, lw[L].Wk, lw[L].Wv);
+#else
                     stage_kv_bwd_weights(pls[L].kvBwd_in, lw[L].Wk, lw[L].Wv);
+#endif
                 }
                 adam_update(rms_final, grms_final, &arms_final, adam_t, lr, adam_b1, adam_b2, adam_eps, 0.0f);
                 adam_update(embed, gembed, &aembed, adam_t, lr, adam_b1, adam_b2, adam_eps, wd);
@@ -2077,7 +2128,11 @@ int main(int argc, char *argv[]) {
         free_kern(dk.sdpaFwd); free_kern(dk.woFwd); free_kern(dk.ffnFused);
         free_kern(dk.ffnBwdW2t); free_kern(dk.ffnBwdW13t); free_kern(dk.wotBwd);
         free_kern(dk.sdpaBwd1); free_kern(dk.sdpaBwd2);
+#if FUSE_QKVBWD
+        free_kern(dk.qkvBwd);
+#else
         free_kern(dk.qBwd); free_kern(dk.kvBwd);
+#endif
         free(da_buf); free(k_tiled); free(v_tiled);
         free(dq_full); free(dk_full); free(dv_full);
         free(dq); free(dk_buf); free(dv);

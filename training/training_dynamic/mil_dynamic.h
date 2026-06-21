@@ -515,6 +515,47 @@ static NSString *gen_kv_bwd_dynamic(void) {
     return m;
 }
 
+#if FUSE_QKVBWD
+// qkvBwd (fused, MHA-only): re-fuses qBwd + kvBwd into ONE single-input eval.
+// dx_attn = dq@Wq + dk@Wk + dv@Wv, all three projections at IC=DIM (requires
+// Q_DIM==KV_DIM==DIM — guarded by #error in config.h). Input
+// [1, DIM, 1, 3*SEQ+3*DIM] = [dq | dk | dv | Wq | Wk | Wv]; output [1,DIM,1,SEQ].
+// Built from three gen_dyn_matmul blocks (same helper qBwd/kvBwd use), summed
+// in-kernel — so the math is byte-identical to the split path's
+// dx_q + dx_kv(=dxk+dxv). GOTCHA (per probe_dispatch.m gen_fused2_mil):
+// gen_dyn_matmul emits one un-prefixed const "bF"; a 2nd/3rd instance duplicates
+// it (InvalidMILProgram). Generate the k/v blocks into their own strings and
+// rename bF -> bFb / bFc before appending.
+static NSString *gen_qkv_bwd_fused_mil(void) {
+    const int ic = DIM, oc = DIM, seq = SEQ;
+    int w0 = 3*seq;                    // Wq spatial offset
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", ic, QKV_BWD_SP];
+
+    // q block: dq@Wq → q_y  (act@0, weight@3*SEQ)
+    gen_dyn_matmul(m, "q", ic, oc, seq, 0, w0, "x");
+
+    // k block: dk@Wk → k_y  (act@SEQ, weight@3*SEQ+DIM), rename bF -> bFb
+    NSMutableString *kb = [NSMutableString string];
+    gen_dyn_matmul(kb, "k", ic, oc, seq, seq, w0 + DIM, "x");
+    [kb replaceOccurrencesOfString:@"bF" withString:@"bFb" options:0 range:NSMakeRange(0, kb.length)];
+    [m appendString:kb];
+
+    // v block: dv@Wv → v_y  (act@2*SEQ, weight@3*SEQ+2*DIM), rename bF -> bFc
+    NSMutableString *vb = [NSMutableString string];
+    gen_dyn_matmul(vb, "v", ic, oc, seq, 2*seq, w0 + 2*DIM, "x");
+    [vb replaceOccurrencesOfString:@"bF" withString:@"bFc" options:0 range:NSMakeRange(0, vb.length)];
+    [m appendString:vb];
+
+    // dx = q_y + k_y + v_y
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> qk = add(x=q_y, y=k_y)[name=string(\"qk\")];\n", oc, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> dx = add(x=qk, y=v_y)[name=string(\"dx\")];\n", oc, seq];
+    [m appendString:@"    } -> (dx);\n}\n"];
+    return m;
+}
+#endif
+
 // SDPA backward part 1: recompute attention + dV, dp
 // Uses tiled K,V at HEADS dimension (CPU pre-tiles)
 // Input: [1, 2*Q_DIM+2*Q_DIM, 1, SEQ] fp16 = (Q, K_tiled, V_tiled, da)

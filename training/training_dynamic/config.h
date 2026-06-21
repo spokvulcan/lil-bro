@@ -102,6 +102,22 @@
 #ifndef CONV1IN
 #define CONV1IN 0
 #endif
+// Kernel-fusion lever (results/ane_residency.md "Dispatch-overhead probe"): the
+// ANE is DISPATCH-BOUND (~0.12 ms fixed overhead/eval, compute near-free to
+// n=1024; fusion PoC saved 38% on 2 matmuls). Re-fuse the qBwd + kvBwd backward
+// projections into ONE single-input kernel (qkvBwd) computing
+// dx_attn = dq@Wq + dk@Wk + dv@Wv in one eval, removing 1 eval/layer plus the
+// CPU dx_attn += dx_kv add. They were split FROM qkvBwd in 475348a purely for
+// GQA (Q_DIM != KV_DIM); on MHA (stories110m: Q_DIM=KV_DIM=DIM=768) the fusion
+// is clean. SCOPED TO Q_DIM==KV_DIM==DIM — a build-time #error guards otherwise,
+// so qwen3/GQA must keep FUSE_QKVBWD=0. Single-input only (the multi-input
+// binding is dead here — see the CORRECTION block). 0 = the split qBwd+kvBwd.
+#ifndef FUSE_QKVBWD
+#define FUSE_QKVBWD 0
+#endif
+#if FUSE_QKVBWD && !(Q_DIM == DIM && KV_DIM == DIM)
+#error "FUSE_QKVBWD requires Q_DIM==KV_DIM==DIM (MHA, e.g. stories110m); GQA models must build with FUSE_QKVBWD=0."
+#endif
 // Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
 // emits this for generated headers; fallback keeps hand-written headers compiling.
 #ifndef MTP_DEPTH
@@ -168,12 +184,18 @@ typedef struct {
     IOSurfaceRef sdpaFwd_in, woFwd_in, ffnFused_in;
     IOSurfaceRef ffnBwdW2t_in, ffnBwdW13t_in, wotBwd_in, qBwd_in, kvBwd_in;
     IOSurfaceRef woFwd_w, ffnBwdW2t_w, wotBwd_w, qBwd_w;
+#if FUSE_QKVBWD
+    IOSurfaceRef qkvBwd_in;   // fused [dq|dk|dv|Wq|Wk|Wv] packed surface
+#endif
 } PerLayerSurfaces;
 
 // Per-layer ANE requests (bound to per-layer IOSurfaces)
 typedef struct {
     void *sdpaFwd, *woFwd, *ffnFused;
     void *ffnBwdW2t, *ffnBwdW13t, *wotBwd, *qBwd, *kvBwd;
+#if FUSE_QKVBWD
+    void *qkvBwd;             // fused qBwd+kvBwd request (replaces both)
+#endif
 } PerLayerRequests;
 
 // Checkpoint header
