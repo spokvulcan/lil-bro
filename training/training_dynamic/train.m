@@ -82,8 +82,14 @@ static bool compile_dynamic_kernels(DynLayerKernels *dk) {
 
     // FFN backward W1^T+W3^T: [1, HIDDEN, 1, 2*SEQ+2*DIM] → [1, DIM, 1, SEQ]
     printf("  Compiling ffnBwdW13t...\n");
+#if FUSE_SILU_BWD
+    // Fused: input [dsilu|h1|h3|W1t|W3t] (3*SEQ+2*DIM), output concat(dx,dh1,dh3)
+    dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_fused_silu_dynamic(), @{},
+        HIDDEN*FFN_BWD_W13T_FUSED_SP*2, (DIM+2*HIDDEN)*SEQ*2);
+#else
     dk->ffnBwdW13t = compile_kern_mil_w(gen_ffn_bwd_w13t_dynamic(), @{},
         HIDDEN*FFN_BWD_W13T_SP*2, DIM*SEQ*2);
+#endif
     if (!dk->ffnBwdW13t) return false;
 
     // Wo^T backward: [1, DIM, 1, SEQ+Q_DIM] → [1, Q_DIM, 1, SEQ]
@@ -1230,7 +1236,11 @@ int main(int argc, char *argv[]) {
 #else
             pls[L].ffnBwdW2t_in  = make_surface(DIM*FFN_BWD_W2T_SP*2);
 #endif
+#if FUSE_SILU_BWD
+            pls[L].ffnBwdW13t_in = make_surface(HIDDEN*FFN_BWD_W13T_FUSED_SP*2);
+#else
             pls[L].ffnBwdW13t_in = make_surface(HIDDEN*FFN_BWD_W13T_SP*2);
+#endif
 #if CONV_DATAPATH
             pls[L].wotBwd_in     = make_surface(DIM*SEQ*2);
             pls[L].wotBwd_w      = make_surface(DIM*Q_DIM*2);
@@ -1296,7 +1306,11 @@ int main(int argc, char *argv[]) {
 #else
             stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
 #endif
+#if FUSE_SILU_BWD
+            stage_ffn_bwd_w13t_fused_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#else
             stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#endif
 #if CONV_DATAPATH
             { static float t_wot_i[Q_DIM*DIM]; transpose_weight(t_wot_i, lw[L].Wo, DIM, Q_DIM);
               io_write_fp16_at(pls[L].wotBwd_w, 0, t_wot_i, Q_DIM, DIM); }  // conv weight = Wo^T [OC=Q_DIM,IC=DIM,1,1]
@@ -1498,6 +1512,24 @@ int main(int argc, char *argv[]) {
                 t0 = mach_absolute_time();
                 ane_eval_req(dk.ffnBwdW2t, plr[L].ffnBwdW2t);
                 t_ane_bwd += tb_ms(mach_absolute_time() - t0);
+#if FUSE_SILU_BWD
+                // Fused FFN backward: dsilu stays ANE-resident (strided copy from
+                // ffnBwdW2t's output), h1/h3 are staged, and the W13t kernel does
+                // the SiLU backward + both matmuls, outputting concat(dx,dh1,dh3).
+                // The 6.4 ms CPU silu bucket vanishes; dh1/dh3 return for the dW.
+                t0 = mach_absolute_time();
+                copy_dsilu_into_w13t_fused(pls[L].ffnBwdW13t_in, dk.ffnBwdW2t->ioOut);
+                write_ffn_bwd_w13t_fused_h(pls[L].ffnBwdW13t_in, ac->h1, ac->h3);
+                t_io_bwd += tb_ms(mach_absolute_time() - t0);
+                t0 = mach_absolute_time();
+                ane_eval_req(dk.ffnBwdW13t, plr[L].ffnBwdW13t);
+                t_ane_bwd += tb_ms(mach_absolute_time() - t0);
+                t0 = mach_absolute_time();
+                io_read_fp16(dk.ffnBwdW13t->ioOut, dx_ffn, 0,          DIM,    SEQ);
+                io_read_fp16(dk.ffnBwdW13t->ioOut, dh1,    DIM,        HIDDEN, SEQ);
+                io_read_fp16(dk.ffnBwdW13t->ioOut, dh3,    DIM+HIDDEN, HIDDEN, SEQ);
+                t_io_bwd += tb_ms(mach_absolute_time() - t0);
+#else
                 t0 = mach_absolute_time();
                 io_read_dyn(dk.ffnBwdW2t->ioOut, dsilu, HIDDEN, SEQ);
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
@@ -1569,6 +1601,7 @@ int main(int argc, char *argv[]) {
                 t0 = mach_absolute_time();
                 io_read_dyn(dk.ffnBwdW13t->ioOut, dx_ffn, DIM, SEQ);
                 t_io_bwd += tb_ms(mach_absolute_time() - t0);
+#endif
 
                 // dW FFN async
                 t0 = mach_absolute_time();
@@ -2018,7 +2051,11 @@ int main(int argc, char *argv[]) {
 #else
                     stage_ffn_bwd_w2t_weights(pls[L].ffnBwdW2t_in, lw[L].W2);
 #endif
+#if FUSE_SILU_BWD
+                    stage_ffn_bwd_w13t_fused_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#else
                     stage_ffn_bwd_w13t_weights(pls[L].ffnBwdW13t_in, lw[L].W1, lw[L].W3);
+#endif
 #if CONV_DATAPATH
                     { static float t_wot_r[Q_DIM*DIM]; transpose_weight(t_wot_r, lw[L].Wo, DIM, Q_DIM);
                       io_write_fp16_at(pls[L].wotBwd_w, 0, t_wot_r, Q_DIM, DIM); }

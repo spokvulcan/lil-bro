@@ -118,6 +118,22 @@
 #if FUSE_QKVBWD && !(Q_DIM == DIM && KV_DIM == DIM)
 #error "FUSE_QKVBWD requires Q_DIM==KV_DIM==DIM (MHA, e.g. stories110m); GQA models must build with FUSE_QKVBWD=0."
 #endif
+// VERTICAL-fusion lever (the dispatch-bound corollary): fold the SiLU backward
+// — the 6.4 ms/step CPU bucket wedged BETWEEN the two FFN-backward evals
+// (ffnBwdW2t -> [silu-bwd] -> ffnBwdW13t) — INTO the ffnBwdW13t kernel. dsilu,
+// h1, h3 are all [HIDDEN,SEQ] (channel-HIDDEN), so no mixed-dim packing; the bwd
+// ops (sigmoid/mul/add) are exactly the forward SiLU's, proven ANE-expressible.
+// The fused kernel takes [dsilu|h1|h3|W1t|W3t] and emits concat(dx_ffn,dh1,dh3)
+// so the async dW closure still gets dh1/dh3 (no recompute on the SERIAL dw_q).
+// dsilu flows ffnBwdW2t->ffnBwdW13t via a strided ANE->ANE copy (no CPU bounce).
+// Moves 6.4 ms of CPU compute onto the dispatch-bound ANE (compute ~free), at the
+// cost of reading dh1/dh3 back. Works for MHA and GQA (pure FFN). 0 = CPU silu.
+#ifndef FUSE_SILU_BWD
+#define FUSE_SILU_BWD 0
+#endif
+#if FUSE_SILU_BWD && SWIGLU_CLAMP
+#error "FUSE_SILU_BWD implements the non-clamp SiLU backward only; build SWIGLU_CLAMP=0 or extend gen_ffn_bwd_w13t_fused_silu_dynamic with the clamp masks."
+#endif
 // Multi-Token Prediction depth (issue #6). 0 = off (plain next-token). emit_c.py
 // emits this for generated headers; fallback keeps hand-written headers compiling.
 #ifndef MTP_DEPTH

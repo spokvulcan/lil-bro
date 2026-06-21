@@ -309,6 +309,44 @@ static void write_ffn_bwd_w13t_acts(IOSurfaceRef s, const float *dh1, const floa
     IOSurfaceUnlock(s, 0, NULL);
 }
 
+// FUSE_SILU_BWD: ffnBwdW13t input grows to [dsilu | h1 | h3 | W1t | W3t] —
+// SP = 3*SEQ + 2*DIM (one extra SEQ-wide region vs FFN_BWD_W13T_SP). Same
+// spatial-strided layout. dsilu is filled by copy_dsilu_into_w13t_fused; h1,h3
+// by write_ffn_bwd_w13t_fused_h; W1,W3 (weights) by the staging fn below.
+#define FFN_BWD_W13T_FUSED_SP (3*SEQ + 2*DIM)
+static void stage_ffn_bwd_w13t_fused_weights(IOSurfaceRef s, const float *W1, const float *W3) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < HIDDEN; d++) {
+        cvt_f32_f16(buf + d*FFN_BWD_W13T_FUSED_SP + 3*SEQ,       W1 + d*DIM, DIM);
+        cvt_f32_f16(buf + d*FFN_BWD_W13T_FUSED_SP + 3*SEQ + DIM, W3 + d*DIM, DIM);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+static void write_ffn_bwd_w13t_fused_h(IOSurfaceRef s, const float *h1, const float *h3) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < HIDDEN; d++) {
+        cvt_f32_f16(buf + d*FFN_BWD_W13T_FUSED_SP + SEQ,   h1 + d*SEQ, SEQ);
+        cvt_f32_f16(buf + d*FFN_BWD_W13T_FUSED_SP + 2*SEQ, h3 + d*SEQ, SEQ);
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
+// Strided ANE->ANE copy: dsilu lives in ffnBwdW2t's OUTPUT as contiguous
+// [HIDDEN,SEQ] (stride SEQ); place it at offset 0 of each channel of the fused
+// W13t input (stride FFN_BWD_W13T_FUSED_SP). fp16->fp16, no conversion, no CPU
+// round-trip — the silu-bwd math never leaves the ANE.
+static void copy_dsilu_into_w13t_fused(IOSurfaceRef dst, IOSurfaceRef src) {
+    IOSurfaceLock(dst, 0, NULL);
+    IOSurfaceLock(src, kIOSurfaceLockReadOnly, NULL);
+    _Float16 *db = (_Float16*)IOSurfaceGetBaseAddress(dst);
+    _Float16 *sb = (_Float16*)IOSurfaceGetBaseAddress(src);
+    for (int d = 0; d < HIDDEN; d++)
+        memcpy(db + d*FFN_BWD_W13T_FUSED_SP, sb + d*SEQ, SEQ * sizeof(_Float16));
+    IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, NULL);
+    IOSurfaceUnlock(dst, 0, NULL);
+}
+
 // wotBwd: [1, DIM, 1, SEQ+Q_DIM] fp16 — Wo is [DIM, Q_DIM], matmul gives Wo^T @ dy
 #define WOT_BWD_SP (SEQ + Q_DIM)
 static void stage_wot_bwd_weights(IOSurfaceRef s, const float *Wo) {

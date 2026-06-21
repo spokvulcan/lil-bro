@@ -58,7 +58,7 @@ Measured sum of named buckets ≈ 95 ms; total step ≈ 102 ms.
 |---|---:|---|---|
 | IOSurface function-param staging | ~14 (io) + kernel speedup | high (rewrite) | upstream −30%; biggest single lever |
 | `cls` classifier-fwd + CE → ANE | ~7 (half of cls) | high (fp32-island LSE) | PLAUSIBLE-BUT-UNVERIFIED; prior art PR #19 |
-| `silu` SiLU-bwd fold into FFN-bwd | ~6.5 + a round-trip | medium (elementwise) | ANE-friendly; fwd already runs SiLU on ANE |
+| ~~`silu` SiLU-bwd fold into FFN-bwd~~ | ~~~6.5 + a round-trip~~ | done | **DONE (`FUSE_SILU_BWD`, −2.0 ms/step, R1 cos 0.99853)** — folded into `ffnBwdW13t`; the round-trip tax (read dh1/dh3 back for dW) ate ~1.8 ms, leaving net −2.0. Next: recompute dh1/dh3 in the async dW closure to drop the read-back (gated on serial `dw_q` slack). |
 | `rms`/`rms_bwd` RMSNorm → ANE | ~5.9 | medium (reduction) | pathfinder for fp32-island recipe; ANE reductions are the "wrong axis" — win uncertain |
 | `dw_copy` buffer pooling | ~1–2 | none (identical math) | pre-allocate persistent capture buffers; safe momentum win |
 
@@ -82,6 +82,7 @@ wall-clock — never a token-efficiency claim.
 | 2026-06-21 | ~~conv datapath on ffnBwdW2t (`CONV_PROBE`)~~ | ~~R1 cos 1.00000~~ | ⚠️ **RETRACTED** | false pass — see Correction |
 | 2026-06-21 | conv via SINGLE-input on wotBwd (`CONV1IN`, fixed gate) | R0 ✓ / R1 **cos 1.00000** (real clean-build diff) | `ane_bwd` 31.2→31.0 (=1) / 31.4 (=2) | **correct, but a WASH; transposes refuted as bottleneck** |
 | 2026-06-21 | **kernel fusion**: re-fuse qBwd+kvBwd → 1 eval (`FUSE_QKVBWD`) | R0 ✓ / R1 **cos 0.99996** (fixed gate, both verified independently) | **`ane_bwd` 31.1→29.1 ms (−2.0/step, −6.3%)** | **WIN — first validated speedup; lever confirmed** |
+| 2026-06-21 | **vertical fusion**: fold SiLU-bwd into `ffnBwdW13t` on ANE (`FUSE_SILU_BWD`); kernel outputs `concat(dx,dh1,dh3)`, `dsilu` flows W2t→W13t via strided ANE→ANE copy | R0 ✓ falls to 3.09 / R1 **cos 0.99853 @L9.Wq, rel_l2 0.054** (fixed gate; worst is a non-FFN weight = correct change propagating fp16-silu rounding upstream) | `silu` **5.6→0.0**, `ane_bwd` +1.8 (in-kernel silu ops + 6× bigger output), `io_bwd` +1.8 (dh1/dh3 read-back for dW) ⇒ **−2.0 ms/step bucket-sum, −2.7 step-median** (9 samples each) | **WIN — 2nd validated speedup; the *vertical* lever confirmed. Stacks with `FUSE_QKVBWD`.** |
 
 > ### ⚠️ CORRECTION (2026-06-21) — the func-param + conv "confirmations" were false passes
 >
