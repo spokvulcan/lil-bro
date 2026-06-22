@@ -39,6 +39,10 @@
 
 static float g_res_alpha;   // 1/sqrt(2*NLAYERS), set in main
 
+// ---- learner-internal sub-profiler (zero-overhead when g_learner_prof==0) ----
+static int    g_learner_prof = 0;
+static double g_lfwd_s = 0.0, g_lloss_s = 0.0, g_lbwd_s = 0.0, g_lemb_s = 0.0, g_lopt_s = 0.0, g_lfus_s = 0.0;
+
 static inline int roundup32(int x) { return ((x + 31) / 32) * 32; }
 
 // ============================================================================
@@ -143,6 +147,7 @@ static void learner_alloc(Learner *L, ChessNet *net, ChessNet *grads, int K) {
 static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int adam_t,
                          float *out_lp, float *out_lv) {
     int K = L->K, S = K*SEQ;
+    uint64_t _t = g_learner_prof ? mach_absolute_time() : 0;
     const ReplaySample **batch = (const ReplaySample**)malloc((size_t)K*sizeof(*batch));
     replay_sample_batch(rb, batch, K);
     for (int k = 0; k < K; k++) memcpy(L->tokens + (size_t)k*SEQ, batch[k]->tokens, SEQ*sizeof(uint16_t));
@@ -150,7 +155,9 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
     grads_zero();
     chess_embed_posenc_batched(L->x_in, K, L->tokens, L->net->tok_emb, L->net->rank_emb, L->net->file_emb, L->net->misc_emb);
     chess_trunk_forward(L->net->W, L->acts, L->x_in, K, L->x_pre, L->x_final, L->net->rms_final, g_res_alpha, 1);
+    if (g_learner_prof) g_lfwd_s += mt_s(mach_absolute_time() - _t);
 
+    _t = g_learner_prof ? mach_absolute_time() : 0;
     memset(L->dx_final, 0, (size_t)DIM*S*4);
     memset(L->dxv,      0, (size_t)DIM*S*4);
     double lp = 0, lv = 0;
@@ -174,6 +181,7 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
         lv += chess_value_loss(L->x_final + (size_t)k*SEQ, L->net->W_val, DIM, S, NREAL, NWDL,
                                tgt_val, L->dxv + (size_t)k*SEQ, L->grads->W_val);
     }
+    if (g_learner_prof) g_lloss_s += mt_s(mach_absolute_time() - _t);
     // total loss = policy + value_weight*value: blend value's dx + scale its head grad.
     float vw = cfg->value_weight;
     for (int i = 0; i < DIM*S; i++) L->dx_final[i] += vw * L->dxv[i];
@@ -185,10 +193,18 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
     vDSP_vsmul(L->dx_final,     1, &ls, L->dx_final,     1, (vDSP_Length)(DIM*S));
     vDSP_vsmul(L->grads->W_pol, 1, &ls, L->grads->W_pol, 1, (vDSP_Length)(DIM*PLANES));
     vDSP_vsmul(L->grads->W_val, 1, &ls, L->grads->W_val, 1, (vDSP_Length)(DIM*NWDL));
+    _t = g_learner_prof ? mach_absolute_time() : 0;
     chess_trunk_backward(L->net->W, L->grads->W, L->acts, L->dx_final, K, L->x_pre, L->net->rms_final, L->grads->rms_final, L->dy_in, g_res_alpha);
+    if (g_learner_prof) g_lbwd_s += mt_s(mach_absolute_time() - _t);
+    _t = g_learner_prof ? mach_absolute_time() : 0;
     chess_embed_posenc_backward_batched(L->dy_in, K, L->grads->tok_emb, L->grads->rank_emb, L->grads->file_emb, L->grads->misc_emb, L->tokens);
+    if (g_learner_prof) g_lemb_s += mt_s(mach_absolute_time() - _t);
+    _t = g_learner_prof ? mach_absolute_time() : 0;
     optimizer_step(1.0f/(ls*(float)K), cfg->grad_clip, adam_t, cfg->lr, cfg->wd);
+    if (g_learner_prof) g_lopt_s += mt_s(mach_absolute_time() - _t);
+    _t = g_learner_prof ? mach_absolute_time() : 0;
     chess_net_build_fused(L->net);   // keep fused forward weights in sync with the canonical ones [iter 6]
+    if (g_learner_prof) g_lfus_s += mt_s(mach_absolute_time() - _t);
 
     *out_lp = (float)(lp / K); *out_lv = (float)(lv / K);
     free(batch);
@@ -401,8 +417,13 @@ int main(int argc, char **argv) {
                "vs-random  (W/D/L  score)", "vs-greedy  (W/D/L  score)");
 
         double sc_rand[512], sc_greedy[512]; int npts = 0; int adam_t = 0; int diverged = 0;
+        int prof = cfg.profile;
+        if (prof) g_learner_prof = 1;
+        double tot_gen = 0, tot_learn = 0, tot_evalr = 0, tot_evalg = 0, tot_ckpt = 0;
         for (int it = 0; it <= iters; it++) {
             float lp = 0, lv = 0; GenStats gs = {0,0,0,0,0};
+            double it_gen = 0, it_learn = 0;
+            g_lfwd_s = g_lloss_s = g_lbwd_s = g_lemb_s = g_lopt_s = g_lfus_s = 0.0;
             if (it > 0) {
                 // Warmup value-prior: blend the net's leaf value with a material heuristic for
                 // iter < warmup_iters, linearly decaying to 0 (purist-Zero resumes after warmup).
@@ -415,10 +436,15 @@ int main(int argc, char **argv) {
                 if (cfg.warmup_iters > 0 && cfg.warmup_frac > 0.0f)
                     frac = cfg.warmup_frac * (float)(cfg.warmup_iters - it > 0 ? (cfg.warmup_iters - it) : 0) / (float)cfg.warmup_iters;
                 if (frac > 0.0f) { warm = make_warmup_evaluator(&bev, frac); gen_bev = warm; }
+                uint64_t _tg = prof ? mach_absolute_time() : 0;
                 play_selfplay_batch(&gen_bev, &rb, &cfg, cfg.seed + (uint64_t)it*7919u, &gs);
+                if (prof) { it_gen = mt_s(mach_absolute_time() - _tg); tot_gen += it_gen; }
                 if (frac > 0.0f) warmup_evaluator_free(&warm);
-                if (replay_count(&rb) >= cfg.learner_batch)
+                if (replay_count(&rb) >= cfg.learner_batch) {
+                    uint64_t _tl = prof ? mach_absolute_time() : 0;
                     for (int s = 0; s < cfg.learner_steps; s++) { float a,b; learner_step(&L, &rb, &cfg, ++adam_t, &a, &b); lp = a; lv = b; }
+                    if (prof) { it_learn = mt_s(mach_absolute_time() - _tl); tot_learn += it_learn; }
+                }
                 // fail-fast on fp16 gradient overflow: a NaN/inf loss means the trunk diverged
                 // (lower --lr); abort now rather than spend the rest of the run spewing NaN.
                 if (!isfinite(lp) || !isfinite(lv)) {
@@ -430,19 +456,38 @@ int main(int argc, char **argv) {
             // so it runs only on eval-iters. Every OTHER iter still prints the loss + this-iter
             // generation W/D/L — a near-free learning signal (is loss_val falling off the ln3
             // uniform floor? is generation producing DECISIVE games for the value to learn from?).
+            double it_evalr = 0, it_evalg = 0, it_ckpt = 0;
             if (it == 0 || it == iters || (cfg.eval_every > 0 && it % cfg.eval_every == 0)) {
                 int w1,d1,l1,w2,d2,l2;
+                uint64_t _te = prof ? mach_absolute_time() : 0;
                 double sr = eval_vs_opponent(&bev, &cfg, opp_random, cfg.eval_games, cfg.seed ^ (0x1111ull*(uint64_t)(it+1)), &w1,&d1,&l1);
+                if (prof) { it_evalr = mt_s(mach_absolute_time() - _te); tot_evalr += it_evalr; }
+                _te = prof ? mach_absolute_time() : 0;
                 double sg = eval_vs_opponent(&bev, &cfg, opp_greedy, cfg.eval_games, cfg.seed ^ (0x2222ull*(uint64_t)(it+1)), &w2,&d2,&l2);
+                if (prof) { it_evalg = mt_s(mach_absolute_time() - _te); tot_evalg += it_evalg; }
                 if (npts < (int)(sizeof(sc_rand)/sizeof(sc_rand[0]))) { sc_rand[npts] = sr; sc_greedy[npts] = sg; npts++; }
                 printf("  %-4d %-9.4f %-9.4f %-8d | %3d/%3d/%-3d   %.3f       | %3d/%3d/%-3d   %.3f\n",
                        it, lp, lv, replay_count(&rb), w1,d1,l1, sr, w2,d2,l2, sg);
-                if (cfg.ckpt && cfg.ckpt[0]) chess_net_save(&net, cfg.ckpt);
+                if (cfg.ckpt && cfg.ckpt[0]) {
+                    uint64_t _tc = prof ? mach_absolute_time() : 0;
+                    chess_net_save(&net, cfg.ckpt);
+                    if (prof) { it_ckpt = mt_s(mach_absolute_time() - _tc); tot_ckpt += it_ckpt; }
+                }
             } else {
                 printf("  %-4d %-9.4f %-9.4f %-8d | gen W/D/L %ld/%ld/%ld  plies %ld\n",
                        it, lp, lv, replay_count(&rb), gs.wins_w, gs.draws, gs.wins_b, gs.plies);
             }
+            if (prof && it > 0) {
+                printf("    t_gen=%.2fs t_learn=%.2fs [fwd=%.2f loss=%.2f bwd=%.2f emb=%.2f opt=%.2f fus=%.2f] t_evalr=%.2fs t_evalg=%.2fs t_ckpt=%.2fs\n",
+                       it_gen, it_learn, g_lfwd_s, g_lloss_s, g_lbwd_s, g_lemb_s, g_lopt_s, g_lfus_s, it_evalr, it_evalg, it_ckpt);
+            }
             fflush(stdout);   // progress visibility for long background runs (output is else fully buffered)
+        }
+        if (prof) {
+            double tot = tot_gen + tot_learn + tot_evalr + tot_evalg + tot_ckpt;
+            printf("# profile: gen=%.1fs (%.0f%%) learn=%.1fs (%.0f%%) eval_r=%.1fs (%.0f%%) eval_g=%.1fs (%.0f%%) ckpt=%.1fs (%.0f%%) total=%.1fs\n",
+                   tot_gen, 100*tot_gen/tot, tot_learn, 100*tot_learn/tot, tot_evalr, 100*tot_evalr/tot,
+                   tot_evalg, 100*tot_evalg/tot, tot_ckpt, 100*tot_ckpt/tot, tot);
         }
 
         if (diverged) {

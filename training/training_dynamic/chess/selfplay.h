@@ -67,6 +67,8 @@ typedef struct {
     int      eval_games, eval_every, eval_sims, eval_considered, eval_max_plies;
     // benchmark harness
     int      bench_games;
+    // diagnostics
+    int      profile;                 // --profile: per-iter phase timing (gen/learner/eval/ckpt)
     // bookkeeping
     uint64_t seed;
     const char *ckpt;

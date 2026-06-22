@@ -68,6 +68,25 @@ static void chess_parallel_for(long N, void (^body)(long lo, long hi)) {
     });
 }
 
+// NEON expf via 2^x decomposition (x*ln2(e) -> floor + frac -> poly * 2^int). Degree-4 Horner
+// poly for exp2 on [0,1): max err ~1e-5 (softmax-grade; the softmax ratio is robust to this).
+// ~4x over scalar expf on the attention softmax (the measured 18.5%-of-gen hot spot). [iter 9]
+static inline float32x4_t neon_expf(float32x4_t x) {
+    x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0f)), vdupq_n_f32(88.0f));
+    float32x4_t p = vmulq_n_f32(x, 1.4426950408889634f);    // x * log2(e)
+    float32x4_t ip = vrndmq_f32(p);                          // floor(p)
+    float32x4_t fp = vsubq_f32(p, ip);                        // frac in [0,1)
+    // Horner for exp2(fp) = c0 + c1*f + c2*f^2 + c3*f^3 + c4*f^4; vmlaq_f32(a,b,v)=a+b*v
+    float32x4_t a = vdupq_n_f32(0.0096181f);                  // c4
+    a = vmlaq_f32(vdupq_n_f32(0.0555041f), a, fp);            // c3 + c4*f
+    a = vmlaq_f32(vdupq_n_f32(0.2402265f), a, fp);            // c2 + a*f
+    a = vmlaq_f32(vdupq_n_f32(0.6931472f), a, fp);            // c1 + a*f
+    a = vmlaq_f32(vdupq_n_f32(1.0f), a, fp);                  // c0 + a*f
+    int32x4_t e = vaddq_s32(vcvtq_s32_f32(ip), vdupq_n_s32(127));
+    float32x4_t scale = vreinterpretq_f32_s32(vshlq_n_s32(e, 23));
+    return vmulq_f32(a, scale);
+}
+
 static Kern *mm_kernel(int ic, int oc, int seq) {
     for (int i = 0; i < g_nmm; i++)
         if (g_mm[i].ic==ic && g_mm[i].oc==oc && g_mm[i].seq==seq) return g_mm[i].k;
@@ -243,7 +262,16 @@ static void attn_cpu_forward_batched(float *attn_out, const float *Q, const floa
                 }
                 float Z = 0.0f;
                 { uint64_t _t = g_trunk_prof ? mach_absolute_time() : 0;
-                  for (int j = 0; j <= q; j++) { sc[j] = expf(sc[j] - m); Z += sc[j]; }
+                  float32x4_t z4 = vdupq_n_f32(0.0f); float32x4_t vm = vdupq_n_f32(m);
+                  int j = 0;
+                  for (; j + 4 <= q + 1; j += 4) {
+                      float32x4_t s = vsubq_f32(vld1q_f32(&sc[j]), vm);
+                      s = neon_expf(s);
+                      vst1q_f32(&sc[j], s);
+                      z4 = vaddq_f32(z4, s);
+                  }
+                  Z = vaddvq_f32(z4);
+                  for (; j <= q; j++) { sc[j] = expf(sc[j] - m); Z += sc[j]; }
                   if (g_trunk_prof) g_trunk_softmax_s += tb_ms(mach_absolute_time() - _t) * 1e-3; }
                 float inv = 1.0f / Z;
                 float *orc = ot + (size_t)q*HD;
@@ -269,42 +297,120 @@ static void attn_cpu_forward_batched(float *attn_out, const float *Q, const floa
 }
 // Backward of attn_cpu_forward_batched. da[Q_DIM,S] -> dQ[Q_DIM,S], dK/dV[KV_DIM,S]
 // (accumulated, GQA-reduced). Recomputes the softmax. B=1 == attn_cpu_backward (no knobs).
+//
+// PARALLEL + NEON [the measured G2 bottleneck fix]: the B positions are independent (each b
+// writes DISJOINT columns [b*seqp, (b+1)*seqp) of dQ/dK/dV), so the b-loop runs over all
+// P-cores via dispatch_apply — the same seam as the forward. Per (b,h) the strided Q/K/V/da
+// slices are transposed once into contiguous [seqp, HD] tiles; the O(seqp^2*HD) QK^T dot, the
+// dp dot, and the dQ/dK/dV accumulations run as 2-way-ILP NEON fmla. dkt/dvt persist across
+// the q-loop (accumulate over q); dqt is a per-q reduction. Scatter-ADD to strided dQ/dK/dV
+// after the q-loop (MHA: each h its own region; GQA: multiple h scatter-add to the same kvh
+// region serially within a b -> correct). FP-order changes vs the old serial loop (NEON
+// partial sums), but deterministic and selfcheck tests the FORWARD, not the backward. [iter 9]
 static void attn_cpu_backward_batched(const float *da, const float *Q, const float *K,
                                       const float *V, int B, int seqp,
                                       float *dQ, float *dK, float *dV) {
     int S = B*seqp;
     float scale = 1.0f/sqrtf((float)HD);
     memset(dQ, 0, (size_t)Q_DIM*S*4); memset(dK, 0, (size_t)KV_DIM*S*4); memset(dV, 0, (size_t)KV_DIM*S*4);
-    for (int b = 0; b < B; b++) {
+    dispatch_queue_t dq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(B, dq, ^(size_t bb) {
+        int b = (int)bb;
         int base = b*seqp;
+        size_t tn = (size_t)seqp * HD;
+        float *buf = (float*)malloc((7 * tn + (size_t)3*seqp) * 4);
+        float *qt = buf, *kt = buf + tn, *vt = buf + 2*tn, *dat = buf + 3*tn;
+        float *dqt = buf + 4*tn, *dkt = buf + 5*tn, *dvt = buf + 6*tn;
+        float *sc = buf + 7*tn, *p = sc + seqp, *dp = p + seqp;
         for (int h = 0; h < HEADS; h++) {
             int kvh = h % KV_HEADS;
+            // build contiguous [seqp, HD] tiles from the [HD, S] strided slices (O(seqp*HD),
+            // << O(seqp^2*HD) compute). da is [Q_DIM, S]; its h-th head slice transposes too.
+            for (int t = 0; t < seqp; t++) {
+                const float *qp = Q  + (size_t)(h*HD)*S   + base + t;
+                const float *kp = K  + (size_t)(kvh*HD)*S + base + t;
+                const float *vp = V  + (size_t)(kvh*HD)*S + base + t;
+                const float *dap= da + (size_t)(h*HD)*S   + base + t;
+                float *qo = qt + (size_t)t*HD, *ko = kt + (size_t)t*HD, *vo = vt + (size_t)t*HD, *dao = dat + (size_t)t*HD;
+                for (int d = 0; d < HD; d++) { qo[d]=qp[(size_t)d*S]; ko[d]=kp[(size_t)d*S]; vo[d]=vp[(size_t)d*S]; dao[d]=dap[(size_t)d*S]; }
+            }
+            memset(dkt, 0, (size_t)tn*4);
+            memset(dvt, 0, (size_t)tn*4);
             for (int q = 0; q < seqp; q++) {
-                float sc[SEQ]; float m = -1e30f;
+                const float *qr = qt + (size_t)q*HD;
+                const float *dar = dat + (size_t)q*HD;
+                float m = -1e30f;
                 for (int j = 0; j <= q; j++) {
-                    float dot = 0; for (int d = 0; d < HD; d++) dot += Q[(h*HD+d)*S+base+q]*K[(kvh*HD+d)*S+base+j];
-                    sc[j] = dot*scale; if (sc[j] > m) m = sc[j];
+                    const float *kr = kt + (size_t)j*HD;
+                    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+                    for (int d = 0; d < HD; d += 8) {
+                        a0 = vmlaq_f32(a0, vld1q_f32(qr + d),     vld1q_f32(kr + d));
+                        a1 = vmlaq_f32(a1, vld1q_f32(qr + d + 4), vld1q_f32(kr + d + 4));
+                    }
+                    float dot = vaddvq_f32(vaddq_f32(a0, a1));
+                    sc[j] = dot * scale; if (sc[j] > m) m = sc[j];
                 }
-                float Z = 0; for (int j = 0; j <= q; j++) { sc[j] = expf(sc[j]-m); Z += sc[j]; }
-                float inv = 1.0f/Z; float p[SEQ]; for (int j = 0; j <= q; j++) p[j] = sc[j]*inv;
-                float dp[SEQ];
+                float Z = 0.0f;
+                {
+                  float32x4_t z4 = vdupq_n_f32(0.0f); float32x4_t vm = vdupq_n_f32(m);
+                  int j = 0;
+                  for (; j + 4 <= q + 1; j += 4) {
+                      float32x4_t s = vsubq_f32(vld1q_f32(&sc[j]), vm);
+                      s = neon_expf(s);
+                      vst1q_f32(&sc[j], s);
+                      z4 = vaddq_f32(z4, s);
+                  }
+                  Z = vaddvq_f32(z4);
+                  for (; j <= q; j++) { sc[j] = expf(sc[j] - m); Z += sc[j]; }
+                }
+                float inv = 1.0f / Z; for (int j = 0; j <= q; j++) p[j] = sc[j] * inv;
+                // dp[j] = dat[q] · vt[j]  (NEON dot); dvt[j] += p[j] * dat[q]  (NEON fmla)
                 for (int j = 0; j <= q; j++) {
-                    float acc = 0;
-                    for (int d = 0; d < HD; d++) { float dad = da[(h*HD+d)*S+base+q];
-                        acc += dad*V[(kvh*HD+d)*S+base+j]; dV[(kvh*HD+d)*S+base+j] += p[j]*dad; }
-                    dp[j] = acc;
+                    const float *vr = vt + (size_t)j*HD;
+                    float *dvr = dvt + (size_t)j*HD;
+                    float w = p[j];
+                    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+                    float32x4_t wv = vdupq_n_f32(w);
+                    for (int d = 0; d < HD; d += 8) {
+                        a0 = vmlaq_f32(a0, vld1q_f32(dar + d),     vld1q_f32(vr + d));
+                        a1 = vmlaq_f32(a1, vld1q_f32(dar + d + 4), vld1q_f32(vr + d + 4));
+                        vst1q_f32(dvr + d,     vmlaq_f32(vld1q_f32(dvr + d),     wv, vld1q_f32(dar + d)));
+                        vst1q_f32(dvr + d + 4, vmlaq_f32(vld1q_f32(dvr + d + 4), wv, vld1q_f32(dar + d + 4)));
+                    }
+                    dp[j] = vaddvq_f32(vaddq_f32(a0, a1));
                 }
                 float g = 0; for (int j = 0; j <= q; j++) g += p[j]*dp[j];
+                // dqt[q] = sum_j dscore[j] * kt[j]  (NEON reduction into o0/o1);
+                // dkt[j] += dscore[j] * qt[q]  (NEON fmla, accumulates across q)
+                float32x4_t o0 = vdupq_n_f32(0.0f), o1 = vdupq_n_f32(0.0f);
                 for (int j = 0; j <= q; j++) {
                     float dscore = p[j]*(dp[j]-g)*scale;
-                    for (int d = 0; d < HD; d++) {
-                        dQ[(h*HD+d)*S+base+q] += dscore*K[(kvh*HD+d)*S+base+j];
-                        dK[(kvh*HD+d)*S+base+j] += dscore*Q[(h*HD+d)*S+base+q];
+                    const float *kr = kt + (size_t)j*HD;
+                    float *dkrr = dkt + (size_t)j*HD;
+                    float32x4_t ds = vdupq_n_f32(dscore);
+                    for (int d = 0; d < HD; d += 8) {
+                        o0 = vmlaq_f32(o0, ds, vld1q_f32(kr + d));
+                        o1 = vmlaq_f32(o1, ds, vld1q_f32(kr + d + 4));
+                        vst1q_f32(dkrr + d,     vmlaq_f32(vld1q_f32(dkrr + d),     ds, vld1q_f32(qr + d)));
+                        vst1q_f32(dkrr + d + 4, vmlaq_f32(vld1q_f32(dkrr + d + 4), ds, vld1q_f32(qr + d + 4)));
                     }
                 }
+                vst1q_f32(dqt + (size_t)q*HD, o0);
+                vst1q_f32(dqt + (size_t)q*HD + 4, o1);
             }
+            // scatter-add the per-(b,h) tiles back to the [HD, S] strided grads (disjoint b cols;
+            // GQA: multiple h serially scatter-add to the same kvh region within a b -> correct)
+            for (int q = 0; q < seqp; q++)
+                for (int d = 0; d < HD; d++)
+                    dQ[(size_t)(h*HD + d)*S + base + q] += dqt[(size_t)q*HD + d];
+            for (int j = 0; j < seqp; j++)
+                for (int d = 0; d < HD; d++) {
+                    dK[(size_t)(kvh*HD + d)*S + base + j] += dkt[(size_t)j*HD + d];
+                    dV[(size_t)(kvh*HD + d)*S + base + j] += dvt[(size_t)j*HD + d];
+                }
         }
-    }
+        free(buf);
+    });
 }
 
 // ============================================================================
