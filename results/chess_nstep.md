@@ -3,7 +3,13 @@
 **Date:** 2026-06-22 · **Machine:** Apple **M3 Max**, macOS 26.5.1 · **Path:** `--mps-graph`
 GPU learner (MPSGraph fp32 hybrid-autodiff trunk backward) · **Branch:** `feat/chess-nstep-value`
 (off `main` post-PR #37) · **Status:** **loss_val descends off the ln(3) floor — the H2 fix works.**
-G2 win-rate gate (0.85 vs random) still not met in 30 iters (needs Muon/depth/more iters — sequenced next).
+Post-Muon audit on `main@c158b86` also shows win-rate climb, but the G2 gate (0.85 vs random,
+greedy >0.50) is still not met in 30 iters.
+
+**Sequence note.** ADR 0006's original build order listed Muon/depth before fallback build-step 7, but
+issue #32 explicitly authorized slice 9 once slice 4 / #27 diagnosed H2 value sparsity. So n-step
+landed before the later Muon commit (`c158b86`). This note keeps the original one-variable n-step read
+and, below, adds the post-Muon combined read needed to audit the current tree.
 
 The pre-committed H2 fallback (ADR 0006 decision 4 / build-step 7). The diagnosis
 (`results/chess_g2_diagnosis.md`) isolated the G2 blocker to **H2 (value-sparsity)**: `loss_val` was
@@ -123,6 +129,62 @@ Two findings from a review pass, both addressed:
   silently clamped. Now `sp_parse` clamps + warns to stderr, and the run header prints the effective
   `td_lambda`. (Python already validated `[0,1]`.)
 
+## Post-Muon current-tree audit — λ=0.5 + Muon (`main@c158b86`)
+
+After `c158b86` made the chess learner's V4 optimizer split default-on, I re-ran the same 30-iter /
+200-eval G2 shape with `--opt muon --td-lambda 0.5` to check whether the existing n-step plumbing plus
+Muon satisfies issue #32's win-rate-climb read on the current tree. This is no longer the original
+one-variable n-step ablation; it is the current-tree combined read against the slice-4 and Muon-only
+baselines.
+
+| iter | loss_pol | loss_val | vs random | vs greedy |
+|---:|---:|---:|---:|---:|
+| 0  | 0.0000 | 0.0000 | 0.545 | 0.403 |
+| 5  | 2.0622 | 0.1956 | 0.625 | 0.427 |
+| 10 | 1.8262 | 0.2489 | 0.667 | 0.445 |
+| 15 | 1.8678 | 0.2694 | 0.705 | 0.477 |
+| 20 | 2.0050 | 0.2325 | 0.710 | 0.453 |
+| 25 | 1.9524 | 0.2036 | 0.695 | 0.472 |
+| 30 | 2.0934 | 0.2049 | 0.740 | 0.470 |
+
+Verdict from the binary:
+
+```text
+vs random : start 0.545 -> end 0.740  (max 0.740)  climb=yes beats-random[>=0.85]=NO
+vs greedy : start 0.403 -> end 0.470  (max 0.477)  climb=yes beats-greedy[>0.50]=NO
+=> G2 NOT YET
+```
+
+Comparison:
+
+| metric | slice-4 AdamW baseline | Muon only (`td_lambda=1.0`) | n-step + Muon (`td_lambda=0.5`) | read |
+|---|---:|---:|---:|---|
+| final vs-random | 0.677 | 0.657 | **0.740** | climbs over both baselines |
+| max vs-random | 0.677 | 0.667 | **0.740** | climbs over both baselines |
+| final vs-greedy | 0.407 | 0.403 | **0.470** | climbs, but below >0.50 gate |
+| max vs-greedy | 0.453 | 0.435 | **0.477** | climbs, but below >0.50 gate |
+| final loss_val | 0.97 | 0.5173 | **0.2049** | dense value target remains the strongest value-loss lever |
+
+All 1800 diagnostic gradient lines were finite (`nan=0/1353472`). The measurement closes the issue #32
+acceptance gap ("G2 with n-step value target; results note records the climb vs the slice-4 baseline")
+without changing the conclusion: n-step fixes H2 and now improves the 30-iter win-rate curve on top of
+Muon, but it still does not clear G2. The remaining blocker is convergence/strength, not the TD label
+plumbing.
+
+Reproduce:
+
+```bash
+cd training/training_dynamic
+make g2 G2ARGS='--B 64 --sims 16 --considered 16 \
+  --dir-alpha 0.3 --dir-frac 0.25 --temp 1.0 --temp-moves 8 --max-plies 20 \
+  --replay 80000 --lbatch 96 --lsteps 60 --iters 30 \
+  --opt muon --lr 0.005 --loss-scale 256.0 --clip 1.0 --wd 0.0 --vw 1.5 \
+  --td-lambda 0.5 --eval-games 200 --eval-every 5 --eval-sims 8 \
+  --eval-considered 8 --eval-max-plies 50 --bench-games 320 --seed 42 \
+  --ckpt /tmp/lilbro_nstep_muon_g2.ckpt --curriculum --curriculum-plies 8 \
+  --adjudicate --mps-graph'
+```
+
 ## Reproducibility
 
 ```
@@ -141,9 +203,9 @@ Deterministic from `seed=42`. λ=1.0 reproduces the diagnosis baseline bit-for-b
 
 - **H2 is genuinely the value-signal lever**, and n-step is the correct densifier: loss_val — stuck for
   the entire diagnosis run — now descends in the same 30-iter budget. The pre-committed fallback worked.
-- **The G2 gate still needs the convergence-speed + capacity levers.** The value head now learns, but
-  1800 updates over a 2-layer net is not enough to convert that into win-rate gains. Per ADR 0006
-  sequencing: **Muon (build-step 4) next** (faster convergence), then **QK-norm/SwiGLU-clamp**, then
-  **scale 2→6 layers** — on a base where the value signal is now dense.
+- **The G2 gate still needs capacity / longer-horizon learning quality.** The value head now learns, and
+  with Muon the 30-iter win-rate curve climbs over both prior baselines, but 1800 updates over a
+  2-layer net still does not clear the fixed-opponent thresholds. Per ADR 0006 sequencing after Muon:
+  **QK-norm/SwiGLU-clamp**, then **scale 2→6 layers** — on a base where the value signal is now dense.
 - λ is a tuning parameter; 0.5 is a first value, not a tuned one. A small λ sweep (0.3 / 0.7) is a cheap
   follow-up but is downstream of the convergence/depth levers above.
