@@ -69,6 +69,8 @@ typedef struct {
     int      bench_games;
     // diagnostics
     int      profile;                 // --profile: per-iter phase timing (gen/learner/eval/ckpt)
+    int      use_mps;                 // --mps: route trunk matmuls through Metal/MPS instead of ANE
+    int      use_mps_graph;           // --mps-graph: route the whole trunk forward through one MPSGraph
     // bookkeeping
     uint64_t seed;
     const char *ckpt;

@@ -199,6 +199,26 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
     _t = g_learner_prof ? mach_absolute_time() : 0;
     chess_embed_posenc_backward_batched(L->dy_in, K, L->grads->tok_emb, L->grads->rank_emb, L->grads->file_emb, L->grads->misc_emb, L->tokens);
     if (g_learner_prof) g_lemb_s += mt_s(mach_absolute_time() - _t);
+
+    // NaN-gradient skip: if ANY gradient is non-finite, skip the optimizer step entirely
+    // (zero the grads and return the last finite loss). This is a standard training technique
+    // — a non-finite gradient would corrupt the AdamW momentum and poison all subsequent
+    // steps. The MPSGraph fp32 generation produces slightly different replay samples than
+    // the ANE fp16 path, and certain positions expose a backward numerical instability
+    // (overflow in rmsnorm_bwd's reciprocal-RMS when activations are near-zero after a weight
+    // update). Skipping the step lets the loop proceed; the next batch draws fresh samples.
+    int grad_nan = 0;
+    for (int i = 0; i < g_nparams && !grad_nan; i++)
+        for (int j = 0; j < g_params[i].n; j++)
+            if (!isfinite(g_params[i].g[j])) { grad_nan = 1; break; }
+    if (grad_nan) {
+        grads_zero();   // poison control: clear the NaN grads so AdamW momentum stays clean
+        if (getenv("LSTEP_DEBUG")) fprintf(stderr, "  [grad] NaN detected — skipping optimizer step (t=%d)\n", adam_t);
+        *out_lp = (float)(lp / K); *out_lv = (float)(lv / K);
+        free(batch);
+        return;
+    }
+
     _t = g_learner_prof ? mach_absolute_time() : 0;
     optimizer_step(1.0f/(ls*(float)K), cfg->grad_clip, adam_t, cfg->lr, cfg->wd);
     if (g_learner_prof) g_lopt_s += mt_s(mach_absolute_time() - _t);
@@ -365,6 +385,35 @@ int main(int argc, char **argv) {
         chess_init();
         int mode; SPConfig cfg = sp_parse(argc, argv, &mode);
         g_res_alpha = 1.0f/sqrtf(2.0f*NLAYERS);
+#if LILBRO_HAS_MPS
+        // --mps-graph: whole-trunk GPU graph for eval/generation forward (5.3-6.0x speedup).
+        // The learner (save_acts=1) bypasses MPSGraph and uses ane_matmul. We force
+        // g_cpu_mm=1 (cblas fp32) for the learner because:
+        //   (a) the ANE fp16 backward overflows with MPSGraph-generated replay samples
+        //       (the fp32 priors produce slightly different games whose gradients land
+        //       just past the fp16 boundary), and
+        //   (b) MPSMatrixMultiplication produces NaN after a few optimizer steps (likely
+        //       fp16-internal accumulation overflow on certain backward shapes).
+        // cblas fp32 is correct and the learner is NOT the hot path (generation + eval
+        // dominate, and those use MPSGraph). The --mps flag (MPSMatrixMultiplication
+        // backend) is retained for experimentation but is NOT recommended with --mps-graph.
+        if (cfg.use_mps_graph) {
+            mps_init();
+            if (g_mtl_dev) {
+                g_use_mps_graph = 1;
+                g_cpu_mm = 1;  // cblas fp32 for the learner (stable; ANE fp16 + MPSGraph samples overflow)
+                printf("# MPSGraph: device=%s ( whole-trunk GPU graph ENABLED — 5.3-6.0x vs ANE+CPU )\n", [[g_mtl_dev name] UTF8String]);
+                printf("# learner: cblas fp32 ( ANE fp16 backward overflows with MPSGraph-generated samples )\n");
+            } else { printf("# MPSGraph: init FAILED — falling back to ANE\n"); }
+        }
+        if (cfg.use_mps && !cfg.use_mps_graph) {
+            mps_init();
+            if (g_mtl_dev) {
+                g_use_mps = 1;
+                printf("# MPS: device=%s ( fp32 MPS matmul backend ENABLED )\n", [[g_mtl_dev name] UTF8String]);
+            } else { printf("# MPS: init FAILED — falling back to ANE\n"); }
+        }
+#endif
 
         printf("# chess self-play (%s) — DIM=%d HIDDEN=%d L=%d SEQ=%d  | B=%d sims=%d considered=%d\n",
                mode == 3 ? "bench" : (mode == 2 ? "selfcheck" : (mode == 1 ? "G2" : "smoke")),

@@ -23,6 +23,15 @@
 #include <string.h>
 #include <math.h>
 
+// MPS/Metal matmul backend (GPU/MPS rewrite, Phase 1 — the ane_matmul seam).
+// Guarded by __has_include so non-Metal builds (pure-C tests) stay clean.
+#if __has_include(<Metal/Metal.h>)
+#import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#define LILBRO_HAS_MPS 1
+#endif
+
 // ---- chess shapes (from chess.h / the model header) ------------------------
 #define NBOARD 64
 #define PLANES 73
@@ -41,6 +50,14 @@
 typedef struct { int ic, oc, seq; Kern *k; } MMEntry;
 static MMEntry g_mm[256]; static int g_nmm = 0;   // many (ic,oc,seq) shapes: B is bucketed
 static int g_cpu_mm = 0;
+
+#if LILBRO_HAS_MPS
+// Forward declarations: the MPS backend is defined after ane_matmul, but ane_matmul
+// dispatches to it when g_use_mps=1. Defined in the MPS section below.
+static int g_use_mps;
+static int g_use_mps_graph;   // Phase 2: MPSGraph whole-forward (set by --mps-graph)
+static void mps_matmul(int ic, int oc, int seq, const float *x, const float *W, float *y);
+#endif
 
 // Optional trunk-forward sub-profiler (zero-overhead when g_trunk_prof==0). Splits each
 // ane_matmul into io (fp32<->fp16 convert + IOSurfaceLock, the CPU copy/dispatch tax) vs
@@ -104,6 +121,9 @@ static void ane_matmul(int ic, int oc, int seq, const float *x, const float *W, 
                     1.0f, W, oc, x, seq, 0.0f, y, seq);
         return;
     }
+#if LILBRO_HAS_MPS
+    if (g_use_mps) { mps_matmul(ic, oc, seq, x, W, y); return; }
+#endif
     Kern *k = mm_kernel(ic, oc, seq);
     uint64_t _tw = 0, _ta = 0;
     if (g_trunk_prof) _tw = mach_absolute_time();
@@ -114,6 +134,179 @@ static void ane_matmul(int ic, int oc, int seq, const float *x, const float *W, 
     io_read_dyn(k->ioOut, y, oc, seq);
     if (g_trunk_prof) g_trunk_io_s += tb_ms(mach_absolute_time() - _tw) * 1e-3;
 }
+
+// ============================================================================
+// MPS matmul backend: y[oc,seq] = W[ic,oc]^T @ x[ic,seq] via Metal/MPS.
+// Drop-in replacement for ane_matmul at the same seam. The ANE path pays
+// fp32->fp16 + IOSurfaceLock + ~0.2-0.4ms dispatch floor + IOSurfaceLock +
+// fp16->fp32 per eval (the ane+io = 40% of gen wall). MPS on Apple Silicon
+// unified memory skips ALL of that: zero-copy MTLBuffers (newBufferWithBytesNoCopy)
+// wrap existing page-aligned float* with NO copy, MPSDataTypeFloat32 needs NO
+// conversion, and MPSMatrixMultiplication encodes the matmul as a Metal compute
+// command. probe_mps measured ~2.3x faster per matmul vs ANE at B=64.
+//
+// Kernel cache: MPSMatrixMultiplication is init'd per (ic,oc,seq) — same key as
+// the ANE g_mm cache. Buffer cache: zero-copy MTLBuffers are cached by host ptr
+// (the trunk reuses the same CActs/CLayer buffers every forward, so a ptr-keyed
+// cache avoids re-creating MTLBuffers). Weights are persistent (optimizer writes
+// to the host ptr → automatically visible via shared memory). Activations change
+// every forward (CPU writes → GPU reads, GPU writes → CPU reads, same memory).
+// Requires page-aligned host memory — fmalloc/fcalloc use posix_memalign(4096).
+// ============================================================================
+#if LILBRO_HAS_MPS
+static id<MTLDevice>        g_mtl_dev   = nil;
+static id<MTLCommandQueue>  g_mtl_queue = nil;
+
+typedef struct { int ic, oc, seq; __strong MPSMatrixMultiplication *kern; } MpsKernEntry;
+static MpsKernEntry g_mps_kerns[256];
+static int g_nmps_kerns = 0;
+
+typedef struct { const void *ptr; size_t bytes; __strong id<MTLBuffer> buf; int zero_copy; } MpsBufEntry;
+static MpsBufEntry g_mps_bufs[128];
+static int g_nmps_bufs = 0;
+
+static void mps_init(void) {
+    if (g_mtl_dev) return;
+    g_mtl_dev = MTLCreateSystemDefaultDevice();
+    if (!g_mtl_dev) { fprintf(stderr, "[mps] MTLCreateSystemDefaultDevice FAILED — no Metal device\n"); return; }
+    g_mtl_queue = [g_mtl_dev newCommandQueue];
+    if (!g_mtl_queue) { fprintf(stderr, "[mps] newCommandQueue FAILED\n"); g_mtl_dev = nil; return; }
+    memset(g_mps_kerns, 0, sizeof(g_mps_kerns));
+    memset(g_mps_bufs, 0, sizeof(g_mps_bufs));
+    g_nmps_kerns = 0;
+    g_nmps_bufs = 0;
+}
+
+static MPSMatrixMultiplication *mps_kernel(int ic, int oc, int seq) {
+    for (int i = 0; i < g_nmps_kerns; i++)
+        if (g_mps_kerns[i].ic==ic && g_mps_kerns[i].oc==oc && g_mps_kerns[i].seq==seq)
+            return g_mps_kerns[i].kern;
+    if (g_nmps_kerns >= (int)(sizeof(g_mps_kerns)/sizeof(g_mps_kerns[0]))) {
+        fprintf(stderr, "[mps] kernel cache overflow (%d shapes)\n", g_nmps_kerns); abort();
+    }
+    // C = alpha * A^T @ B. A=W[ic,oc], B=x[ic,seq], C=y[oc,seq].
+    // M=oc (result rows), N=seq (result cols), K=ic (interior).
+    MPSMatrixMultiplication *k = [[MPSMatrixMultiplication alloc] initWithDevice:g_mtl_dev
+                transposeLeft:YES transposeRight:NO
+                resultRows:oc resultColumns:seq interiorColumns:ic
+                alpha:1.0f beta:0.0f];
+    if (!k) { fprintf(stderr, "[mps] MPSMatrixMultiplication init FAILED ic=%d oc=%d seq=%d\n", ic, oc, seq); abort(); }
+    g_mps_kerns[g_nmps_kerns] = (MpsKernEntry){ic, oc, seq, k};
+    g_nmps_kerns++;
+    return k;
+}
+
+// Get or create a zero-copy MTLBuffer for a host pointer. The trunk reuses the
+// same float* buffers every forward (CActs/CLayer), so this cache hits after the
+// first forward. Zero-copy: the MTLBuffer IS the host memory (shared mode) — no
+// copy, no coherency sync. Falls back to a managed buffer (copy) if the ptr
+// isn't page-aligned (posix_memalign in fmalloc should prevent this).
+// GROWTH: the same host buffer is used at different seq values (B=1 selfcheck
+// warmup seq=96, then B=64 bench seq=6144). The cache tracks the max bytes seen
+// per ptr and (re)creates the MTLBuffer when a larger request arrives. Zero-copy
+// recreation is free (same host ptr, larger length); managed recreation
+// reallocates. is_zero_copy is set to 1 for zero-copy, 0 for managed.
+static id<MTLBuffer> mps_get_buf(const void *ptr, size_t bytes, int *is_zero_copy) {
+    for (int i = 0; i < g_nmps_bufs; i++)
+        if (g_mps_bufs[i].ptr == ptr) {
+            if (g_mps_bufs[i].bytes >= bytes) {
+                *is_zero_copy = g_mps_bufs[i].zero_copy;
+                return g_mps_bufs[i].buf;
+            }
+            // Cached buffer too small — recreate at the larger size.
+            // Zero-copy: the host allocation is large enough (fmalloc sized for
+            // maxS), so we just wrap the same ptr with a larger length. Managed:
+            // drop the old buffer and allocate a bigger one.
+            size_t pg = 4096;
+            size_t buf_bytes = (bytes + pg - 1) & ~(pg - 1);
+            id<MTLBuffer> buf = nil;
+            int zc = 0;
+            if (((uintptr_t)ptr & (pg - 1)) == 0) {
+                buf = [g_mtl_dev newBufferWithBytesNoCopy:(void *)ptr length:buf_bytes
+                            options:MTLResourceStorageModeShared deallocator:nil];
+                if (buf) zc = 1;
+            }
+            if (!buf) {
+                buf = [g_mtl_dev newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+                if (!buf) { fprintf(stderr, "[mps] buffer realloc FAILED (%zu bytes)\n", buf_bytes); abort(); }
+            }
+            g_mps_bufs[i].buf = buf;
+            g_mps_bufs[i].bytes = bytes;
+            g_mps_bufs[i].zero_copy = zc;
+            *is_zero_copy = zc;
+            return buf;
+        }
+    if (g_nmps_bufs >= (int)(sizeof(g_mps_bufs)/sizeof(g_mps_bufs[0]))) {
+        fprintf(stderr, "[mps] buffer cache overflow (%d bufs)\n", g_nmps_bufs); abort();
+    }
+    // Round length up to page boundary (newBufferWithBytesNoCopy requires it).
+    size_t pg = 4096;
+    size_t buf_bytes = (bytes + pg - 1) & ~(pg - 1);
+    id<MTLBuffer> buf = nil;
+    int zc = 0;
+    // Try zero-copy first (requires page-aligned address).
+    if (((uintptr_t)ptr & (pg - 1)) == 0) {
+        buf = [g_mtl_dev newBufferWithBytesNoCopy:(void *)ptr length:buf_bytes
+                    options:MTLResourceStorageModeShared deallocator:nil];
+        if (buf) zc = 1;
+    }
+    if (!buf) {
+        // Fallback: managed buffer (allocates; caller copies in/out per call).
+        buf = [g_mtl_dev newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+        if (!buf) { fprintf(stderr, "[mps] buffer alloc FAILED (%zu bytes)\n", buf_bytes); abort(); }
+    }
+    g_mps_bufs[g_nmps_bufs] = (MpsBufEntry){ptr, bytes, buf, zc};
+    g_nmps_bufs++;
+    *is_zero_copy = zc;
+    return buf;
+}
+
+static void mps_matmul(int ic, int oc, int seq, const float *x, const float *W, float *y) {
+    @autoreleasepool {
+        MPSMatrixMultiplication *kern = mps_kernel(ic, oc, seq);
+        size_t bytesW = (size_t)ic * oc * 4;
+        size_t bytesX = (size_t)ic * seq * 4;
+        size_t bytesY = (size_t)oc * seq * 4;
+        int zcW, zcX, zcY;
+        id<MTLBuffer> bufW = mps_get_buf(W, bytesW, &zcW);
+        id<MTLBuffer> bufX = mps_get_buf(x, bytesX, &zcX);
+        id<MTLBuffer> bufY = mps_get_buf(y, bytesY, &zcY);
+        // Managed (non-zero-copy) inputs: copy current data in.
+        if (!zcW) memcpy(bufW.contents, W, bytesW);
+        if (!zcX) memcpy(bufX.contents, x, bytesX);
+
+        // Create fresh MPSMatrix objects from the CURRENT MTLBuffers each call.
+        // (The previous MPSMatrix-by-ptr cache was UNSAFE: when mps_get_buf recreates
+        // a MTLBuffer for a reused host ptr at a different size, the cached MPSMatrix
+        // still referenced the OLD MTLBuffer while mps_matmul copied data to the NEW
+        // one — the GPU read stale/freed memory and produced NaN. The backward's
+        // temporary transposed-weight buffers trigger this: they're fmalloc'd/freed
+        // each step, and malloc reuses ptrs. Creating fresh MPSMatrix objects is
+        // ~2.6x overhead vs the cache but is correct, and this path is learner-only.)
+        MPSMatrix *mW = nil, *mX = nil, *mY = nil;
+        {
+            MPSMatrixDescriptor *dW = [MPSMatrixDescriptor matrixDescriptorWithRows:ic columns:oc
+                                        rowBytes:(oc*4) dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *dX = [MPSMatrixDescriptor matrixDescriptorWithRows:ic columns:seq
+                                        rowBytes:(seq*4) dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *dY = [MPSMatrixDescriptor matrixDescriptorWithRows:oc columns:seq
+                                        rowBytes:(seq*4) dataType:MPSDataTypeFloat32];
+            mW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:dW];
+            mX = [[MPSMatrix alloc] initWithBuffer:bufX descriptor:dX];
+            mY = [[MPSMatrix alloc] initWithBuffer:bufY descriptor:dY];
+        }
+
+        uint64_t _t = 0;
+        if (g_trunk_prof) _t = mach_absolute_time();
+        id<MTLCommandBuffer> cb = [g_mtl_queue commandBuffer];
+        [kern encodeToCommandBuffer:cb leftMatrix:mW rightMatrix:mX resultMatrix:mY];
+        [cb commit]; [cb waitUntilCompleted];
+        if (g_trunk_prof) g_trunk_ane_s += tb_ms(mach_absolute_time() - _t) * 1e-3;
+        // Managed output: copy GPU result back to host. Zero-copy: already written.
+        if (!zcY) memcpy(y, bufY.contents, bytesY);
+    }
+}
+#endif // LILBRO_HAS_MPS
 
 // transpose src[rows,cols] -> dst[cols,rows]
 static void transpose2d(float *dst, const float *src, int rows, int cols) {
@@ -142,8 +335,18 @@ typedef struct { float *Wq,*Wk,*Wv,*Wo,*W1,*W2,*W3,*rms_att,*rms_ffn; float *Wqk
 // backward) works unchanged. [iter 6]
 typedef struct { float *layer_in,*xnorm,*qkv,*Q,*K,*V,*attn,*x2,*x2norm,*h13,*h1,*h3,*gate; } CActs;
 
-static float *fmalloc(size_t n) { return (float*)malloc(n*4); }
-static float *fcalloc(size_t n) { return (float*)calloc(n,4); }
+// Page-aligned alloc for MPS zero-copy (newBufferWithBytesNoCopy requires
+// page-aligned address + length). posix_memalign(4096) ensures all trunk
+// buffers (weights + activations) qualify. The extra bytes from length
+// rounding are zero and unused by the matmul.
+static float *fmalloc(size_t n) {
+    void *p = NULL; size_t bytes = ((n*4 + 4095) & ~4095);
+    if (posix_memalign(&p, 4096, bytes)) { fprintf(stderr, "[fmalloc] OOM (%zu)\n", bytes); abort(); }
+    return (float*)p;
+}
+static float *fcalloc(size_t n) {
+    float *p = fmalloc(n); memset(p, 0, n*4); return p;
+}
 
 static void clayer_alloc(CLayer *w) {
     w->Wq=fmalloc(DIM*Q_DIM); w->Wk=fmalloc(DIM*KV_DIM); w->Wv=fmalloc(DIM*KV_DIM);
@@ -414,6 +617,190 @@ static void attn_cpu_backward_batched(const float *da, const float *Q, const flo
 }
 
 // ============================================================================
+// MPSGraph whole-forward backend (Phase 2 — the pipeline-bubble-elimination win).
+// The ENTIRE trunk (8 matmuls + attention + rms + silu + residual + final rmsnorm)
+// as ONE MPSGraph in ONE command buffer — zero CPU<->GPU sync between ops, no
+// pipeline bubbles. probe_mps_graph measured 5.3-6.0x vs ANE+CPU (3.2ms vs 16.9ms
+// at B=64). Eval-only (save_acts==0): the learner (save_acts==1) needs all
+// intermediates for the backward, so it stays on the ANE+CPU path. Generation +
+// the eval ladder are save_acts==0 — the dominant cost (the bench is 94-95% trunk).
+//
+// Graph caching: shapes are baked into the graph at build time (S = B*SEQ). The eval
+// path pads B to a multiple of 32, so only a handful of distinct S values appear
+// (96, 3072, 6144, 9216, 12288, 15360). Each gets its own compiled graph, cached
+// by S. Buffer caching: reuses the Phase 1 mps_get_buf (ptr-keyed, zero-copy
+// MTLBuffers wrapping the fmalloc'd page-aligned host memory). Weights are
+// persistent (same ptr every forward; the optimizer writes to the host ptr -> the
+// GPU sees updated values via shared memory). x_in is CPU-written (embed+posenc)
+// then GPU-read; x_final is GPU-written then CPU-read (readout) — both zero-copy.
+// ============================================================================
+#if LILBRO_HAS_MPS
+typedef struct {
+    __strong MPSGraph *graph;
+    int S;   // packed S = P*SEQ (shapes baked in at build)
+    __strong MPSGraphTensor *x_in_ph, *rms_final_ph;
+    __strong MPSGraphTensor *Wqkv_ph[NLAYERS], *Wo_ph[NLAYERS], *W13_ph[NLAYERS], *W2_ph[NLAYERS];
+    __strong MPSGraphTensor *rms_att_ph[NLAYERS], *rms_ffn_ph[NLAYERS];
+    __strong MPSGraphTensor *x_out;
+} MpsGraphTrunk;
+
+#define MAX_MPS_GRAPHS 16
+static MpsGraphTrunk g_mg[MAX_MPS_GRAPHS];
+static int g_nmg = 0;
+
+// matmul: y[oc,seq] = W[ic,oc]^T @ x[ic,seq]. W is [ic,oc], x is [ic,seq].
+static MPSGraphTensor *mg_matmul(MPSGraph *g, MPSGraphTensor *W, MPSGraphTensor *x, NSString *nm) {
+    MPSGraphTensor *Wt = [g transposeTensor:W dimension:0 withDimension:1 name:[nm stringByAppendingString:@"_Wt"]];
+    return [g matrixMultiplicationWithPrimaryTensor:Wt secondaryTensor:x name:nm];
+}
+
+// RMSNorm: out = x * rsqrt(mean(x^2, axis=0) + eps) * weight. x: [DIM, S], w: [DIM].
+static MPSGraphTensor *mg_rmsnorm(MPSGraph *g, MPSGraphTensor *x, MPSGraphTensor *w,
+                                  int dim, int S, NSString *nm) {
+    MPSGraphTensor *x2 = [g multiplicationWithPrimaryTensor:x secondaryTensor:x name:[nm stringByAppendingString:@"_x2"]];
+    MPSGraphTensor *sum = [g reductionSumWithTensor:x2 axis:0 name:[nm stringByAppendingString:@"_sum"]];
+    MPSGraphTensor *sum_2d = [g reshapeTensor:sum withShape:@[@1, @(S)] name:[nm stringByAppendingString:@"_sum2d"]];
+    MPSGraphTensor *dim_c = [g constantWithScalar:(double)dim dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *mean = [g divisionWithPrimaryTensor:sum_2d secondaryTensor:dim_c name:[nm stringByAppendingString:@"_mean"]];
+    MPSGraphTensor *eps_c = [g constantWithScalar:1e-5 dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *me = [g additionWithPrimaryTensor:mean secondaryTensor:eps_c name:[nm stringByAppendingString:@"_me"]];
+    MPSGraphTensor *sq = [g squareRootWithTensor:me name:[nm stringByAppendingString:@"_sq"]];
+    MPSGraphTensor *one = [g constantWithScalar:1.0 dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *rrms = [g divisionWithPrimaryTensor:one secondaryTensor:sq name:[nm stringByAppendingString:@"_rrms"]];
+    MPSGraphTensor *xn = [g multiplicationWithPrimaryTensor:x secondaryTensor:rrms name:[nm stringByAppendingString:@"_xn"]];
+    MPSGraphTensor *wc = [g reshapeTensor:w withShape:@[@(dim), @1] name:[nm stringByAppendingString:@"_wc"]];
+    return [g multiplicationWithPrimaryTensor:xn secondaryTensor:wc name:nm];
+}
+
+// Causal MHA: Q/K/V [Q_DIM, S] -> attn_out [Q_DIM, S]. mask [SEQ,SEQ] is a graph constant.
+static MPSGraphTensor *mg_attention(MPSGraph *g, MPSGraphTensor *Q, MPSGraphTensor *K,
+                                    MPSGraphTensor *V, MPSGraphTensor *mask, int B, int S,
+                                    NSString *nm) {
+    MPSGraphTensor *Q4 = [g reshapeTensor:Q withShape:@[@(HEADS), @(HD), @(B), @(SEQ)] name:[nm stringByAppendingString:@"_Q4"]];
+    MPSGraphTensor *Qb = [g transposeTensor:Q4 permutation:@[@2, @0, @3, @1] name:[nm stringByAppendingString:@"_Qb"]];
+    MPSGraphTensor *K4 = [g reshapeTensor:K withShape:@[@(HEADS), @(HD), @(B), @(SEQ)] name:[nm stringByAppendingString:@"_K4"]];
+    MPSGraphTensor *Kb = [g transposeTensor:K4 permutation:@[@2, @0, @3, @1] name:[nm stringByAppendingString:@"_Kb"]];
+    MPSGraphTensor *V4 = [g reshapeTensor:V withShape:@[@(HEADS), @(HD), @(B), @(SEQ)] name:[nm stringByAppendingString:@"_V4"]];
+    MPSGraphTensor *Vb = [g transposeTensor:V4 permutation:@[@2, @0, @3, @1] name:[nm stringByAppendingString:@"_Vb"]];
+    MPSGraphTensor *Kt = [g transposeTensor:Kb dimension:2 withDimension:3 name:[nm stringByAppendingString:@"_Kt"]];
+    MPSGraphTensor *sc = [g matrixMultiplicationWithPrimaryTensor:Qb secondaryTensor:Kt name:[nm stringByAppendingString:@"_sc"]];
+    float scale = 1.0f/sqrtf((float)HD);
+    MPSGraphTensor *sc_c = [g constantWithScalar:(double)scale dataType:MPSDataTypeFloat32];
+    MPSGraphTensor *scs = [g multiplicationWithPrimaryTensor:sc secondaryTensor:sc_c name:[nm stringByAppendingString:@"_scs"]];
+    MPSGraphTensor *mb = [g reshapeTensor:mask withShape:@[@1, @1, @(SEQ), @(SEQ)] name:[nm stringByAppendingString:@"_mb"]];
+    MPSGraphTensor *msk = [g additionWithPrimaryTensor:scs secondaryTensor:mb name:[nm stringByAppendingString:@"_msk"]];
+    MPSGraphTensor *pr = [g softMaxWithTensor:msk axis:3 name:[nm stringByAppendingString:@"_sm"]];
+    MPSGraphTensor *at = [g matrixMultiplicationWithPrimaryTensor:pr secondaryTensor:Vb name:[nm stringByAppendingString:@"_at"]];
+    MPSGraphTensor *at_t = [g transposeTensor:at permutation:@[@1, @3, @0, @2] name:[nm stringByAppendingString:@"_att"]];
+    return [g reshapeTensor:at_t withShape:@[@(Q_DIM), @(S)] name:nm];
+}
+
+static void mg_build(MpsGraphTrunk *t, int S) {
+    int B = S / SEQ;
+    t->graph = [[MPSGraph alloc] init];
+    t->S = S;
+    MPSGraph *g = t->graph;
+    t->x_in_ph = [g placeholderWithShape:@[@(DIM), @(S)] dataType:MPSDataTypeFloat32 name:@"x_in"];
+    t->rms_final_ph = [g placeholderWithShape:@[@(DIM)] dataType:MPSDataTypeFloat32 name:@"rms_final"];
+    // Causal mask [SEQ, SEQ]: 0 below diag, -1e9 above (baked as a graph constant).
+    float *md = (float*)malloc(SEQ*SEQ*4);
+    for (int i = 0; i < SEQ; i++) for (int j = 0; j < SEQ; j++) md[i*SEQ+j] = (j <= i) ? 0.0f : -1e9f;
+    NSData *mns = [NSData dataWithBytesNoCopy:md length:SEQ*SEQ*4 freeWhenDone:YES];
+    MPSGraphTensor *mask = [g constantWithData:mns shape:@[@(SEQ), @(SEQ)] dataType:MPSDataTypeFloat32];
+    float alpha = 1.0f/sqrtf(2.0f*NLAYERS);
+    MPSGraphTensor *alpha_c = [g constantWithScalar:(double)alpha dataType:MPSDataTypeFloat32];
+    for (int L = 0; L < NLAYERS; L++) {
+        NSString *pfx = [NSString stringWithFormat:@"L%d_", L];
+        t->Wqkv_ph[L] = [g placeholderWithShape:@[@(DIM), @(Q_DIM+2*KV_DIM)] dataType:MPSDataTypeFloat32 name:[pfx stringByAppendingString:@"Wqkv"]];
+        t->Wo_ph[L]   = [g placeholderWithShape:@[@(Q_DIM), @(DIM)] dataType:MPSDataTypeFloat32 name:[pfx stringByAppendingString:@"Wo"]];
+        t->W13_ph[L]  = [g placeholderWithShape:@[@(DIM), @(2*HIDDEN)] dataType:MPSDataTypeFloat32 name:[pfx stringByAppendingString:@"W13"]];
+        t->W2_ph[L]   = [g placeholderWithShape:@[@(HIDDEN), @(DIM)] dataType:MPSDataTypeFloat32 name:[pfx stringByAppendingString:@"W2"]];
+        t->rms_att_ph[L] = [g placeholderWithShape:@[@(DIM)] dataType:MPSDataTypeFloat32 name:[pfx stringByAppendingString:@"rms_att"]];
+        t->rms_ffn_ph[L] = [g placeholderWithShape:@[@(DIM)] dataType:MPSDataTypeFloat32 name:[pfx stringByAppendingString:@"rms_ffn"]];
+    }
+    MPSGraphTensor *x = t->x_in_ph;
+    for (int L = 0; L < NLAYERS; L++) {
+        NSString *pfx = [NSString stringWithFormat:@"L%d_", L];
+        MPSGraphTensor *xn = mg_rmsnorm(g, x, t->rms_att_ph[L], DIM, S, [pfx stringByAppendingString:@"rms_att"]);
+        MPSGraphTensor *qkv = mg_matmul(g, t->Wqkv_ph[L], xn, [pfx stringByAppendingString:@"qkv"]);
+        MPSGraphTensor *Q = [g sliceTensor:qkv dimension:0 start:0 length:Q_DIM name:[pfx stringByAppendingString:@"Q"]];
+        MPSGraphTensor *K = [g sliceTensor:qkv dimension:0 start:Q_DIM length:KV_DIM name:[pfx stringByAppendingString:@"K"]];
+        MPSGraphTensor *V = [g sliceTensor:qkv dimension:0 start:Q_DIM+KV_DIM length:KV_DIM name:[pfx stringByAppendingString:@"V"]];
+        MPSGraphTensor *at = mg_attention(g, Q, K, V, mask, B, S, [pfx stringByAppendingString:@"attn"]);
+        MPSGraphTensor *o = mg_matmul(g, t->Wo_ph[L], at, [pfx stringByAppendingString:@"wo"]);
+        MPSGraphTensor *ao = [g multiplicationWithPrimaryTensor:o secondaryTensor:alpha_c name:[pfx stringByAppendingString:@"ao"]];
+        MPSGraphTensor *x2 = [g additionWithPrimaryTensor:x secondaryTensor:ao name:[pfx stringByAppendingString:@"x2"]];
+        MPSGraphTensor *x2n = mg_rmsnorm(g, x2, t->rms_ffn_ph[L], DIM, S, [pfx stringByAppendingString:@"rms_ffn"]);
+        MPSGraphTensor *h13 = mg_matmul(g, t->W13_ph[L], x2n, [pfx stringByAppendingString:@"h13"]);
+        MPSGraphTensor *h1 = [g sliceTensor:h13 dimension:0 start:0 length:HIDDEN name:[pfx stringByAppendingString:@"h1"]];
+        MPSGraphTensor *h3 = [g sliceTensor:h13 dimension:0 start:HIDDEN length:HIDDEN name:[pfx stringByAppendingString:@"h3"]];
+        MPSGraphTensor *sig = [g sigmoidWithTensor:h1 name:[pfx stringByAppendingString:@"sig"]];
+        MPSGraphTensor *silu = [g multiplicationWithPrimaryTensor:h1 secondaryTensor:sig name:[pfx stringByAppendingString:@"silu"]];
+        MPSGraphTensor *gate = [g multiplicationWithPrimaryTensor:silu secondaryTensor:h3 name:[pfx stringByAppendingString:@"gate"]];
+        MPSGraphTensor *ffn = mg_matmul(g, t->W2_ph[L], gate, [pfx stringByAppendingString:@"w2"]);
+        MPSGraphTensor *af = [g multiplicationWithPrimaryTensor:ffn secondaryTensor:alpha_c name:[pfx stringByAppendingString:@"af"]];
+        x = [g additionWithPrimaryTensor:x2 secondaryTensor:af name:[pfx stringByAppendingString:@"x"]];
+    }
+    t->x_out = mg_rmsnorm(g, x, t->rms_final_ph, DIM, S, @"rms_final");
+}
+
+static MpsGraphTrunk *mg_get(int S) {
+    for (int i = 0; i < g_nmg; i++)
+        if (g_mg[i].S == S) return &g_mg[i];
+    if (g_nmg >= MAX_MPS_GRAPHS) {
+        fprintf(stderr, "[mps_graph] graph cache overflow (%d shapes)\n", g_nmg); abort();
+    }
+    mg_build(&g_mg[g_nmg], S);
+    return &g_mg[g_nmg++];
+}
+
+// Execute the whole-trunk graph: x_in -> x_final (zero-copy, in-place into x_final).
+// Eval-only (save_acts==0 callers). x_pre_final is NOT written — no save_acts==0
+// caller reads it (verified: net_eval_batched and selfcheck's single-position reference
+// both pass x_pre but only read x_final). Weights are the FUSED forward-only Wqkv/W13.
+static void mps_graph_forward(CLayer *W, const float *x_in, int B,
+                              float *x_final, const float *rms_final) {
+    int S = B*SEQ;
+    MpsGraphTrunk *t = mg_get(S);
+    @autoreleasepool {
+        NSMutableDictionary *feeds = [NSMutableDictionary dictionary];
+        int zc;
+        id<MTLBuffer> bx = mps_get_buf(x_in, (size_t)DIM*S*4, &zc);
+        feeds[t->x_in_ph] = [[MPSGraphTensorData alloc] initWithMTLBuffer:bx shape:@[@(DIM), @(S)] dataType:MPSDataTypeFloat32];
+        id<MTLBuffer> brf = mps_get_buf(rms_final, (size_t)DIM*4, &zc);
+        feeds[t->rms_final_ph] = [[MPSGraphTensorData alloc] initWithMTLBuffer:brf shape:@[@(DIM)] dataType:MPSDataTypeFloat32];
+        for (int L = 0; L < NLAYERS; L++) {
+            CLayer *w = &W[L];
+            #define FEED2D(ph, ptr, r, c) do { \
+                id<MTLBuffer> _b = mps_get_buf(ptr, (size_t)(r)*(c)*4, &zc); \
+                feeds[t->ph[L]] = [[MPSGraphTensorData alloc] initWithMTLBuffer:_b shape:@[@(r), @(c)] dataType:MPSDataTypeFloat32]; \
+            } while(0)
+            #define FEED1D(ph, ptr, n) do { \
+                id<MTLBuffer> _b = mps_get_buf(ptr, (size_t)(n)*4, &zc); \
+                feeds[t->ph[L]] = [[MPSGraphTensorData alloc] initWithMTLBuffer:_b shape:@[@(n)] dataType:MPSDataTypeFloat32]; \
+            } while(0)
+            FEED2D(Wqkv_ph, w->Wqkv, DIM, Q_DIM+2*KV_DIM);
+            FEED2D(Wo_ph,   w->Wo,   Q_DIM, DIM);
+            FEED2D(W13_ph,  w->W13,  DIM, 2*HIDDEN);
+            FEED2D(W2_ph,   w->W2,   HIDDEN, DIM);
+            FEED1D(rms_att_ph, w->rms_att, DIM);
+            FEED1D(rms_ffn_ph, w->rms_ffn, DIM);
+            #undef FEED2D
+            #undef FEED1D
+        }
+        id<MTLBuffer> bout = mps_get_buf(x_final, (size_t)DIM*S*4, &zc);
+        MPSGraphTensorData *out_td = [[MPSGraphTensorData alloc] initWithMTLBuffer:bout shape:@[@(DIM), @(S)] dataType:MPSDataTypeFloat32];
+        NSMutableDictionary *results = [NSMutableDictionary dictionary];
+        results[t->x_out] = out_td;
+        id<MTLCommandBuffer> cb = [g_mtl_queue commandBuffer];
+        MPSCommandBuffer *mps_cb = [MPSCommandBuffer commandBufferWithCommandBuffer:cb];
+        [t->graph encodeToCommandBuffer:mps_cb feeds:feeds targetOperations:nil resultsDictionary:results executionDescriptor:nil];
+        [mps_cb commit]; [mps_cb waitUntilCompleted];
+    }
+}
+#endif // LILBRO_HAS_MPS
+
+// ============================================================================
 // Trunk forward: x_in[DIM, B*SEQ] (embed+posenc already summed) -> x_final[DIM, B*SEQ].
 // save_acts=1 -> acts is NLAYERS-long (kept for backward); =0 -> acts[0] reused (eval).
 // B=1 is byte-identical to the pre-#18 chess_forward.
@@ -421,6 +808,16 @@ static void attn_cpu_backward_batched(const float *da, const float *Q, const flo
 static void chess_trunk_forward(CLayer *W, CActs *acts, const float *x_in, int B,
                                 float *x_pre_final, float *x_final, const float *rms_final,
                                 float res_alpha, int save_acts) {
+#if LILBRO_HAS_MPS
+    // Phase 2: MPSGraph whole-forward — the entire trunk as one GPU graph (5.3-6.0x
+    // vs ANE+CPU, probe_mps_graph). Eval-only (save_acts==0): the learner needs all
+    // intermediates for the backward, so save_acts==1 falls through to the ANE+CPU
+    // path. x_pre_final is NOT written on this path — no save_acts==0 caller reads it.
+    if (g_use_mps_graph && !save_acts && g_mtl_dev) {
+        mps_graph_forward(W, x_in, B, x_final, rms_final);
+        return;
+    }
+#endif
     int S = B*SEQ;
     float *x = fmalloc((size_t)DIM*S); memcpy(x, x_in, (size_t)DIM*S*4);
     float *o = fmalloc((size_t)DIM*S), *ffn = fmalloc((size_t)DIM*S);

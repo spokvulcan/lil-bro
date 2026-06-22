@@ -20,6 +20,20 @@ train: FORCE train.m config.h io.h cpu_ops.h mil_dynamic.h $(MODEL_HDR)
 probe_chess: probe_chess.m config.h io.h mil_dynamic.h models/gen_r2_small.h
 	$(CC) $(CFLAGS) $(EXTRA) -include models/gen_r2_small.h -o probe_chess probe_chess.m
 
+# GPU/MPS tracer bullet (issue #18 frontier): measures MPSMatrixMultiplication
+# vs the ANE dispatch floor at the real chess matmul shapes. Standalone — no
+# config.h deps (dims are #defined in the probe). Links Metal + MPS frameworks.
+probe_mps: probe_mps.m
+	$(CC) $(CFLAGS) -framework Metal -framework MetalPerformanceShaders \
+	  -framework MetalPerformanceShadersGraph -o probe_mps probe_mps.m
+
+# Phase 2 tracer bullet: full 2-layer trunk as ONE MPSGraph (all ops on GPU,
+# 1 command buffer, no CPU↔GPU sync). Tests the "100x hypothesis" — whether
+# eliminating pipeline bubbles gives the big win.
+probe_mps_graph: probe_mps_graph.m
+	$(CC) $(CFLAGS) -framework Metal -framework MetalPerformanceShaders \
+	  -framework MetalPerformanceShadersGraph -o probe_mps_graph probe_mps_graph.m
+
 # Chess bitboard engine (build-step 1, ADR 0005, issue #15). Pure C, ZERO deps:
 # no model header, no ANE/Foundation/Accelerate frameworks. perft is the gate.
 CHESS_CFLAGS = -O2 -Wall -Wextra -std=c11 -isysroot $(shell xcrun --show-sdk-path)
@@ -44,7 +58,9 @@ test_heads: chess/test_heads_cpu.c chess/chess_heads.h
 # (the same primitive train.m's woFwd/qBwd/wotBwd use); heads + loss on the CPU floor.
 # `make g0` builds and runs the overfit gate (both losses -> ~0 == G0-green).
 train_chess: train_chess.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h chess/chess_net.h chess/chess.h models/chess_g0.h $(CHESS_DEPS)
-	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h -o train_chess train_chess.m chess/chess.c
+	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h \
+		-framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
+		-o train_chess train_chess.m chess/chess.c
 
 g0: train_chess
 	./train_chess --overfit
@@ -95,10 +111,13 @@ test_selfplay: chess/test_selfplay
 
 # Full self-play trainer (generation + replay + learner) on the one ANE client.
 # `make selfplay` builds; the run driver (lilbro/chess/) invokes ./train_selfplay --config ...
+# Links Metal + MPS frameworks for the optional --mps matmul backend (chess_net.h).
 train_selfplay: train_selfplay.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h \
                 chess/chess_net.h chess/selfplay.h chess/replay.h chess/mcts.h chess/chess.h models/chess_g0.h \
                 chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c
-	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h -o train_selfplay train_selfplay.m \
+	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h \
+		-framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
+		-o train_selfplay train_selfplay.m \
 		chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c
 
 # G2 gate: vectorized self-play whose win-rate climbs vs a fixed random-mover then a weak
@@ -109,7 +128,7 @@ g2: train_selfplay
 	./train_selfplay --g2 $(G2ARGS)
 
 clean:
-	rm -f train probe_chess train_chess train_selfplay \
+	rm -f train probe_chess probe_mps probe_mps_graph train_chess train_selfplay \
 	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay chess/test_selfplay
 
 FORCE:
