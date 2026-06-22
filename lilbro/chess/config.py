@@ -46,6 +46,8 @@ class ChessConfig:
     adjudicate: bool = False     # material-adjudicate capped TRAINING games (-> --adjudicate); a
                                  # cold-start mitigation (the value head needs a non-draw signal).
                                  # TRAINING-ONLY: the eval ladder always scores real game outcomes.
+    td_lambda: float = 1.0       # TD(lambda) value-target knob (-> --td-lambda): 1.0 = terminal z
+                                 # (legacy behavior), 0.0 = 1-step TD; densifies the value signal.
 
     # --- replay + learner ---
     replay_cap: int = 30000      # sliding-window size (-> --replay)
@@ -104,6 +106,9 @@ class ChessConfig:
         if self.value_weight <= 0.0:
             raise ValueError(f"value_weight must be positive (0 silences the value head; "
                              f"the AZ policy/value blend), got {self.value_weight}")
+        if not 0.0 <= self.td_lambda <= 1.0:
+            raise ValueError(f"td_lambda must be in [0,1] (1.0=terminal z, 0.0=1-step TD), "
+                             f"got {self.td_lambda}")
 
     def to_argv(self) -> list[str]:
         """Map this config to the ``train_selfplay`` flag list (NOT including the run mode
@@ -127,6 +132,7 @@ class ChessConfig:
             "--clip", _fmt(self.grad_clip),
             "--wd", _fmt(self.weight_decay),
             "--vw", _fmt(self.value_weight),
+            "--td-lambda", _fmt(self.td_lambda),
             "--eval-games", str(self.eval_games),
             "--eval-every", str(self.eval_every),
             "--eval-sims", str(self.eval_sims),

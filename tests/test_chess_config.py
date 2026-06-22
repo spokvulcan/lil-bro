@@ -106,6 +106,18 @@ def test_validation():
         ChessConfig(name="x", value_weight=0.0)        # blend weight must be > 0 (H3 sign check)
 
 
+def test_td_lambda_knob():
+    base = ChessConfig(name="b")
+    assert base.td_lambda == 1.0
+    p = _argv_pairs(base.to_argv())
+    assert float(p["--td-lambda"]) == 1.0
+    cfg = ChessConfig(name="t", td_lambda=0.5)
+    assert float(_argv_pairs(cfg.to_argv())["--td-lambda"]) == 0.5
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValueError):
+            ChessConfig(name="x", td_lambda=bad)
+
+
 def test_ladder_presets_valid():
     for key, cfg in LADDER.items():
         assert cfg.name == key

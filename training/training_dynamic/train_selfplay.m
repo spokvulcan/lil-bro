@@ -175,11 +175,12 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
         // dense policy target from the sparse sample
         memset(tgt_pol, 0, sizeof tgt_pol);
         for (int e = 0; e < batch[k]->n_policy; e++) tgt_pol[batch[k]->policy_idx[e]] = batch[k]->policy_p[e];
-        // WDL one-hot from z (self-play emits z in {-1,0,+1}: mate / draw)
-        float z = batch[k]->z, tgt_val[NWDL];
-        tgt_val[0] = (z >  0.5f) ? 1.0f : 0.0f;
-        tgt_val[2] = (z < -0.5f) ? 1.0f : 0.0f;
-        tgt_val[1] = 1.0f - tgt_val[0] - tgt_val[2];
+        float v = batch[k]->z_nstep, tgt_val[NWDL];
+        float tw = v > 0.0f ? v : 0.0f;
+        float tl = v < 0.0f ? -v : 0.0f;
+        tgt_val[0] = tw;
+        tgt_val[2] = tl;
+        tgt_val[1] = 1.0f - tw - tl;
         lp += chess_policy_loss(L->x_final + (size_t)k*SEQ, L->net->W_pol, DIM, S, NBOARD, PLANES,
                                 mask, tgt_pol, L->dx_final + (size_t)k*SEQ, L->grads->W_pol);
         lv += chess_value_loss(L->x_final + (size_t)k*SEQ, L->net->W_val, DIM, S, NREAL, NWDL,

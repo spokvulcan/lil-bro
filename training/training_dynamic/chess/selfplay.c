@@ -16,6 +16,7 @@ SPConfig sp_defaults(void) {
     c.temp = 1.0f; c.temp_moves = 15; c.max_plies = 100;
     c.use_improved_policy = 1; c.curriculum = 0; c.curriculum_plies = 8; c.adjudicate = 0;
     c.warmup_iters = 20; c.warmup_frac = 1.0f;   // cold-start value-prior warmup: ON by default (dec 8 fallback)
+    c.td_lambda = 1.0f;
     c.replay_cap = 30000; c.learner_batch = 64; c.learner_steps = 16; c.iters = 60;
     c.lr = 2e-3f; c.loss_scale = 256.0f; c.grad_clip = 1.0f; c.wd = 0.0f; c.value_weight = 1.0f;
     c.eval_games = 40; c.eval_every = 5; c.eval_sims = 32; c.eval_considered = 16; c.eval_max_plies = 120;
@@ -52,6 +53,7 @@ SPConfig sp_parse(int argc, char **argv, int *mode) {
         ARGF("--temp", temp); ARGI("--temp-moves", temp_moves); ARGI("--max-plies", max_plies);
         ARGI("--curriculum-plies", curriculum_plies);
         ARGI("--warmup-iters", warmup_iters); ARGF("--warmup-frac", warmup_frac);
+        ARGF("--td-lambda", td_lambda);
         ARGI("--eval-games", eval_games); ARGI("--eval-every", eval_every);
         ARGI("--eval-sims", eval_sims); ARGI("--eval-considered", eval_considered);
         ARGI("--eval-max-plies", eval_max_plies);
@@ -92,6 +94,30 @@ void build_sample(ReplaySample *s, const Position *pos, const MctsResult *r,
         s->policy_idx[a] = idx; s->policy_p[a] = dense_scratch[idx];
     }
     s->z = 0.0f;   // filled at game end
+    s->z_nstep = 0.0f;
+}
+
+void relabel_value_targets(ReplaySample *plies, const float *leaf_v, int n_plies,
+                           const int *side, float fv, int fstm, float td_lambda) {
+    if (n_plies <= 0) return;
+    float lam = td_lambda;
+    if (lam < 0.0f) lam = 0.0f;
+    if (lam > 1.0f) lam = 1.0f;
+    int last = n_plies - 1;
+    for (int t = 0; t < n_plies; t++) {
+        float z_t = (side[t] == fstm) ? fv : -fv;
+        float g = 0.0f, lam_pow = 1.0f;
+        for (int n = 1; n <= last - t; n++) {
+            int tp = t + n;
+            float b = (side[tp] == side[t]) ? leaf_v[tp] : -leaf_v[tp];
+            g += (1.0f - lam) * lam_pow * b;
+            lam_pow *= lam;
+        }
+        g += lam_pow * z_t;
+        if (g > 1.0f) g = 1.0f;
+        if (g < -1.0f) g = -1.0f;
+        plies[t].z_nstep = g;
+    }
 }
 
 // ============================================================================
@@ -122,7 +148,7 @@ Move opp_greedy(const Position *p, uint64_t *rng) {
 // GENERATION
 // ============================================================================
 typedef struct { Position cur; int done; float result_value; int result_stm; int n_plies;
-                 int *side; ReplaySample *plies; } Game;
+                 int *side; float *leaf_v; ReplaySample *plies; } Game;
 
 #define SP_ADJ_THRESH 2   // pawns of material edge that adjudicate a capped game as a win
 
@@ -154,7 +180,9 @@ static uint64_t hash_sample(uint64_t h, const ReplaySample *s) {
         h = hash_mix64(h, pb);
     }
     uint32_t zb; memcpy(&zb, &s->z, sizeof(zb));
-    return hash_mix64(h, zb);
+    h = hash_mix64(h, zb);
+    uint32_t zb2; memcpy(&zb2, &s->z_nstep, sizeof(zb2));
+    return hash_mix64(h, zb2);
 }
 
 void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
@@ -165,6 +193,7 @@ void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
         chess_startpos(&g[b].cur);
         g[b].plies = (ReplaySample*)malloc((size_t)cfg->max_plies * sizeof(ReplaySample));
         g[b].side  = (int*)malloc((size_t)cfg->max_plies * sizeof(int));
+        g[b].leaf_v = (float*)malloc((size_t)cfg->max_plies * sizeof(float));
         g[b].done = 0; g[b].n_plies = 0;
     }
     // Optional curriculum (default OFF): start from a random short opening to shorten the
@@ -212,6 +241,7 @@ void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
             ReplaySample *smp = &g[b].plies[g[b].n_plies];
             build_sample(smp, &g[b].cur, &res[k], cfg, dense);
             g[b].side[g[b].n_plies] = g[b].cur.side;
+            g[b].leaf_v[g[b].n_plies] = res[k].root_value;
             g[b].n_plies++;
             // select + apply a move. Search is never run on a terminal node (the seam
             // contract guarantees n_legal>=1), so select_move returns a real move; guard
@@ -247,13 +277,14 @@ void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
                    if (white_won) st->wins_w++; else st->wins_b++; }
             st->games++;
         }
+        relabel_value_targets(g[b].plies, g[b].leaf_v, g[b].n_plies, g[b].side, fv, fstm, cfg->td_lambda);
         for (int p = 0; p < g[b].n_plies; p++) {
             int s = g[b].side[p];
             g[b].plies[p].z = (s == fstm) ? fv : -fv;
             replay_add(rb, &g[b].plies[p]);
             if (st) { st->plies++; st->checksum = hash_sample(st->checksum, &g[b].plies[p]); }
         }
-        free(g[b].plies); free(g[b].side);
+        free(g[b].plies); free(g[b].side); free(g[b].leaf_v);
     }
     free(g); free(dense); free(roots); free(cfgs); free(active); free(res);
 }

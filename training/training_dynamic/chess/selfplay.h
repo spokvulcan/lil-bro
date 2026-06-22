@@ -58,6 +58,7 @@ typedef struct {
                                              // SEARCH PRIOR (like Dirichlet), not labels. 0 = purist-Zero
                                              // (the steady state). Default ON: the cold-start desert is
                                              // measured-real (loss_pol sticks at ln(n_legal) without it).
+    float    td_lambda;                      // TD(lambda) for the value target: 1.0 = terminal z (legacy), 0.0 = 1-step TD
     // replay + learner (train_selfplay.m)
     int      replay_cap, learner_batch, learner_steps, iters;
     float    lr, loss_scale, grad_clip, wd, value_weight;
@@ -102,6 +103,9 @@ Move select_move(const MctsResult *r, int ply, const SPConfig *cfg, uint64_t *rn
 // CHESS_POLICY_SIZE floats of caller-owned scratch.
 void build_sample(ReplaySample *s, const Position *pos, const MctsResult *r,
                   const SPConfig *cfg, float *dense_scratch);
+
+void relabel_value_targets(ReplaySample *plies, const float *leaf_v, int n_plies,
+                           const int *side, float fv, int fstm, float td_lambda);
 
 // GENERATION: play cfg->B self-play games in lockstep (one mcts_search_batched per ply, so
 // all games' leaf evals batch into one bev->evaluate), recording every searched position as

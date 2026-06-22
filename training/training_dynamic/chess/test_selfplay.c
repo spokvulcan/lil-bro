@@ -180,6 +180,90 @@ static void test_z_labeling(void) {
     printf("\n");
 }
 
+// ---- 5b. n-step / TD(lambda) value densification (ADR 0006 build-step 7) -----------------
+// Pure-math oracle: hand-set leaf_v + a known terminal, assert the TD(lambda) return. No
+// net/ANE/GPU. lam=1 -> z_nstep == z (backward-compat); lam=0 -> 1-step TD off the next ply
+// (last ply anchors on the terminal); lam=0.5 -> the blend. side[] alternates [W,B,W,B]; the
+// terminal is white-mates (fstm=BLACK lost, fv=-1) so z = [+1,-1,+1,-1].
+static void test_nstep_relabel_math(void) {
+    printf("## n-step relabel: TD(lambda) value target from oracle leaf values + known terminal\n");
+    const int N = 4;
+    ReplaySample plies[4];
+    int side[4] = { WHITE, BLACK, WHITE, BLACK };
+    float leaf_v[4] = { 0.2f, -0.3f, 0.4f, -0.1f };
+    float fv = -1.0f; int fstm = BLACK;
+    const char *where = "n-step";
+
+    memset(plies, 0, sizeof plies);
+    relabel_value_targets(plies, leaf_v, N, side, fv, fstm, 1.0f);
+    float e_lam1[4] = { +1.0f, -1.0f, +1.0f, -1.0f };
+    for (int t = 0; t < N; t++)
+        CHECK(fabsf(plies[t].z_nstep - e_lam1[t]) < 1e-6f,
+              "%s lam=1 ply=%d: z_nstep=%.6f expected %.6f (==z)", where, t, plies[t].z_nstep, e_lam1[t]);
+
+    memset(plies, 0, sizeof plies);
+    relabel_value_targets(plies, leaf_v, N, side, fv, fstm, 0.0f);
+    float e_lam0[4] = { +0.3f, -0.4f, +0.1f, -1.0f };
+    for (int t = 0; t < N; t++)
+        CHECK(fabsf(plies[t].z_nstep - e_lam0[t]) < 1e-6f,
+              "%s lam=0 ply=%d: z_nstep=%.6f expected %.6f", where, t, plies[t].z_nstep, e_lam0[t]);
+
+    memset(plies, 0, sizeof plies);
+    relabel_value_targets(plies, leaf_v, N, side, fv, fstm, 0.5f);
+    float e_lam5[4] = { 0.3875f, -0.475f, 0.55f, -1.0f };
+    for (int t = 0; t < N; t++)
+        CHECK(fabsf(plies[t].z_nstep - e_lam5[t]) < 1e-6f,
+              "%s lam=0.5 ply=%d: z_nstep=%.6f expected %.6f", where, t, plies[t].z_nstep, e_lam5[t]);
+
+    float lv_ext[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    memset(plies, 0, sizeof plies);
+    relabel_value_targets(plies, lv_ext, N, side, +1.0f, WHITE, 0.5f);
+    for (int t = 0; t < N; t++)
+        CHECK(plies[t].z_nstep >= -1.0001f && plies[t].z_nstep <= 1.0001f,
+              "%s boundary ply=%d: z_nstep=%.6f out of [-1,1]", where, t, plies[t].z_nstep);
+
+    printf("   ok (lam=1.0->z, lam=0.0->1-step TD, lam=0.5->blend; bounded in [-1,1])\n\n");
+}
+
+// ---- 5c. n-step wiring: generation records leaf_v and relabels z_nstep (oracle evaluator) -
+// End-to-end at the pure-C seam: a real B=1 self-play game through play_selfplay_batch (the
+// oracle stands in for the net). At lam=1.0 z_nstep MUST equal z for every ply (the
+// backward-compat contract that lets td_lambda default to 1.0 with zero behavior change).
+static void test_nstep_relabel_integration(void) {
+    printf("## n-step integration: generation populates z_nstep; == z at lam=1.0\n");
+    SPConfig cfg = sp_defaults();
+    cfg.td_lambda = 1.0f;
+    cfg.B = 1; cfg.sims = 24; cfg.considered = 24; cfg.max_plies = 80; cfg.replay_cap = 100000;
+    cfg.adjudicate = 1;
+    ReplayBuffer rb; replay_init(&rb, cfg.replay_cap, 11);
+    GenStats gs; int n = run_generation(&rb, &cfg, 987654321u, &gs);
+    CHECK(n > 0, "n-step integ: generation produced no samples");
+    int eq = 1, in_range = 1;
+    for (int i = 0; i < n; i++) {
+        if (rb.buf[i].z_nstep < -1.0001f || rb.buf[i].z_nstep > 1.0001f) in_range = 0;
+        if (fabsf(rb.buf[i].z_nstep - rb.buf[i].z) > 1e-6f) eq = 0;
+    }
+    CHECK(in_range, "n-step integ: z_nstep out of [-1,1] (n=%d)", n);
+    CHECK(eq, "n-step integ: z_nstep != z at lam=1.0 (%d samples) -- backward-compat broken", n);
+    printf("   lam=1.0: %d samples, z_nstep == z for all, in [-1,1] (backward-compat holds)\n\n", n);
+    replay_free(&rb);
+
+    cfg.td_lambda = 0.5f;
+    ReplayBuffer rb2; replay_init(&rb2, cfg.replay_cap, 13);
+    GenStats gs2; int n2 = run_generation(&rb2, &cfg, 42424242u, &gs2);
+    CHECK(n2 > 0, "n-step integ lam=0.5: no samples");
+    int differ = 0;
+    for (int i = 0; i < n2; i++) {
+        CHECK(rb2.buf[i].z_nstep >= -1.0001f && rb2.buf[i].z_nstep <= 1.0001f,
+              "n-step integ lam=0.5 ply=%d: z_nstep=%.3f out of [-1,1]", i, rb2.buf[i].z_nstep);
+        if (fabsf(rb2.buf[i].z_nstep - rb2.buf[i].z) > 1e-4f) differ++;
+    }
+    CHECK(differ > 0, "n-step integ lam=0.5: z_nstep == z for ALL %d plies (relabel inactive at lam<1)", n2);
+    printf("   lam=0.5: %d samples, %d differ from z (relabel active at lam<1), all in [-1,1]\n\n",
+           n2, differ);
+    replay_free(&rb2);
+}
+
 // ---- 6. eval ladder: W/D/L bookkeeping + a material+mate searcher beats a random-mover ---
 static void test_eval(void) {
     printf("## eval ladder: W/D/L sums to n_games; deterministic; oracle-search beats random\n");
@@ -279,6 +363,8 @@ int main(void) {
     test_select_move();
     test_generation();
     test_z_labeling();
+    test_nstep_relabel_math();
+    test_nstep_relabel_integration();
     test_eval();
     test_warmup_value_prior();
     if (g_fail) { printf("*** test_selfplay: FAILURES ***\n"); return 1; }
