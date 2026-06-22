@@ -20,14 +20,16 @@ training/training_dynamic/models/gen_*.h
 training/training_dynamic/probe_rms
 training/training_dynamic/probe_chess
 
-# GPU/MPS probe build artifacts (Phase 1 & 2 tracer bullets)
+# GPU/MPS probe build artifacts (Phase 1 & 2 tracer bullets; autodiff spike #23)
 training/training_dynamic/probe_mps
 training/training_dynamic/probe_mps_graph
+training/training_dynamic/probe_autodiff
 
 # Chess engine build artifacts (build-step 1 & 2, ADR 0005)
 training/training_dynamic/chess/perft
 training/training_dynamic/chess/test_chess
 training/training_dynamic/chess/test_heads
+training/training_dynamic/test_trunk_attn
 
 # Chess Gumbel-MCTS build artifacts (build-step 3, ADR 0005, issue #17)
 training/training_dynamic/chess/test_mcts

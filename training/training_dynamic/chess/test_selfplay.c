@@ -156,6 +156,12 @@ static void test_z_labeling_mode(int adjudicate, int *decisive_out) {
             else                expect = side_white ? -1.0f : +1.0f;
             CHECK(rb.buf[i].z == expect, "z-label[adj=%d] seed=%llu ply=%d: z=%.1f expected %.1f (W%d B%d D%d)",
                   adjudicate, (unsigned long long)seed, i, rb.buf[i].z, expect, white_won, black_won, draw);
+            int16_t t16d[CHESS_NUM_TOKENS];
+            for (int t = 0; t < CHESS_NUM_TOKENS; t++) t16d[t] = (int16_t)rb.buf[i].tokens[t];
+            Position pd; chess_decode(&pd, t16d);
+            int expected_side = side_white ? WHITE : BLACK;
+            CHECK(pd.side == expected_side, "z-label[adj=%d] ply=%d: decoded stm=%d != before-move side %d (encoding/perspective drift)",
+                  adjudicate, i, pd.side, expected_side);
         }
         if (draw) draws_seen = 1; else decisive_seen = 1;
         checked++;

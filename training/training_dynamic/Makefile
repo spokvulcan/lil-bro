@@ -34,6 +34,19 @@ probe_mps_graph: probe_mps_graph.m
 	$(CC) $(CFLAGS) -framework Metal -framework MetalPerformanceShaders \
 	  -framework MetalPerformanceShadersGraph -o probe_mps_graph probe_mps_graph.m
 
+# Slice 0 autodiff spike (ADR 0006 build-step 0, issue #23): standalone probe that
+# builds the chess trunk as ONE MPSGraph + a scalar source and obtains the backward
+# via MPSGraph gradientForPrimaryTensor:withTensors:, then (a) grad-diffs the result
+# vs the CPU chess_trunk_backward to fp32 cosine and (b) runs a G0 overfit using the
+# autodiff trunk backward + the existing CPU heads/loss/optimizer. Gates the GPU
+# backward method (hybrid autodiff vs hand-written). Reuses the chess trunk/heads/net
+# headers, so it links the chess deps + Metal/MPS/MPSGraph like train_chess.
+probe_autodiff: probe_autodiff.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h \
+                chess/chess_net.h chess/chess.h models/chess_g0.h $(CHESS_DEPS)
+	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h \
+		-framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
+		-o probe_autodiff probe_autodiff.m chess/chess.c
+
 # Chess bitboard engine (build-step 1, ADR 0005, issue #15). Pure C, ZERO deps:
 # no model header, no ANE/Foundation/Accelerate frameworks. perft is the gate.
 CHESS_CFLAGS = -O2 -Wall -Wextra -std=c11 -isysroot $(shell xcrun --show-sdk-path)
@@ -52,6 +65,18 @@ test_engine: chess/test_chess.c $(CHESS_DEPS)
 test_heads: chess/test_heads_cpu.c chess/chess_heads.h
 	$(CC) $(CHESS_CFLAGS) -o chess/test_heads chess/test_heads_cpu.c -lm
 	./chess/test_heads
+
+# Trunk attention backward FD gate (issue #36): analytic-vs-numeric check on
+# attn_cpu_backward_batched's dQ/dK/dV. The heads have test_heads_cpu.c; the trunk
+# attention backward had no FD gate, which let the dQ NEON fold bug (HD>8) slip
+# through. Exercises the REAL static functions in chess_net.h at chess_g0 dims, so
+# it links the chess deps + Metal/MPS/MPSGraph like probe_autodiff.
+test_trunk_attn: test_trunk_attn.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h \
+           chess/chess_net.h chess/chess.h models/chess_g0.h $(CHESS_DEPS)
+	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h \
+		-framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
+		-o test_trunk_attn test_trunk_attn.m chess/chess.c
+	./test_trunk_attn
 
 # Chess G0 trainer (build-step 2, issue #16): policy + WDL value heads + 2D posenc
 # + AlphaZero loss on the ANE. The trunk matmuls run on the ANE via gen_dyn_matmul_mil
@@ -128,9 +153,9 @@ g2: train_selfplay
 	./train_selfplay --g2 $(G2ARGS)
 
 clean:
-	rm -f train probe_chess probe_mps probe_mps_graph train_chess train_selfplay \
+	rm -f train probe_chess probe_mps probe_mps_graph probe_autodiff train_chess train_selfplay test_trunk_attn \
 	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay chess/test_selfplay
 
 FORCE:
 
-.PHONY: clean FORCE test_engine test_heads g0 test_mcts g1 test_replay test_selfplay selfplay g2
+.PHONY: clean FORCE test_engine test_heads test_trunk_attn g0 test_mcts g1 test_replay test_selfplay selfplay g2

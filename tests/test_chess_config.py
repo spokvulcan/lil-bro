@@ -102,6 +102,8 @@ def test_validation():
         ChessConfig(name="x", iters=0)                     # must be positive
     with pytest.raises(ValueError):
         ChessConfig(name="x", bench_games=0)
+    with pytest.raises(ValueError):
+        ChessConfig(name="x", value_weight=0.0)        # blend weight must be > 0 (H3 sign check)
 
 
 def test_ladder_presets_valid():

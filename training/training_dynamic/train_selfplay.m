@@ -154,7 +154,11 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
 
     grads_zero();
     chess_embed_posenc_batched(L->x_in, K, L->tokens, L->net->tok_emb, L->net->rank_emb, L->net->file_emb, L->net->misc_emb);
-    chess_trunk_forward(L->net->W, L->acts, L->x_in, K, L->x_pre, L->x_final, L->net->rms_final, g_res_alpha, 1);
+    if (g_use_mps_graph && g_mtl_dev) {
+        mg_ad_forward(K, L->x_in, L->net->W, L->net->rms_final, L->x_final);
+    } else {
+        chess_trunk_forward(L->net->W, L->acts, L->x_in, K, L->x_pre, L->x_final, L->net->rms_final, g_res_alpha, 1);
+    }
     if (g_learner_prof) g_lfwd_s += mt_s(mach_absolute_time() - _t);
 
     _t = g_learner_prof ? mach_absolute_time() : 0;
@@ -194,7 +198,11 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
     vDSP_vsmul(L->grads->W_pol, 1, &ls, L->grads->W_pol, 1, (vDSP_Length)(DIM*PLANES));
     vDSP_vsmul(L->grads->W_val, 1, &ls, L->grads->W_val, 1, (vDSP_Length)(DIM*NWDL));
     _t = g_learner_prof ? mach_absolute_time() : 0;
-    chess_trunk_backward(L->net->W, L->grads->W, L->acts, L->dx_final, K, L->x_pre, L->net->rms_final, L->grads->rms_final, L->dy_in, g_res_alpha);
+    if (g_use_mps_graph && g_mtl_dev) {
+        mg_ad_backward(K, L->x_in, L->net->W, L->net->rms_final, L->dx_final, L->grads->W, L->grads->rms_final, L->dy_in);
+    } else {
+        chess_trunk_backward(L->net->W, L->grads->W, L->acts, L->dx_final, K, L->x_pre, L->net->rms_final, L->grads->rms_final, L->dy_in, g_res_alpha);
+    }
     if (g_learner_prof) g_lbwd_s += mt_s(mach_absolute_time() - _t);
     _t = g_learner_prof ? mach_absolute_time() : 0;
     chess_embed_posenc_backward_batched(L->dy_in, K, L->grads->tok_emb, L->grads->rank_emb, L->grads->file_emb, L->grads->misc_emb, L->tokens);
@@ -207,13 +215,9 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
     // the ANE fp16 path, and certain positions expose a backward numerical instability
     // (overflow in rmsnorm_bwd's reciprocal-RMS when activations are near-zero after a weight
     // update). Skipping the step lets the loop proceed; the next batch draws fresh samples.
-    int grad_nan = 0;
-    for (int i = 0; i < g_nparams && !grad_nan; i++)
-        for (int j = 0; j < g_params[i].n; j++)
-            if (!isfinite(g_params[i].g[j])) { grad_nan = 1; break; }
+    int grad_nan = grads_diagnose(adam_t, 1.0f/(ls*(float)K));
     if (grad_nan) {
         grads_zero();   // poison control: clear the NaN grads so AdamW momentum stays clean
-        if (getenv("LSTEP_DEBUG")) fprintf(stderr, "  [grad] NaN detected — skipping optimizer step (t=%d)\n", adam_t);
         *out_lp = (float)(lp / K); *out_lv = (float)(lv / K);
         free(batch);
         return;
@@ -386,24 +390,19 @@ int main(int argc, char **argv) {
         int mode; SPConfig cfg = sp_parse(argc, argv, &mode);
         g_res_alpha = 1.0f/sqrtf(2.0f*NLAYERS);
 #if LILBRO_HAS_MPS
-        // --mps-graph: whole-trunk GPU graph for eval/generation forward (5.3-6.0x speedup).
-        // The learner (save_acts=1) bypasses MPSGraph and uses ane_matmul. We force
-        // g_cpu_mm=1 (cblas fp32) for the learner because:
-        //   (a) the ANE fp16 backward overflows with MPSGraph-generated replay samples
-        //       (the fp32 priors produce slightly different games whose gradients land
-        //       just past the fp16 boundary), and
-        //   (b) MPSMatrixMultiplication produces NaN after a few optimizer steps (likely
-        //       fp16-internal accumulation overflow on certain backward shapes).
-        // cblas fp32 is correct and the learner is NOT the hot path (generation + eval
-        // dominate, and those use MPSGraph). The --mps flag (MPSMatrixMultiplication
-        // backend) is retained for experimentation but is NOT recommended with --mps-graph.
+        // --mps-graph: the GPU iteration path (ADR 0006 build-step 2). Eval/generation
+        // forward uses the whole-trunk MPSGraph (5.3-6.0x vs ANE+CPU); the LEARNER
+        // forward+backward uses mg_ad_* (MPSGraph hybrid autodiff, fp32). The cblas
+        // (g_cpu_mm=1) and ANE paths remain as the non-default fallback when --mps-graph
+        // is off (AC #25 #4); the autodiff backward subsumes the CPU rmsnorm_bwd overflow
+        // bug by construction (ADR 0006 dec 2). Optimizer + heads stay on the CPU floor.
         if (cfg.use_mps_graph) {
             mps_init();
             if (g_mtl_dev) {
                 g_use_mps_graph = 1;
-                g_cpu_mm = 1;  // cblas fp32 for the learner (stable; ANE fp16 + MPSGraph samples overflow)
-                printf("# MPSGraph: device=%s ( whole-trunk GPU graph ENABLED — 5.3-6.0x vs ANE+CPU )\n", [[g_mtl_dev name] UTF8String]);
-                printf("# learner: cblas fp32 ( ANE fp16 backward overflows with MPSGraph-generated samples )\n");
+                g_cpu_mm = 1;  // cblas fp32 fallback for any non-autodiff ane_matmul call
+                printf("# MPSGraph: device=%s ( GPU iteration path — trunk fwd+bwd hybrid autodiff )\n", [[g_mtl_dev name] UTF8String]);
+                printf("# learner: MPSGraph autodiff fp32 ( mg_ad_forward/backward ); cblas retained as fallback\n");
             } else { printf("# MPSGraph: init FAILED — falling back to ANE\n"); }
         }
         if (cfg.use_mps && !cfg.use_mps_graph) {
