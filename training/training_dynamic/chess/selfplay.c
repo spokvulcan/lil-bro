@@ -7,6 +7,10 @@
 #include <math.h>
 #include <stdio.h>
 
+#ifndef OPTIMIZER_IS_MUON
+#define OPTIMIZER_IS_MUON 1
+#endif
+
 // ============================================================================
 // Config
 // ============================================================================
@@ -19,6 +23,7 @@ SPConfig sp_defaults(void) {
     c.warmup_iters = 20; c.warmup_frac = 1.0f;   // cold-start value-prior warmup: ON by default (dec 8 fallback)
     c.td_lambda = 1.0f;
     c.replay_cap = 30000; c.learner_batch = 64; c.learner_steps = 16; c.iters = 60;
+    c.optimizer_muon = OPTIMIZER_IS_MUON;
     c.lr = 2e-3f; c.loss_scale = 256.0f; c.grad_clip = 1.0f; c.wd = 0.0f; c.value_weight = 1.0f;
     c.eval_games = 40; c.eval_every = 5; c.eval_sims = 32; c.eval_considered = 16; c.eval_max_plies = 120;
     c.bench_games = 256;
@@ -45,6 +50,15 @@ SPConfig sp_parse(int argc, char **argv, int *mode) {
         else if (!strcmp(argv[i], "--visit-policy")) c.use_improved_policy = 0;
         else if (!strcmp(argv[i], "--ckpt") && i+1<argc) c.ckpt = argv[++i];
         else if (!strcmp(argv[i], "--seed") && i+1<argc) c.seed = (uint64_t)strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--opt") && i+1<argc) {
+            const char *o = argv[++i];
+            if (!strcmp(o, "muon")) c.optimizer_muon = 1;
+            else if (!strcmp(o, "adamw")) c.optimizer_muon = 0;
+            else {
+                fprintf(stderr, "[config] unknown --opt %s (use adamw|muon); keeping %s\n",
+                        o, c.optimizer_muon ? "muon" : "adamw");
+            }
+        }
         ARGI("--B", B); ARGI("--sims", sims); ARGI("--considered", considered);
         ARGI("--replay", replay_cap); ARGI("--lbatch", learner_batch);
         ARGI("--lsteps", learner_steps); ARGI("--iters", iters);

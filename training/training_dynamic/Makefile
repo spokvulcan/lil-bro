@@ -78,6 +78,15 @@ test_trunk_attn: test_trunk_attn.m config.h io.h cpu_ops.h mil_dynamic.h chess/c
 		-o test_trunk_attn test_trunk_attn.m chess/chess.c
 	./test_trunk_attn
 
+# Chess optimizer split gate (slice 5): Muon for canonical 2D trunk matrices,
+# AdamW for embeddings, RMSNorm gains, and policy/value heads.
+test_chess_optimizer: test_chess_optimizer.m config.h io.h cpu_ops.h mil_dynamic.h \
+                      chess/chess_heads.h chess/chess_net.h chess/chess.h models/chess_g0.h $(CHESS_DEPS)
+	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h \
+		-framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
+		-o test_chess_optimizer test_chess_optimizer.m chess/chess.c
+	./test_chess_optimizer
+
 # Chess G0 trainer (build-step 2, issue #16): policy + WDL value heads + 2D posenc
 # + AlphaZero loss on the ANE. The trunk matmuls run on the ANE via gen_dyn_matmul_mil
 # (the same primitive train.m's woFwd/qBwd/wotBwd use); heads + loss on the CPU floor.
@@ -153,9 +162,9 @@ g2: train_selfplay
 	./train_selfplay --g2 $(G2ARGS)
 
 clean:
-	rm -f train probe_chess probe_mps probe_mps_graph probe_autodiff train_chess train_selfplay test_trunk_attn \
+	rm -f train probe_chess probe_mps probe_mps_graph probe_autodiff train_chess train_selfplay test_trunk_attn test_chess_optimizer \
 	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay chess/test_selfplay
 
 FORCE:
 
-.PHONY: clean FORCE test_engine test_heads test_trunk_attn g0 test_mcts g1 test_replay test_selfplay selfplay g2
+.PHONY: clean FORCE test_engine test_heads test_trunk_attn test_chess_optimizer g0 test_mcts g1 test_replay test_selfplay selfplay g2

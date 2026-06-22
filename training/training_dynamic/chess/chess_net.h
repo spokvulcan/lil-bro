@@ -14,7 +14,7 @@
 //
 // WHAT RUNS WHERE (ADR 0004 / [[ane-resident-training-cpu-floor]]): trunk matmuls on the
 // ANE in fp16 via gen_dyn_matmul_mil; RMSNorm / attention softmax / SiLU / dW / embed /
-// 2D posenc / heads / loss / AdamW on the CPU in fp32. Include AFTER mil_dynamic.h,
+// 2D posenc / heads / loss / optimizer on the CPU in fp32. Include AFTER mil_dynamic.h,
 // cpu_ops.h, chess/chess.h, chess/chess_heads.h. Pure C/Obj-C, zero new deps.
 #ifndef LILBRO_CHESS_NET_H
 #define LILBRO_CHESS_NET_H
@@ -1220,28 +1220,40 @@ static float chess_policy_value_readout(const float *x, int stride, const float 
 }
 
 // ============================================================================
-// Whole-net weights container + checkpoint I/O + AdamW param registry.
+// Whole-net weights container + checkpoint I/O + optimizer param registry.
 // ============================================================================
 typedef struct {
     CLayer W[NLAYERS];
     float *rms_final, *tok_emb, *rank_emb, *file_emb, *misc_emb, *W_pol, *W_val;
 } ChessNet;
 
-typedef struct { float *p; int n; } ParamRef;
+typedef enum {
+    NET_OPT_ADAMW = 0,
+    NET_OPT_MUON_2D = 1,
+} NetOptKind;
+
+typedef struct { float *p; int n; NetOptKind opt; int rows, cols; } ParamRef;
+static ParamRef pref_adamw(float *p, int n) {
+    return (ParamRef){p, n, NET_OPT_ADAMW, 0, 0};
+}
+static ParamRef pref_muon2d(float *p, int rows, int cols) {
+    return (ParamRef){p, rows*cols, NET_OPT_MUON_2D, rows, cols};
+}
+
 // Enumerate every trainable tensor of *n in a FIXED order (used by register/save/load).
 static int chess_net_params(ChessNet *n, ParamRef *out) {
     int k = 0;
     for (int L = 0; L < NLAYERS; L++) {
-        out[k++]=(ParamRef){n->W[L].Wq, DIM*Q_DIM};  out[k++]=(ParamRef){n->W[L].Wk, DIM*KV_DIM};
-        out[k++]=(ParamRef){n->W[L].Wv, DIM*KV_DIM}; out[k++]=(ParamRef){n->W[L].Wo, Q_DIM*DIM};
-        out[k++]=(ParamRef){n->W[L].W1, DIM*HIDDEN}; out[k++]=(ParamRef){n->W[L].W2, HIDDEN*DIM};
-        out[k++]=(ParamRef){n->W[L].W3, DIM*HIDDEN}; out[k++]=(ParamRef){n->W[L].rms_att, DIM};
-        out[k++]=(ParamRef){n->W[L].rms_ffn, DIM};
+        out[k++]=pref_muon2d(n->W[L].Wq, DIM,   Q_DIM);   out[k++]=pref_muon2d(n->W[L].Wk, DIM,   KV_DIM);
+        out[k++]=pref_muon2d(n->W[L].Wv, DIM,   KV_DIM);  out[k++]=pref_muon2d(n->W[L].Wo, Q_DIM, DIM);
+        out[k++]=pref_muon2d(n->W[L].W1, DIM,   HIDDEN);  out[k++]=pref_muon2d(n->W[L].W2, HIDDEN,DIM);
+        out[k++]=pref_muon2d(n->W[L].W3, DIM,   HIDDEN);  out[k++]=pref_adamw(n->W[L].rms_att, DIM);
+        out[k++]=pref_adamw(n->W[L].rms_ffn, DIM);
     }
-    out[k++]=(ParamRef){n->rms_final, DIM};       out[k++]=(ParamRef){n->tok_emb, VOCAB*DIM};
-    out[k++]=(ParamRef){n->rank_emb, 8*DIM};      out[k++]=(ParamRef){n->file_emb, 8*DIM};
-    out[k++]=(ParamRef){n->misc_emb, NMISC*DIM};  out[k++]=(ParamRef){n->W_pol, DIM*PLANES};
-    out[k++]=(ParamRef){n->W_val, DIM*NWDL};
+    out[k++]=pref_adamw(n->rms_final, DIM);       out[k++]=pref_adamw(n->tok_emb, VOCAB*DIM);
+    out[k++]=pref_adamw(n->rank_emb, 8*DIM);      out[k++]=pref_adamw(n->file_emb, 8*DIM);
+    out[k++]=pref_adamw(n->misc_emb, NMISC*DIM);  out[k++]=pref_adamw(n->W_pol, DIM*PLANES);
+    out[k++]=pref_adamw(n->W_val, DIM*NWDL);
     return k;
 }
 
@@ -1335,19 +1347,34 @@ static int chess_net_load(ChessNet *n, const char *path) {
     fclose(f); return 1;
 }
 
-// AdamW param registry: register every (weight, grad) pair, zero grads, and run a global
-// grad-norm + clip + AdamW step. Mirrors train_chess.m's optimizer (same fp16-scaled
-// pattern). gsc unscales the loss-scale; clip>0 applies global-norm clipping.
-typedef struct { float *w, *g; AdamState a; int n; } NetParam;
+// Optimizer param registry: register every (weight, grad) pair, zero grads, and run a
+// global grad-norm + clip + optimizer step. Slice 5's V4 split uses Muon only for the
+// canonical 2D trunk matrices and AdamW for embeddings, norms, heads, and scalars.
+// gsc unscales the loss-scale; clip>0 applies global-norm clipping.
+typedef struct { float *w, *g; AdamState a; int n; NetOptKind opt; int rows, cols; } NetParam;
 static NetParam g_params[256]; static int g_nparams = 0;
-static void reg(float *w, float *g, int n) {
+static int g_chess_optimizer_is_muon = OPTIMIZER_IS_MUON;
+
+static void chess_optimizer_set_muon(int enabled) { g_chess_optimizer_is_muon = enabled ? 1 : 0; }
+static int chess_optimizer_uses_muon(void) { return g_chess_optimizer_is_muon; }
+static const char *chess_optimizer_name(void) { return g_chess_optimizer_is_muon ? "muon" : "adamw"; }
+
+static void reg_param(float *w, float *g, int n, NetOptKind opt, int rows, int cols) {
     g_params[g_nparams].w=w; g_params[g_nparams].g=g;
-    g_params[g_nparams].a=adam_alloc(n); g_params[g_nparams].n=n; g_nparams++;
+    g_params[g_nparams].a=adam_alloc(n); g_params[g_nparams].n=n;
+    g_params[g_nparams].opt=opt; g_params[g_nparams].rows=rows; g_params[g_nparams].cols=cols;
+    g_nparams++;
+}
+static void reg(float *w, float *g, int n) {
+    reg_param(w, g, n, NET_OPT_ADAMW, 0, 0);
+}
+static void reg_muon2d(float *w, float *g, int rows, int cols) {
+    reg_param(w, g, rows*cols, NET_OPT_MUON_2D, rows, cols);
 }
 static void chess_net_register(ChessNet *W, ChessNet *G) {
     ParamRef wp[256], gp[256];
     int k = chess_net_params(W, wp); chess_net_params(G, gp);
-    for (int i = 0; i < k; i++) reg(wp[i].p, gp[i].p, wp[i].n);
+    for (int i = 0; i < k; i++) reg_param(wp[i].p, gp[i].p, wp[i].n, wp[i].opt, wp[i].rows, wp[i].cols);
 }
 static void grads_zero(void) {
     for (int i = 0; i < g_nparams; i++) memset(g_params[i].g, 0, (size_t)g_params[i].n*4);
@@ -1362,8 +1389,13 @@ static void optimizer_step(float gsc, float clip, int t, float lr, float wd) {
         float cs = clip/norm;
         for (int i = 0; i < g_nparams; i++) vDSP_vsmul(g_params[i].g,1,&cs,g_params[i].g,1,(vDSP_Length)g_params[i].n);
     }
-    for (int i = 0; i < g_nparams; i++)
-        adam_update(g_params[i].w, g_params[i].g, &g_params[i].a, t, lr, 0.9f, 0.999f, 1e-8f, wd);
+    for (int i = 0; i < g_nparams; i++) {
+        if (g_chess_optimizer_is_muon && g_params[i].opt == NET_OPT_MUON_2D)
+            muon_update(g_params[i].w, g_params[i].g, g_params[i].a.m,
+                        g_params[i].rows, g_params[i].cols, lr, 0.95f, 1, 1, wd);
+        else
+            adam_update(g_params[i].w, g_params[i].g, &g_params[i].a, t, lr, 0.9f, 0.999f, 1e-8f, wd);
+    }
 }
 
 static const char *net_param_tag(int idx) {

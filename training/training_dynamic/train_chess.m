@@ -11,8 +11,9 @@
 //   ANE (fp16): every trunk matmul — QKV/Wo/W1/W3/W2 forward AND the dx backward
 //     matmuls — via gen_dyn_matmul_mil(ic,oc,seq), the proven substrate, un-fused.
 //   CPU (fp32): RMSNorm, attention softmax (attn_cpu_*, RoPE OFF), SiLU, dW (cblas),
-//     the embedding + 2D posenc, the policy/value heads, the AZ loss, AdamW — the
-//     irreducible CPU floor.
+//     the embedding + 2D posenc, the policy/value heads, the AZ loss, optimizer — the
+//     irreducible CPU floor. Slice 5 uses Muon for canonical 2D trunk matrices and
+//     AdamW for embeddings, RMSNorm gains, and policy/value heads.
 //
 // G0 GATE (the discipline — a MEASURED gate): `./train_chess --overfit` pins ONE
 // chess position -> (one-hot target policy, one-hot target value) and trains until
@@ -38,6 +39,7 @@ int main(int argc, char *argv[]) {
         int do_overfit = 0, do_selfcheck = 0, steps = 600;
         float lr = 1e-3f, thresh = 0.05f, loss_scale = 256.0f, grad_clip = 1.0f, wd = 0.0f;
         float vw = 1.0f, l2 = 0.0f;   // value-loss weight; L2 (0 for the gate so CEs -> 0)
+        int opt_is_muon = OPTIMIZER_IS_MUON;
         for (int i = 1; i < argc; i++) {
             if      (!strcmp(argv[i], "--overfit"))   do_overfit = 1;
             else if (!strcmp(argv[i], "--selfcheck")) do_selfcheck = 1;
@@ -46,13 +48,21 @@ int main(int argc, char *argv[]) {
             else if (!strcmp(argv[i], "--thresh")&& i+1<argc) thresh = atof(argv[++i]);
             else if (!strcmp(argv[i], "--clip")  && i+1<argc) grad_clip = atof(argv[++i]);
             else if (!strcmp(argv[i], "--l2")    && i+1<argc) l2 = atof(argv[++i]);
+            else if (!strcmp(argv[i], "--opt") && i+1<argc) {
+                const char *o = argv[++i];
+                if (!strcmp(o, "muon")) opt_is_muon = 1;
+                else if (!strcmp(o, "adamw")) opt_is_muon = 0;
+                else { printf("unknown --opt %s (use adamw|muon)\n", o); return 1; }
+            }
         }
+        chess_optimizer_set_muon(opt_is_muon);
         if (do_overfit) do_selfcheck = 1;  // the gate always proves the substrate is live first
         if (!do_overfit && !do_selfcheck) do_selfcheck = 1;
 
         printf("# chess G0 trainer — DIM=%d HEADS=%d HD=%d HIDDEN=%d L=%d SEQ=%d VOCAB=%d\n",
                DIM, HEADS, HD, HIDDEN, NLAYERS, SEQ, VOCAB);
-        printf("# trunk matmuls on ANE (fp16) via gen_dyn_matmul_mil; heads/loss/norm/attn on CPU (fp32)\n\n");
+        printf("# trunk matmuls on ANE (fp16) via gen_dyn_matmul_mil; heads/loss/norm/attn on CPU (fp32); optimizer=%s\n\n",
+               chess_optimizer_name());
 
         float res_alpha = 1.0f/sqrtf(2.0f*NLAYERS);
 
@@ -87,9 +97,9 @@ int main(int argc, char *argv[]) {
 
         // ---- register params for the optimizer (order is irrelevant) ----
         for (int L=0;L<NLAYERS;L++) {
-            reg(W[L].Wq,G[L].Wq,DIM*Q_DIM); reg(W[L].Wk,G[L].Wk,DIM*KV_DIM); reg(W[L].Wv,G[L].Wv,DIM*KV_DIM);
-            reg(W[L].Wo,G[L].Wo,Q_DIM*DIM); reg(W[L].W1,G[L].W1,DIM*HIDDEN); reg(W[L].W2,G[L].W2,HIDDEN*DIM);
-            reg(W[L].W3,G[L].W3,DIM*HIDDEN); reg(W[L].rms_att,G[L].rms_att,DIM); reg(W[L].rms_ffn,G[L].rms_ffn,DIM);
+            reg_muon2d(W[L].Wq,G[L].Wq,DIM,Q_DIM); reg_muon2d(W[L].Wk,G[L].Wk,DIM,KV_DIM); reg_muon2d(W[L].Wv,G[L].Wv,DIM,KV_DIM);
+            reg_muon2d(W[L].Wo,G[L].Wo,Q_DIM,DIM); reg_muon2d(W[L].W1,G[L].W1,DIM,HIDDEN); reg_muon2d(W[L].W2,G[L].W2,HIDDEN,DIM);
+            reg_muon2d(W[L].W3,G[L].W3,DIM,HIDDEN); reg(W[L].rms_att,G[L].rms_att,DIM); reg(W[L].rms_ffn,G[L].rms_ffn,DIM);
         }
         reg(rms_final,grms_final,DIM); reg(tok_emb,g_tok,VOCAB*DIM);
         reg(rank_emb,g_rank,8*DIM); reg(file_emb,g_file,8*DIM); reg(misc_emb,g_misc,NMISC*DIM);
@@ -217,7 +227,7 @@ int main(int argc, char *argv[]) {
             chess_trunk_backward(W, G, acts, dx_final, 1, x_pre, rms_final, grms_final, dy_in, res_alpha);
             chess_posenc_backward(dy_in, g_rank, g_file, g_misc, DIM, SEQ, NBOARD);
             embed_backward(g_tok, dy_in, tokens, DIM, SEQ);
-            // optimizer: unscale (1/loss_scale), global-clip, AdamW
+            // optimizer: unscale (1/loss_scale), global-clip, then the selected V4 split.
             adam_t++;
             optimizer_step(1.0f/loss_scale, grad_clip, adam_t, lr, wd);
             for (int L=0;L<NLAYERS;L++) chess_layer_build_fused(&W[L]);   // keep fused fwd weights in sync [iter 6]

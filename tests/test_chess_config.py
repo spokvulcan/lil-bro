@@ -47,6 +47,7 @@ def test_to_argv_pulls_from_config():
     assert p["--considered"] == "12"
     assert p["--iters"] == "7"
     assert p["--bench-games"] == "96"
+    assert p["--opt"] == "muon"
     assert float(p["--lr"]) == 1e-3
     assert p["--ckpt"] == "ane_chess_t.ckpt"   # __post_init__ default
 
@@ -104,6 +105,8 @@ def test_validation():
         ChessConfig(name="x", bench_games=0)
     with pytest.raises(ValueError):
         ChessConfig(name="x", value_weight=0.0)        # blend weight must be > 0 (H3 sign check)
+    with pytest.raises(ValueError):
+        ChessConfig(name="x", optimizer="sgd")
 
 
 def test_td_lambda_knob():
@@ -126,7 +129,7 @@ def test_ladder_presets_valid():
         assert cfg.eval_considered <= cfg.eval_sims
         # argv must be parseable: every numeric flag value round-trips
         for flag, val in _argv_pairs(cfg.to_argv()).items():
-            if val and flag not in ("--ckpt",):
+            if val and flag not in ("--ckpt", "--opt"):
                 float(val)  # raises if not numeric
 
 

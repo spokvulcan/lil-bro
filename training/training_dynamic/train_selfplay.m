@@ -12,7 +12,8 @@
 //      distribution, value <- the game outcome z (decision 13).
 //   2. REPLAY — a sliding window of recent positions (decision 14: always-latest).
 //   3. LEARNER — samples a minibatch and trains the shared trunk (chess_net.h) with the
-//      AlphaZero loss + fp16 loss-scaling + grad-clip — the SAME net `make g0` verified.
+//      AlphaZero loss + fp16 loss-scaling + grad-clip + optimizer split — the SAME net
+//      `make g0` verified.
 //
 // THE SPLIT: the net glue lives HERE (the batched forward behind mcts.h's evaluator
 // contract — decision 2; the learner; the substrate self-check). The evaluator-AGNOSTIC
@@ -389,6 +390,7 @@ int main(int argc, char **argv) {
         mach_timebase_info(&g_tb);
         chess_init();
         int mode; SPConfig cfg = sp_parse(argc, argv, &mode);
+        chess_optimizer_set_muon(cfg.optimizer_muon);
         g_res_alpha = 1.0f/sqrtf(2.0f*NLAYERS);
 #if LILBRO_HAS_MPS
         // --mps-graph: the GPU iteration path (ADR 0006 build-step 2). Eval/generation
@@ -427,10 +429,11 @@ int main(int argc, char **argv) {
         printf("# replay=%d lbatch=%d lsteps=%d iters=%d lr=%g vw=%g dir(a=%g,f=%g) temp=%g/%d max_plies=%d seed=%llu\n",
                 cfg.replay_cap, cfg.learner_batch, cfg.learner_steps, cfg.iters, cfg.lr, cfg.value_weight,
                 cfg.dir_alpha, cfg.dir_frac, cfg.temp, cfg.temp_moves, cfg.max_plies, (unsigned long long)cfg.seed);
-        printf("# warmup: iters=%d frac=%g  adjudicate=%d curriculum=%d  td_lambda=%g\n",
-                cfg.warmup_iters, (double)cfg.warmup_frac, cfg.adjudicate, cfg.curriculum, (double)cfg.td_lambda);
+        printf("# warmup: iters=%d frac=%g  adjudicate=%d curriculum=%d  td_lambda=%g  optimizer=%s\n",
+                cfg.warmup_iters, (double)cfg.warmup_frac, cfg.adjudicate, cfg.curriculum,
+                (double)cfg.td_lambda, chess_optimizer_name());
 
-        // ---- the ONE net + grads + AdamW registry (the single ANE client) ----
+        // ---- the ONE net + grads + optimizer registry (the single ANE client) ----
         ChessNet net, grads;
         chess_net_alloc(&net, 0); chess_net_alloc(&grads, 1);
         chess_net_init(&net, cfg.seed);

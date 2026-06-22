@@ -61,6 +61,7 @@ typedef struct {
     float    td_lambda;                      // TD(lambda) for the value target: 1.0 = terminal z (legacy), 0.0 = 1-step TD
     // replay + learner (train_selfplay.m)
     int      replay_cap, learner_batch, learner_steps, iters;
+    int      optimizer_muon;                    // --opt muon|adamw; learner-only
     float    lr, loss_scale, grad_clip, wd, value_weight;
     // eval ladder (eval_considered decoupled from generation's `considered`: a TRAINED
     // policy guides a narrow/cheap eval search, while generation needs a broad search to

@@ -5,6 +5,8 @@ Ablation outputs: tables, loss curves, and the energy verdict.
 > **Sibling project — Chess RL self-play on the ANE** ([ADR 0005](../docs/adr/0005-chess-rl-self-play-on-ane.md)):
 > [`chess_throughput_probe.md`](chess_throughput_probe.md) — build-step 0 gate (games/day,
 > ANE-bound verdict, days-vs-never). Raw: [`chess_throughput_probe_raw.txt`](chess_throughput_probe_raw.txt).
+> [`chess_g2_diagnosis.md`](chess_g2_diagnosis.md) records the GPU learner H1-H4 read;
+> [`chess_muon.md`](chess_muon.md) records the Slice 5 Muon one-variable read.
 
 ## DeepSeek-V4 parity build status (PRD spokvulcan/lil-bro#2)
 

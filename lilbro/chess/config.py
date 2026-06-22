@@ -54,7 +54,8 @@ class ChessConfig:
     learner_batch: int = 64      # minibatch K (-> --lbatch)
     learner_steps: int = 16      # optimizer steps per iteration (-> --lsteps)
     iters: int = 60              # self-play iterations (-> --iters)
-    lr: float = 2e-3             # AdamW learning rate (-> --lr)
+    optimizer: str = "muon"      # V4 split by default (-> --opt): 2D trunk Muon, rest AdamW
+    lr: float = 2e-3             # optimizer learning rate (-> --lr)
     loss_scale: float = 256.0    # fp16 loss-scaling (-> --loss-scale)
     grad_clip: float = 1.0       # global grad-norm clip (-> --clip)
     weight_decay: float = 0.0    # AdamW decoupled weight decay (-> --wd)
@@ -76,8 +77,8 @@ class ChessConfig:
     ckpt: str = ""               # checkpoint path (-> --ckpt; default -> ane_<name>.ckpt)
 
     # --- backend (GPU/MPS rewrite, Phase 2) ---
-    use_mps_graph: bool = False  # --mps-graph: route the whole trunk forward through one MPSGraph
-                                  # (5.3-6.0x vs ANE+CPU on M3 Max; eval-only — the learner stays on ANE)
+    use_mps_graph: bool = False  # --mps-graph: GPU iteration path; trunk forward+learner
+                                  # backward through MPSGraph fp32, optimizer stays CPU-side
 
     def __post_init__(self) -> None:
         if not self.ckpt:
@@ -106,6 +107,8 @@ class ChessConfig:
         if self.value_weight <= 0.0:
             raise ValueError(f"value_weight must be positive (0 silences the value head; "
                              f"the AZ policy/value blend), got {self.value_weight}")
+        if self.optimizer not in ("muon", "adamw"):
+            raise ValueError(f"optimizer must be 'muon' or 'adamw', got {self.optimizer!r}")
         if not 0.0 <= self.td_lambda <= 1.0:
             raise ValueError(f"td_lambda must be in [0,1] (1.0=terminal z, 0.0=1-step TD), "
                              f"got {self.td_lambda}")
@@ -127,6 +130,7 @@ class ChessConfig:
             "--lbatch", str(self.learner_batch),
             "--lsteps", str(self.learner_steps),
             "--iters", str(self.iters),
+            "--opt", self.optimizer,
             "--lr", _fmt(self.lr),
             "--loss-scale", _fmt(self.loss_scale),
             "--clip", _fmt(self.grad_clip),
@@ -208,6 +212,7 @@ LADDER: dict[str, ChessConfig] = {
         name="g2", batch=64, sims=16, considered=16, max_plies=20, iters=30,
         learner_steps=60, learner_batch=96, replay_cap=80000, lr=5e-3, temp_moves=8,
         curriculum=True, curriculum_plies=8, adjudicate=True, value_weight=1.5,
+        use_mps_graph=True,
         bench_games=320,
         # Eval is the loop's dominant cost (full games vs a non-resigning random-mover run to
         # the ply cap), so it is kept CHEAP and infrequent — the per-iter loss + gen-W/D/L row
@@ -223,6 +228,7 @@ LADDER: dict[str, ChessConfig] = {
         name="g2_diag", batch=64, sims=16, considered=16, max_plies=20, iters=30,
         learner_steps=60, learner_batch=96, replay_cap=80000, lr=5e-3, temp_moves=8,
         curriculum=True, curriculum_plies=8, adjudicate=True, value_weight=1.5,
+        use_mps_graph=True,
         bench_games=320,
         eval_games=200, eval_sims=8, eval_considered=8, eval_max_plies=50, eval_every=5,
     ),
@@ -241,6 +247,7 @@ LADDER: dict[str, ChessConfig] = {
         name="g2_full", batch=128, sims=32, considered=32, max_plies=80, iters=60,
         learner_steps=48, learner_batch=128, replay_cap=120000, lr=3e-3,
         curriculum=True, adjudicate=True,
+        use_mps_graph=True,
         eval_games=40, eval_sims=16, eval_considered=16, eval_max_plies=120, eval_every=5,
         bench_games=320,
     ),

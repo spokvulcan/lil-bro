@@ -41,7 +41,7 @@
 #define MTP_DEPTH 0
 #endif
 #ifndef OPTIMIZER_IS_MUON
-#define OPTIMIZER_IS_MUON 0   // 0 = adamw (lower-risk for the overfit gate), 1 = muon
+#define OPTIMIZER_IS_MUON 1   // Slice 5 default: V4 split (2D trunk Muon, rest AdamW)
 #endif
 
 // --- DeepSeek-V4 ablation knobs: ALL OFF for chess v1 (ADR 0005 decision 11:
