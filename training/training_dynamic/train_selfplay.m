@@ -215,13 +215,9 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
     // the ANE fp16 path, and certain positions expose a backward numerical instability
     // (overflow in rmsnorm_bwd's reciprocal-RMS when activations are near-zero after a weight
     // update). Skipping the step lets the loop proceed; the next batch draws fresh samples.
-    int grad_nan = 0;
-    for (int i = 0; i < g_nparams && !grad_nan; i++)
-        for (int j = 0; j < g_params[i].n; j++)
-            if (!isfinite(g_params[i].g[j])) { grad_nan = 1; break; }
+    int grad_nan = grads_diagnose(adam_t, 1.0f/(ls*(float)K));
     if (grad_nan) {
         grads_zero();   // poison control: clear the NaN grads so AdamW momentum stays clean
-        if (getenv("LSTEP_DEBUG")) fprintf(stderr, "  [grad] NaN detected — skipping optimizer step (t=%d)\n", adam_t);
         *out_lp = (float)(lp / K); *out_lv = (float)(lv / K);
         free(batch);
         return;

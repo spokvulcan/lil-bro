@@ -1366,4 +1366,52 @@ static void optimizer_step(float gsc, float clip, int t, float lr, float wd) {
         adam_update(g_params[i].w, g_params[i].g, &g_params[i].a, t, lr, 0.9f, 0.999f, 1e-8f, wd);
 }
 
+static const char *net_param_tag(int idx) {
+    static char tag[256][12];
+    static int built = 0;
+    if (!built) {
+        int k = 0;
+        const char *op[9] = {"Wq","Wk","Wv","Wo","W1","W2","W3","rma","rmf"};
+        for (int L = 0; L < NLAYERS; L++)
+            for (int g = 0; g < 9; g++) snprintf(tag[k++], 12, "%s%d", op[g], L);
+        snprintf(tag[k++], 12, "rmsfin");
+        snprintf(tag[k++], 12, "tok");
+        snprintf(tag[k++], 12, "rank");
+        snprintf(tag[k++], 12, "file");
+        snprintf(tag[k++], 12, "misc");
+        snprintf(tag[k++], 12, "Wpol");
+        snprintf(tag[k++], 12, "Wval");
+        built = 1;
+    }
+    return (idx >= 0 && idx < 256) ? tag[idx] : "?";
+}
+
+static int grads_diagnose(int adam_t, float mean_div) {
+    double gnorm2 = 0.0, gmax = 0.0;
+    long nnan = 0, ntot = 0;
+    int verbose = getenv("GRAD_DIAG_VERBOSE") != NULL;
+    char nanbuf[256]; nanbuf[0] = 0; int nanlen = 0;
+    for (int i = 0; i < g_nparams; i++) {
+        const float *g = g_params[i].g; int n = g_params[i].n;
+        double pm = 0.0; int pnan = 0;
+        for (int j = 0; j < n; j++) {
+            double v = (double)g[j];
+            if (!isfinite(v)) { pnan++; continue; }
+            double a = fabs(v);
+            if (a > pm) pm = a;
+            if (a > gmax) gmax = a;
+            gnorm2 += v*v;
+        }
+        nnan += pnan; ntot += n;
+        if (verbose)
+            fprintf(stderr, "    %-7s maxg=%.3e nan=%d/%d\n", net_param_tag(i), pm*mean_div, pnan, n);
+        if (pnan > 0 && nanlen < 240)
+            nanlen += snprintf(nanbuf+nanlen, (size_t)(256-nanlen), "%s%s(%d)", nanlen?" ":"", net_param_tag(i), pnan);
+    }
+    double gnorm = sqrt(gnorm2) * mean_div;
+    fprintf(stderr, "[grad t=%d] gnorm=%.3e maxg=%.3e nan=%ld/%ld%s%s\n",
+            adam_t, gnorm, gmax*mean_div, nnan, ntot, nnan?" ":"", nanbuf);
+    return (int)nnan;
+}
+
 #endif  // LILBRO_CHESS_NET_H

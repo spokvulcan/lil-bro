@@ -101,6 +101,9 @@ class ChessConfig:
                              f"the eval search would be degenerate")
         if not 0.0 <= self.dir_frac <= 1.0:
             raise ValueError(f"dir_frac must be in [0,1], got {self.dir_frac}")
+        if self.value_weight <= 0.0:
+            raise ValueError(f"value_weight must be positive (0 silences the value head; "
+                             f"the AZ policy/value blend), got {self.value_weight}")
 
     def to_argv(self) -> list[str]:
         """Map this config to the ``train_selfplay`` flag list (NOT including the run mode
@@ -204,6 +207,18 @@ LADDER: dict[str, ChessConfig] = {
         # the ply cap), so it is kept CHEAP and infrequent — the per-iter loss + gen-W/D/L row
         # is the primary learning signal; eval only confirms the win-rate effect at 6 points.
         eval_games=8, eval_sims=8, eval_considered=8, eval_max_plies=50, eval_every=6,
+    ),
+    # The G2 diagnosis rung (issue #24): the g2 shape with eval_games=200 to read the win-rate
+    # curve BELOW the noise floor (±0.035 at 200 games vs ±0.08 at 40 — kills H4). Run with
+    # --mps-graph (the GPU learner path); stderr carries the per-step grad-norm/NaN-count
+    # (grads_diagnose) and stdout carries the split loss_pol/loss_val. The H1–H4 read is off
+    # the instrumented curve (see results/chess_g2_diagnosis.md).
+    "g2_diag": ChessConfig(
+        name="g2_diag", batch=64, sims=16, considered=16, max_plies=20, iters=30,
+        learner_steps=60, learner_batch=96, replay_cap=80000, lr=5e-3, temp_moves=8,
+        curriculum=True, curriculum_plies=8, adjudicate=True, value_weight=1.5,
+        bench_games=320,
+        eval_games=200, eval_sims=8, eval_considered=8, eval_max_plies=50, eval_every=5,
     ),
     # Raw-throughput bulk-data phase. This still runs the real self-play/evaluator path, but
     # deliberately uses one-sim searches and short capped games with material adjudication.
