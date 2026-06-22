@@ -39,4 +39,7 @@ training/training_dynamic/chess/test_selfplay
 training/training_dynamic/train_selfplay
 training/training_dynamic/chess/test_evaluator
 training/training_dynamic/chess/test_replay
+# Self-anchored Elo harness (ADR 0007)
+training/training_dynamic/chess/test_elo
 *.ckpt
+*.ckpt.elo*

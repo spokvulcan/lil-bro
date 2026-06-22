@@ -67,6 +67,11 @@ typedef struct {
     // policy guides a narrow/cheap eval search, while generation needs a broad search to
     // sharpen the policy target from uninformative cold-start priors — see the G1 note)
     int      eval_games, eval_every, eval_sims, eval_considered, eval_max_plies;
+    // self-anchored Elo (ADR 0007): the "infinite-learning" slope metric. elo_every>0 snapshots
+    // the net to <ckpt>.eloNNN every elo_every iters during --g2; the --elo mode then round-robins
+    // those snapshots (net-vs-net at the eval search budget, elo_games per pairing) into a relative
+    // Elo curve over the net's own past selves. 0 = off (no snapshots).
+    int      elo_every, elo_games;
     // benchmark harness
     int      bench_games;
     // diagnostics
@@ -120,6 +125,17 @@ void play_selfplay_batch(const BatchedChessEvaluator *bev, const BatchedChessEva
 // /temperature) at cfg->eval_sims.
 double eval_vs_opponent(const BatchedChessEvaluator *bev, const SPConfig *cfg,
                         OpponentFn opp, int n_games, uint64_t seed, int *W, int *D, int *Lo);
+
+// MATCH (self-anchored Elo, ADR 0007): play n_games net-vs-net games between evaluators A and
+// B, both searching via MCTS at the eval budget (cfg->eval_sims/eval_considered/eval_max_plies).
+// Both nets play their best move (deterministic), so each game is seeded with a distinct random
+// opening (open_plies uniform moves) for diversity; games come in COLOR-SWAPPED PAIRS (even idx
+// -> A white, odd -> A black, the pair sharing one opening) so opening + first-move bias cancels
+// — pass an even n_games. Returns A's score (Wa + 0.5 Da)/n_games and raw W/D/L (A's
+// perspective). Deterministic from seed. A capped game is a draw (eval scores real outcomes).
+double match_net_vs_net(const BatchedChessEvaluator *bevA, const BatchedChessEvaluator *bevB,
+                        const SPConfig *cfg, int n_games, int open_plies, uint64_t seed,
+                        int *Wa, int *Da, int *La);
 
 // Warmup value-prior wrapper (ADR 0005 decision 8 fallback, MEASURED-triggered): returns a
 // BatchedChessEvaluator that wraps `inner` and blends the leaf VALUE with a material

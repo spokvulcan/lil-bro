@@ -337,6 +337,47 @@ static void test_eval(void) {
     printf("   vs greedy: W/D/L = %d/%d/%d  score=%.3f\n\n", gw, gd, gl, sg);
 }
 
+// ---- 6b. net-vs-net match (self-anchored Elo core, ADR 0007): a STRONGER evaluator must
+// beat a WEAKER one, decisively and with the correct sign. match_net_vs_net is the heart of
+// the Elo metric; an always-draw or sign-flipped bug would silently make every Elo number
+// meaningless. Strong = the G1 oracle (material + mate value + MCTS-Solver); weak = a const-0
+// evaluator (uniform priors, no value signal -> uninformed ~random search). Pure C, no ANE.
+static void test_match_net_vs_net(void) {
+    printf("## net-vs-net match: a stronger evaluator beats a weaker one (decisive, correct sign)\n");
+    SPConfig cfg = sp_defaults();
+    cfg.eval_sims = 64; cfg.eval_considered = 8; cfg.eval_max_plies = 160;
+    BatchedChessEvaluator strong = chess_oracle_batched_evaluator();
+    BatchedChessEvaluator weak   = make_const_evaluator(0.0f);
+    const int n = 16, open_plies = 2;
+
+    // strong as A: must score > 0.5 AND produce decisive games (not silently all-draws)
+    int Wa, Da, La;
+    double sA = match_net_vs_net(&strong, &weak, &cfg, n, open_plies, 909, &Wa, &Da, &La);
+    CHECK(Wa + Da + La == n, "match: W+D+L=%d != n=%d", Wa+Da+La, n);
+    CHECK(Wa + La > 0, "match: ALL %d games drew — match never resolves (silent always-draw bug)", n);
+    CHECK(sA > 0.5, "match: strong-as-A only scored %.3f vs weak (the stronger net should win)", sA);
+    printf("   strong(A) vs weak(B):   W/D/L = %2d/%2d/%2d  score=%.3f\n", Wa, Da, La, sA);
+
+    // sign check: swap roles, SAME seed -> weak-as-A must score < 0.5 (A should now LOSE)
+    int Wb, Db, Lb;
+    double sB = match_net_vs_net(&weak, &strong, &cfg, n, open_plies, 909, &Wb, &Db, &Lb);
+    CHECK(sB < 0.5, "match: weak-as-A scored %.3f — sign is wrong (A should lose)", sB);
+    printf("   weak(A)  vs strong(B):  W/D/L = %2d/%2d/%2d  score=%.3f (A loses — sign correct)\n", Wb, Db, Lb, sB);
+
+    // determinism: same seed -> identical result
+    int Wc, Dc, Lc;
+    double sC = match_net_vs_net(&strong, &weak, &cfg, n, open_plies, 909, &Wc, &Dc, &Lc);
+    CHECK(Wc==Wa && Dc==Da && Lc==La && sC==sA, "match is NOT deterministic for a fixed seed");
+
+    // symmetric sanity: equal strength -> valid bookkeeping (score near 0.5, not asserted tight)
+    int Ws, Ds, Ls;
+    double sS = match_net_vs_net(&strong, &strong, &cfg, n, open_plies, 909, &Ws, &Ds, &Ls);
+    CHECK(Ws + Ds + Ls == n, "match(self): W+D+L != n");
+    printf("   strong vs strong:       W/D/L = %2d/%2d/%2d  score=%.3f (~0.5 expected)\n\n", Ws, Ds, Ls, sS);
+
+    free(weak.ctx);
+}
+
 // ---- 7. warmup value-prior wrapper: blends net value with a material heuristic ----
 // The G2 cold-start fix (ADR 0005 decision 8 fallback, measured-triggered). At cold start
 // the net's value is random, so MCTS can't sharpen the policy prior into a useful target
@@ -418,6 +459,7 @@ int main(void) {
     test_nstep_relabel_integration();
     test_nstep_label_separation();
     test_eval();
+    test_match_net_vs_net();
     test_warmup_value_prior();
     if (g_fail) { printf("*** test_selfplay: FAILURES ***\n"); return 1; }
     printf("# test_selfplay: ALL TESTS PASSED\n");
