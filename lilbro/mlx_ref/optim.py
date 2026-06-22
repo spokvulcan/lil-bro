@@ -17,18 +17,25 @@ from .params import is_muon_param, param_spec
 from lilbro.configs import Config
 
 
-def _newton_schulz5(G: np.ndarray, steps: int = 5, eps: float = 1e-7) -> np.ndarray:
-    """Orthogonalize G via the quintic Newton-Schulz iteration (Keller Jordan's
-    Muon). Returns a matrix with (approximately) the same shape whose singular
-    values are pushed toward 1. Computed in float64."""
-    a, b, c = 3.4445, -4.7750, 2.0315
+def _newton_schulz(G: np.ndarray, steps: int = 5, eps: float = 1e-7,
+                   v4_hybrid: bool = False) -> np.ndarray:
+    """Orthogonalize G via quintic Newton-Schulz in float64.
+
+    The prior Muon path uses Keller Jordan's coefficients for every iteration.
+    The trainer's default V4 path runs 10 iterations, with the final two using
+    the stabilizing (2, -1.5, 0.5) triple. This mirrors ``cpu_ops.h``.
+    """
     X = G.astype(np.float64).copy()
     transposed = False
     if X.shape[0] > X.shape[1]:
         X = X.T
         transposed = True
     X /= (np.linalg.norm(X) + eps)
-    for _ in range(steps):
+    for i in range(steps):
+        if v4_hybrid and i >= steps - 2:
+            a, b, c = 2.0, -1.5, 0.5
+        else:
+            a, b, c = 3.4445, -4.7750, 2.0315
         A = X @ X.T
         B = b * A + c * (A @ A)
         X = a * X + B @ X
@@ -69,12 +76,16 @@ class Muon:
     every parameter Muon does not own (embedding, norms)."""
 
     def __init__(self, cfg: Config, lr: float, momentum: float = 0.95,
-                 nesterov: bool = True, ns_steps: int = 5):
+                 nesterov: bool = True, ns_steps: int | None = None,
+                 variant: str = "v4"):
         self.cfg = cfg
         self.lr = lr
         self.mu = momentum
         self.nesterov = nesterov
-        self.ns_steps = ns_steps
+        if variant not in {"v4", "prior"}:
+            raise ValueError(f"unknown Muon variant {variant!r}; use 'v4' or 'prior'")
+        self.variant = variant
+        self.ns_steps = (10 if variant == "v4" else 5) if ns_steps is None else ns_steps
         self.buf: dict[str, np.ndarray] = {}
         self._kind = {n: k for n, k in param_spec(cfg)}
         # AdamW handles the non-Muon parameters with the same base lr.
@@ -98,11 +109,12 @@ class Muon:
         buf = self.buf[name]
         buf[:] = self.mu * buf + g
         d = g + self.mu * buf if self.nesterov else buf
-        u = _newton_schulz5(d, steps=self.ns_steps)
-        # RMS-matching scale (modded-nanogpt / Keller Jordan Muon variant): pushes
-        # the update's per-element RMS toward AdamW's so a shared base lr behaves.
-        # NOTE: the ANE-side Muon MUST replicate this update *exactly* — momentum,
-        # nesterov, ns_steps, AND this scale — or the R1 grad/step diff diverges.
+        u = _newton_schulz(d, steps=self.ns_steps, v4_hybrid=(self.variant == "v4"))
+        # NOTE: the ANE-side Muon MUST replicate this update exactly — momentum,
+        # nesterov, coefficient schedule, scale, and weight decay.
+        if self.variant == "v4":
+            scale = max(w.shape) ** 0.5 * 0.18
+            return w * (1.0 - self.lr * self.cfg.weight_decay) - self.lr * u * scale
         scale = max(1.0, w.shape[0] / w.shape[1]) ** 0.5
         return w - self.lr * u * scale
 
@@ -111,7 +123,7 @@ def make_optimizer(cfg: Config):
     """Build the optimizer named by ``cfg.optimizer``. AdamW needs ``t`` bumped
     each step; Muon delegates non-owned params to an inner AdamW that shares it."""
     if cfg.optimizer == "muon":
-        return Muon(cfg, cfg.lr, momentum=0.95, nesterov=True)
+        return Muon(cfg, cfg.lr, momentum=0.95, nesterov=True, variant="v4")
     return AdamW(cfg.lr, wd=cfg.weight_decay)
 
 

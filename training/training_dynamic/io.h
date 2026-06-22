@@ -238,6 +238,18 @@ static void write_wo_fwd_acts(IOSurfaceRef s, const float *attn_out) {
         cvt_f32_f16(buf + d*WO_FWD_SP, attn_out + d*SEQ, SEQ);
     IOSurfaceUnlock(s, 0, NULL);
 }
+static void copy_wo_fwd_acts_fp16_from_sdpa(IOSurfaceRef s, const _Float16 *attn_out_fp16) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    for (int d = 0; d < Q_DIM; d++) {
+#if WO_FUNCPARAM
+        memcpy(buf + d*SEQ, attn_out_fp16 + d*SEQ, SEQ * sizeof(_Float16));
+#else
+        memcpy(buf + d*WO_FWD_SP, attn_out_fp16 + d*SEQ, SEQ * sizeof(_Float16));
+#endif
+    }
+    IOSurfaceUnlock(s, 0, NULL);
+}
 // Function-parameter woFwd (WO_FUNCPARAM): the act surface holds only attn_out
 // [1,Q_DIM,1,SEQ] (no packed weight); Wo^T arrives as its own [1,1,Q_DIM,DIM]
 // surface, already in matmul shape, so the kernel skips the weight slice/reshape.
@@ -422,19 +434,19 @@ static void write_kv_bwd_acts(IOSurfaceRef s, const float *dk, const float *dv) 
 }
 
 #if FUSE_QKVBWD
-// qkvBwd (fused, MHA-only): one packed surface [1, DIM, 1, 3*SEQ+3*DIM] fp16 =
-// [dq | dk | dv | Wq | Wk | Wv]. Requires Q_DIM==KV_DIM==DIM (#error in config.h
-// otherwise), so all three projections share IC=DIM. Activations dq/dk/dv are
-// [DIM,SEQ]; weights Wq/Wk/Wv are [DIM rows, DIM cols] — the SAME layouts the
-// split stage_q_bwd_weights / stage_kv_bwd_weights / write_*_bwd_acts use, so
-// the fused matmuls are byte-identical math to qBwd + kvBwd, summed in-kernel.
+// qkvBwd (fused): one packed Q_DIM-channel surface =
+// [dq | dk | dv | Wq | Wk | Wv]. Under GQA, K/V occupy only the first KV_DIM
+// channels of their slices; the MIL slices those narrower channel ranges. The
+// staged layouts match the split qBwd/kvBwd paths, so the math is byte-identical
+// to dx_q + dx_kv, summed in-kernel.
 #define QKV_BWD_SP (3*SEQ + 3*DIM)
 static void stage_qkv_bwd_weights(IOSurfaceRef s, const float *Wq,
                                   const float *Wk, const float *Wv) {
     IOSurfaceLock(s, 0, NULL);
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++) {
-        cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ,         Wq + d*DIM, DIM);
+    for (int d = 0; d < Q_DIM; d++)
+        cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ, Wq + d*DIM, DIM);
+    for (int d = 0; d < KV_DIM; d++) {
         cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ + DIM,   Wk + d*DIM, DIM);
         cvt_f32_f16(buf + d*QKV_BWD_SP + 3*SEQ + 2*DIM, Wv + d*DIM, DIM);
     }
@@ -444,14 +456,108 @@ static void write_qkv_bwd_acts(IOSurfaceRef s, const float *dq,
                                const float *dk, const float *dv) {
     IOSurfaceLock(s, 0, NULL);
     _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
-    for (int d = 0; d < DIM; d++) {
-        cvt_f32_f16(buf + d*QKV_BWD_SP,         dq + d*SEQ, SEQ);
+    for (int d = 0; d < Q_DIM; d++)
+        cvt_f32_f16(buf + d*QKV_BWD_SP, dq + d*SEQ, SEQ);
+    for (int d = 0; d < KV_DIM; d++) {
         cvt_f32_f16(buf + d*QKV_BWD_SP + SEQ,   dk + d*SEQ, SEQ);
         cvt_f32_f16(buf + d*QKV_BWD_SP + 2*SEQ, dv + d*SEQ, SEQ);
     }
     IOSurfaceUnlock(s, 0, NULL);
 }
 #endif
+
+// SDPA backward hot-path packing/unpacking. These keep GQA expansion/reduction at
+// the fp16 IOSurface boundary instead of materializing full Q_DIM K/V tensors in
+// fp32 scratch buffers for every layer.
+static void cvt_gqa_kv_f32_to_f16_tiled(_Float16 *dst, const float *src, int seq) {
+#if GQA_RATIO == 1
+    cvt_f32_f16(dst, src, KV_DIM * seq);
+#else
+    const int chunk = HD * seq;
+    for (int r = 0; r < GQA_RATIO; r++) {
+        for (int kv = 0; kv < KV_HEADS; kv++) {
+            int q_head = r * KV_HEADS + kv;
+            cvt_f32_f16(dst + q_head * chunk, src + kv * chunk, chunk);
+        }
+    }
+#endif
+}
+
+static void reduce_gqa_fp16_to_f32(float *out, const _Float16 *in, int seq) {
+#if GQA_RATIO == 1
+    cvt_f16_f32(out, in, KV_DIM * seq);
+#else
+    const int chunk = HD * seq;
+    float tmp[HD * SEQ];
+    for (int kv = 0; kv < KV_HEADS; kv++) {
+        float *dst = out + kv * chunk;
+        cvt_f16_f32(dst, in + kv * chunk, chunk);
+        for (int r = 1; r < GQA_RATIO; r++) {
+            int q_head = r * KV_HEADS + kv;
+            cvt_f16_f32(tmp, in + q_head * chunk, chunk);
+            vDSP_vadd(dst, 1, tmp, 1, dst, 1, (vDSP_Length)chunk);
+        }
+    }
+#endif
+}
+
+static void write_sdpa_bwd1_acts_gqa(IOSurfaceRef s, const float *q,
+                                     const float *k, const float *v,
+                                     const float *da) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    cvt_f32_f16(buf, q, Q_DIM * SEQ);
+    cvt_gqa_kv_f32_to_f16_tiled(buf + Q_DIM * SEQ, k, SEQ);
+    cvt_gqa_kv_f32_to_f16_tiled(buf + 2 * Q_DIM * SEQ, v, SEQ);
+    cvt_f32_f16(buf + 3 * Q_DIM * SEQ, da, Q_DIM * SEQ);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+static void write_sdpa_bwd_v_acts_gqa(IOSurfaceRef s, const float *q,
+                                      const float *k, const float *da) {
+    IOSurfaceLock(s, 0, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    cvt_f32_f16(buf, q, Q_DIM * SEQ);
+    cvt_gqa_kv_f32_to_f16_tiled(buf + Q_DIM * SEQ, k, SEQ);
+    cvt_f32_f16(buf + 2 * Q_DIM * SEQ, da, Q_DIM * SEQ);
+    IOSurfaceUnlock(s, 0, NULL);
+}
+
+static void write_sdpa_bwd2_input_gqa(IOSurfaceRef dst, IOSurfaceRef bwd1_out,
+                                      const float *q, const float *k) {
+    IOSurfaceLock(dst, 0, NULL);
+    IOSurfaceLock(bwd1_out, kIOSurfaceLockReadOnly, NULL);
+    _Float16 *db = (_Float16*)IOSurfaceGetBaseAddress(dst);
+    _Float16 *sb = (_Float16*)IOSurfaceGetBaseAddress(bwd1_out);
+    memcpy(db, sb + Q_DIM * SEQ, 2 * SCORE_CH * SEQ * sizeof(_Float16));
+    cvt_f32_f16(db + 2 * SCORE_CH * SEQ, q, Q_DIM * SEQ);
+    cvt_gqa_kv_f32_to_f16_tiled(db + (2 * SCORE_CH + Q_DIM) * SEQ, k, SEQ);
+    IOSurfaceUnlock(bwd1_out, kIOSurfaceLockReadOnly, NULL);
+    IOSurfaceUnlock(dst, 0, NULL);
+}
+
+static void read_sdpa_bwd_outputs_gqa(IOSurfaceRef bwd2_out, IOSurfaceRef bwd1_out,
+                                      float *dq, float *dk, float *dv) {
+    IOSurfaceLock(bwd2_out, kIOSurfaceLockReadOnly, NULL);
+    IOSurfaceLock(bwd1_out, kIOSurfaceLockReadOnly, NULL);
+    _Float16 *b2 = (_Float16*)IOSurfaceGetBaseAddress(bwd2_out);
+    _Float16 *b1 = (_Float16*)IOSurfaceGetBaseAddress(bwd1_out);
+    cvt_f16_f32(dq, b2, Q_DIM * SEQ);
+    reduce_gqa_fp16_to_f32(dk, b2 + Q_DIM * SEQ, SEQ);
+    reduce_gqa_fp16_to_f32(dv, b1, SEQ);
+    IOSurfaceUnlock(bwd1_out, kIOSurfaceLockReadOnly, NULL);
+    IOSurfaceUnlock(bwd2_out, kIOSurfaceLockReadOnly, NULL);
+}
+
+static void read_sdpa_bwd_fused_outputs_gqa(IOSurfaceRef s,
+                                            float *dq, float *dk, float *dv) {
+    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
+    _Float16 *buf = (_Float16*)IOSurfaceGetBaseAddress(s);
+    cvt_f16_f32(dq, buf, Q_DIM * SEQ);
+    reduce_gqa_fp16_to_f32(dk, buf + Q_DIM * SEQ, SEQ);
+    reduce_gqa_fp16_to_f32(dv, buf + 2 * Q_DIM * SEQ, SEQ);
+    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+}
 
 // Free per-layer surfaces and requests
 static void free_per_layer(PerLayerSurfaces *pls, PerLayerRequests *plr) {

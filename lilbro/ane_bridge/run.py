@@ -116,12 +116,13 @@ def train_argv(
 def build(cfg: Config, *, quiet: bool = True) -> Path:
     """Emit ``cfg``'s C header and build the trainer for it. Returns the binary.
 
-    Re-emitting the header bumps its mtime, so ``make`` rebuilds whenever the
-    shape changed and is a near-instant no-op when it didn't.
+    The output binary is always ``training_dynamic/train`` while ``MODEL=`` can
+    point at different generated headers in the same Python process. Force make
+    to rebuild so a fast sd_base -> sd_gqa2 switch cannot reuse a stale shape.
     """
     write_c_header(cfg, MODELS_DIR)
     proc = subprocess.run(
-        ["make", f"MODEL={model_name(cfg)}"], cwd=TRAIN_DIR,
+        ["make", "-B", f"MODEL={model_name(cfg)}"], cwd=TRAIN_DIR,
         capture_output=quiet, text=True)
     if proc.returncode != 0:
         out = (proc.stdout or "") + (proc.stderr or "") if quiet else ""
