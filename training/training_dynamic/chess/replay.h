@@ -28,6 +28,7 @@ typedef struct {
     int      policy_idx[REPLAY_MAX_POLICY];   // dense policy index per entry (chess_move_to_index)
     float    policy_p[REPLAY_MAX_POLICY];     // target prob per entry (sums to 1 over entries)
     float    z;                               // game outcome in [-1,1], stm perspective
+    float    z_nstep;                         // TD(lambda) value target in [-1,1], stm perspective (== z at lambda=1)
 } ReplaySample;
 
 // A fixed-capacity sliding window: the buffer always retains the most-recent `capacity`

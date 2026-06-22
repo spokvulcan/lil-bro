@@ -175,11 +175,12 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
         // dense policy target from the sparse sample
         memset(tgt_pol, 0, sizeof tgt_pol);
         for (int e = 0; e < batch[k]->n_policy; e++) tgt_pol[batch[k]->policy_idx[e]] = batch[k]->policy_p[e];
-        // WDL one-hot from z (self-play emits z in {-1,0,+1}: mate / draw)
-        float z = batch[k]->z, tgt_val[NWDL];
-        tgt_val[0] = (z >  0.5f) ? 1.0f : 0.0f;
-        tgt_val[2] = (z < -0.5f) ? 1.0f : 0.0f;
-        tgt_val[1] = 1.0f - tgt_val[0] - tgt_val[2];
+        float v = batch[k]->z_nstep, tgt_val[NWDL];
+        float tw = v > 0.0f ? v : 0.0f;
+        float tl = v < 0.0f ? -v : 0.0f;
+        tgt_val[0] = tw;
+        tgt_val[2] = tl;
+        tgt_val[1] = 1.0f - tw - tl;
         lp += chess_policy_loss(L->x_final + (size_t)k*SEQ, L->net->W_pol, DIM, S, NBOARD, PLANES,
                                 mask, tgt_pol, L->dx_final + (size_t)k*SEQ, L->grads->W_pol);
         lv += chess_value_loss(L->x_final + (size_t)k*SEQ, L->net->W_val, DIM, S, NREAL, NWDL,
@@ -306,7 +307,7 @@ static void run_bench(NetEvalCtx *evctx, const BatchedChessEvaluator *bev, const
     SPConfig warm = *cfg;
     warm.B = 1; warm.sims = 1; warm.considered = 1; warm.max_plies = 1; warm.bench_games = 1;
     GenStats warm_gs = {0};
-    play_selfplay_batch(bev, &rb, &warm, cfg->seed ^ 0xA11CE5ull, &warm_gs);
+    play_selfplay_batch(bev, NULL, &rb, &warm, cfg->seed ^ 0xA11CE5ull, &warm_gs);
 
     net_eval_profile_reset(evctx);
     mcts_profile_reset();
@@ -316,7 +317,7 @@ static void run_bench(NetEvalCtx *evctx, const BatchedChessEvaluator *bev, const
     while (gs.games < cfg->bench_games) {
         int remain = cfg->bench_games - (int)gs.games;
         bc.B = remain < cfg->B ? remain : cfg->B;
-        play_selfplay_batch(bev, &rb, &bc, cfg->seed + (uint64_t)batch*7919u, &gs);
+        play_selfplay_batch(bev, NULL, &rb, &bc, cfg->seed + (uint64_t)batch*7919u, &gs);
         batch++;
     }
     double wall_s = tb_ms(mach_absolute_time() - t0) * 1e-3;
@@ -426,8 +427,8 @@ int main(int argc, char **argv) {
         printf("# replay=%d lbatch=%d lsteps=%d iters=%d lr=%g vw=%g dir(a=%g,f=%g) temp=%g/%d max_plies=%d seed=%llu\n",
                 cfg.replay_cap, cfg.learner_batch, cfg.learner_steps, cfg.iters, cfg.lr, cfg.value_weight,
                 cfg.dir_alpha, cfg.dir_frac, cfg.temp, cfg.temp_moves, cfg.max_plies, (unsigned long long)cfg.seed);
-        printf("# warmup: iters=%d frac=%g  adjudicate=%d curriculum=%d\n",
-                cfg.warmup_iters, (double)cfg.warmup_frac, cfg.adjudicate, cfg.curriculum);
+        printf("# warmup: iters=%d frac=%g  adjudicate=%d curriculum=%d  td_lambda=%g\n",
+                cfg.warmup_iters, (double)cfg.warmup_frac, cfg.adjudicate, cfg.curriculum, (double)cfg.td_lambda);
 
         // ---- the ONE net + grads + AdamW registry (the single ANE client) ----
         ChessNet net, grads;
@@ -485,7 +486,7 @@ int main(int argc, char **argv) {
                     frac = cfg.warmup_frac * (float)(cfg.warmup_iters - it > 0 ? (cfg.warmup_iters - it) : 0) / (float)cfg.warmup_iters;
                 if (frac > 0.0f) { warm = make_warmup_evaluator(&bev, frac); gen_bev = warm; }
                 uint64_t _tg = prof ? mach_absolute_time() : 0;
-                play_selfplay_batch(&gen_bev, &rb, &cfg, cfg.seed + (uint64_t)it*7919u, &gs);
+                play_selfplay_batch(&gen_bev, frac > 0.0f ? &bev : NULL, &rb, &cfg, cfg.seed + (uint64_t)it*7919u, &gs);
                 if (prof) { it_gen = mt_s(mach_absolute_time() - _tg); tot_gen += it_gen; }
                 if (frac > 0.0f) warmup_evaluator_free(&warm);
                 if (replay_count(&rb) >= cfg.learner_batch) {
