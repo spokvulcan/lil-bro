@@ -128,7 +128,7 @@ g2: train_selfplay
 	./train_selfplay --g2 $(G2ARGS)
 
 clean:
-	rm -f train probe_chess train_chess train_selfplay \
+	rm -f train probe_chess probe_mps probe_mps_graph train_chess train_selfplay \
 	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay chess/test_selfplay
 
 FORCE:

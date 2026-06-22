@@ -20,6 +20,10 @@ training/training_dynamic/models/gen_*.h
 training/training_dynamic/probe_rms
 training/training_dynamic/probe_chess
 
+# GPU/MPS probe build artifacts (Phase 1 & 2 tracer bullets)
+training/training_dynamic/probe_mps
+training/training_dynamic/probe_mps_graph
+
 # Chess engine build artifacts (build-step 1 & 2, ADR 0005)
 training/training_dynamic/chess/perft
 training/training_dynamic/chess/test_chess
