@@ -161,8 +161,11 @@ typedef struct { int ic, oc, seq; __strong MPSMatrixMultiplication *kern; } MpsK
 static MpsKernEntry g_mps_kerns[256];
 static int g_nmps_kerns = 0;
 
+#ifndef MPS_BUF_CACHE_MAX
+#define MPS_BUF_CACHE_MAX (64 + 24 * NLAYERS)
+#endif
 typedef struct { const void *ptr; size_t bytes; __strong id<MTLBuffer> buf; int zero_copy; } MpsBufEntry;
-static MpsBufEntry g_mps_bufs[128];
+static MpsBufEntry g_mps_bufs[MPS_BUF_CACHE_MAX];
 static int g_nmps_bufs = 0;
 
 static void mps_init(void) {
