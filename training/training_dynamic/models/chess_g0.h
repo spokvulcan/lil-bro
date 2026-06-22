@@ -1,7 +1,7 @@
 // chess_g0.h — hand-written tiny chess policy/value net config (NOT generated).
 //
 // Build-step 2 of the chess-RL-on-ANE build order (ADR 0005, issue #16). This is
-// the smallest net that makes the G0 overfit gate fast: a 2-layer MHA transformer
+// the current chess smoke net: a 6-layer MHA transformer
 // trunk at chess shapes (seq 77 -> 96 padded, ADR 0005 decision 5). Scale here is
 // for *correctness* (overfit one position), not strength (ADR 0005 decision 12:
 // the optional ~2-5M proof-of-life, not r2_small).
@@ -24,7 +24,7 @@
 #define Q_DIM (HEADS * HD)
 #define KV_DIM (KV_HEADS * HD)
 #define SEQ 96                // CHESS_PAD_TOKENS (77 real chess tokens, mult-of-32 pad)
-#define NLAYERS 2
+#define NLAYERS 6
 #define VOCAB 38              // CHESS_VOCAB (chess.h)
 
 #define CKPT_PATH "ane_chess_g0_ckpt.bin"   // unused by train_chess (G0 is in-memory)
