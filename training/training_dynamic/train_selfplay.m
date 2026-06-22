@@ -353,9 +353,17 @@ int main(int argc, char **argv) {
         printf("# chess self-play (%s) — DIM=%d HIDDEN=%d L=%d SEQ=%d  | B=%d sims=%d considered=%d\n",
                mode == 3 ? "bench" : (mode == 2 ? "selfcheck" : (mode == 1 ? "G2" : "smoke")),
                DIM, HIDDEN, NLAYERS, SEQ, cfg.B, cfg.sims, cfg.considered);
+        // Cold-start mitigation (ADR 0005 dec 8, MEASURED-triggered): adjudicate capped games
+        // by material so the value head gets a decisive signal when weak self-play never reaches
+        // mate (the smoke runs showed 0/32 decisive games without it -> loss_val collapses to 0).
+        // TRAINING-ONLY: the eval ladder always scores real outcomes (a capped eval game is a
+        // draw). Default ON for smoke/G2; --no-adjudicate (via the flag) keeps the ablation path.
+        if (cfg.adjudicate == 0 && (mode == 1 || mode == 0)) cfg.adjudicate = 1;
         printf("# replay=%d lbatch=%d lsteps=%d iters=%d lr=%g vw=%g dir(a=%g,f=%g) temp=%g/%d max_plies=%d seed=%llu\n",
-               cfg.replay_cap, cfg.learner_batch, cfg.learner_steps, cfg.iters, cfg.lr, cfg.value_weight,
-               cfg.dir_alpha, cfg.dir_frac, cfg.temp, cfg.temp_moves, cfg.max_plies, (unsigned long long)cfg.seed);
+                cfg.replay_cap, cfg.learner_batch, cfg.learner_steps, cfg.iters, cfg.lr, cfg.value_weight,
+                cfg.dir_alpha, cfg.dir_frac, cfg.temp, cfg.temp_moves, cfg.max_plies, (unsigned long long)cfg.seed);
+        printf("# warmup: iters=%d frac=%g  adjudicate=%d curriculum=%d\n",
+                cfg.warmup_iters, (double)cfg.warmup_frac, cfg.adjudicate, cfg.curriculum);
 
         // ---- the ONE net + grads + AdamW registry (the single ANE client) ----
         ChessNet net, grads;
@@ -396,7 +404,19 @@ int main(int argc, char **argv) {
         for (int it = 0; it <= iters; it++) {
             float lp = 0, lv = 0; GenStats gs = {0,0,0,0,0};
             if (it > 0) {
-                play_selfplay_batch(&bev, &rb, &cfg, cfg.seed + (uint64_t)it*7919u, &gs);
+                // Warmup value-prior: blend the net's leaf value with a material heuristic for
+                // iter < warmup_iters, linearly decaying to 0 (purist-Zero resumes after warmup).
+                // GENERATION ONLY: the eval ladder below uses the pure net (bev) so the win-rate
+                // measures the net's TRUE strength, not the warmup-boosted search. A search prior,
+                // not labels — the priors are the net's own. [dec 8 fallback, MEASURED-triggered]
+                BatchedChessEvaluator gen_bev = bev;
+                BatchedChessEvaluator warm = bev;
+                float frac = 0.0f;
+                if (cfg.warmup_iters > 0 && cfg.warmup_frac > 0.0f)
+                    frac = cfg.warmup_frac * (float)(cfg.warmup_iters - it > 0 ? (cfg.warmup_iters - it) : 0) / (float)cfg.warmup_iters;
+                if (frac > 0.0f) { warm = make_warmup_evaluator(&bev, frac); gen_bev = warm; }
+                play_selfplay_batch(&gen_bev, &rb, &cfg, cfg.seed + (uint64_t)it*7919u, &gs);
+                if (frac > 0.0f) warmup_evaluator_free(&warm);
                 if (replay_count(&rb) >= cfg.learner_batch)
                     for (int s = 0; s < cfg.learner_steps; s++) { float a,b; learner_step(&L, &rb, &cfg, ++adam_t, &a, &b); lp = a; lv = b; }
                 // fail-fast on fp16 gradient overflow: a NaN/inf loss means the trunk diverged

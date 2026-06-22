@@ -15,6 +15,7 @@ SPConfig sp_defaults(void) {
     c.dir_alpha = 0.3f; c.dir_frac = 0.25f;
     c.temp = 1.0f; c.temp_moves = 15; c.max_plies = 100;
     c.use_improved_policy = 1; c.curriculum = 0; c.curriculum_plies = 8; c.adjudicate = 0;
+    c.warmup_iters = 20; c.warmup_frac = 1.0f;   // cold-start value-prior warmup: ON by default (dec 8 fallback)
     c.replay_cap = 30000; c.learner_batch = 64; c.learner_steps = 16; c.iters = 60;
     c.lr = 2e-3f; c.loss_scale = 256.0f; c.grad_clip = 1.0f; c.wd = 0.0f; c.value_weight = 1.0f;
     c.eval_games = 40; c.eval_every = 5; c.eval_sims = 32; c.eval_considered = 16; c.eval_max_plies = 120;
@@ -34,6 +35,8 @@ SPConfig sp_parse(int argc, char **argv, int *mode) {
         else if (!strcmp(argv[i], "--resume"))     c.resume = 1;
         else if (!strcmp(argv[i], "--curriculum")) c.curriculum = 1;
         else if (!strcmp(argv[i], "--adjudicate")) c.adjudicate = 1;
+        else if (!strcmp(argv[i], "--no-adjudicate")) c.adjudicate = 0;
+        else if (!strcmp(argv[i], "--no-warmup"))  { c.warmup_iters = 0; c.warmup_frac = 0.0f; }
         else if (!strcmp(argv[i], "--visit-policy")) c.use_improved_policy = 0;
         else if (!strcmp(argv[i], "--ckpt") && i+1<argc) c.ckpt = argv[++i];
         else if (!strcmp(argv[i], "--seed") && i+1<argc) c.seed = (uint64_t)strtoull(argv[++i], NULL, 10);
@@ -45,6 +48,7 @@ SPConfig sp_parse(int argc, char **argv, int *mode) {
         ARGF("--dir-alpha", dir_alpha); ARGF("--dir-frac", dir_frac);
         ARGF("--temp", temp); ARGI("--temp-moves", temp_moves); ARGI("--max-plies", max_plies);
         ARGI("--curriculum-plies", curriculum_plies);
+        ARGI("--warmup-iters", warmup_iters); ARGF("--warmup-frac", warmup_frac);
         ARGI("--eval-games", eval_games); ARGI("--eval-every", eval_every);
         ARGI("--eval-sims", eval_sims); ARGI("--eval-considered", eval_considered);
         ARGI("--eval-max-plies", eval_max_plies);
@@ -318,4 +322,38 @@ double eval_vs_opponent(const BatchedChessEvaluator *bev, const SPConfig *cfg,
     if (W) *W = w; if (D) *D = d; if (Lo) *Lo = l;
     free(g); free(roots); free(cfgs); free(idx); free(res);
     return ((double)w + 0.5*(double)d) / (double)n_games;
+}
+
+// ============================================================================
+// Warmup value-prior wrapper (ADR 0005 decision 8 fallback, MEASURED-triggered).
+// See selfplay.h for the contract. Blends the inner evaluator's leaf VALUE with a
+// material heuristic (the G1 oracle's value: 0.9*tanh(material_diff/5)), leaving the
+// priors untouched. A search prior, not labels. The wrapper owns a small context (the
+// inner pointer + frac); warmup_evaluator_free releases it.
+// ============================================================================
+typedef struct { const BatchedChessEvaluator *inner; float frac; } WarmupCtx;
+
+static void warmup_evaluate(void *ctx, const Position *const *pos, int B,
+                            const Move *const *legal, const int *n_legal,
+                            float *const *priors, float *value) {
+    WarmupCtx *w = (WarmupCtx*)ctx;
+    w->inner->evaluate(w->inner->ctx, pos, B, legal, n_legal, priors, value);
+    if (w->frac <= 0.0f) return;                  // frac=0: pure net (the steady state)
+    float f = w->frac;
+    for (int b = 0; b < B; b++) {
+        float mat_v = 0.9f * tanhf((float)chess_material_diff(pos[b]) / 5.0f);
+        value[b] = (1.0f - f) * value[b] + f * mat_v;
+    }
+}
+
+BatchedChessEvaluator make_warmup_evaluator(const BatchedChessEvaluator *inner, float frac) {
+    BatchedChessEvaluator out;
+    WarmupCtx *w = (WarmupCtx*)malloc(sizeof(WarmupCtx));
+    w->inner = inner; w->frac = frac;
+    out.ctx = w; out.evaluate = warmup_evaluate;
+    return out;
+}
+
+void warmup_evaluator_free(BatchedChessEvaluator *w) {
+    if (w && w->ctx) { free(w->ctx); w->ctx = NULL; }
 }

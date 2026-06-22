@@ -46,11 +46,18 @@ typedef struct {
     int      use_improved_policy;          // 1 = Gumbel improved-policy target (default), 0 = visits
     int      curriculum, curriculum_plies; // default-OFF random-opening fallback (dec 8)
     int      adjudicate;                    // default-OFF cold-start mitigation: label a game that
-                                            // hits the ply/50-move cap by MATERIAL (+-1 if a side is
-                                            // up >= SP_ADJ_THRESH pawns, else draw) instead of a flat
-                                            // draw, so the value head gets a signal when weak self-play
-                                            // never reaches mate. TRAINING-ONLY: the eval ladder always
-                                            // scores real game outcomes (a capped eval game is a draw).
+                                             // hits the ply/50-move cap by MATERIAL (+-1 if a side is
+                                             // up >= SP_ADJ_THRESH pawns, else draw) instead of a flat
+                                             // draw, so the value head gets a signal when weak self-play
+                                             // never reaches mate. TRAINING-ONLY: the eval ladder always
+                                             // scores real game outcomes (a capped eval game is a draw).
+    int      warmup_iters;                  // cold-start value-prior warmup (dec 8 fallback, MEASURED-
+    float    warmup_frac;                   // triggered): for iter < warmup_iters, blend the net's leaf
+                                             // value with a material heuristic at frac = warmup_frac *
+                                             // max(0, 1 - iter/warmup_iters) (linear decay to 0). A
+                                             // SEARCH PRIOR (like Dirichlet), not labels. 0 = purist-Zero
+                                             // (the steady state). Default ON: the cold-start desert is
+                                             // measured-real (loss_pol sticks at ln(n_legal) without it).
     // replay + learner (train_selfplay.m)
     int      replay_cap, learner_batch, learner_steps, iters;
     float    lr, loss_scale, grad_clip, wd, value_weight;
@@ -104,5 +111,16 @@ void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
 // /temperature) at cfg->eval_sims.
 double eval_vs_opponent(const BatchedChessEvaluator *bev, const SPConfig *cfg,
                         OpponentFn opp, int n_games, uint64_t seed, int *W, int *D, int *Lo);
+
+// Warmup value-prior wrapper (ADR 0005 decision 8 fallback, MEASURED-triggered): returns a
+// BatchedChessEvaluator that wraps `inner` and blends the leaf VALUE with a material
+// heuristic: value_out = (1-frac)*inner.value + frac * 0.9*tanh(material_diff/5). The PRIORS
+// pass through unchanged (purist-Zero: the net's own policy stays the search prior; the value
+// prior just gives MCTS a signal to sharpen the policy against at cold start, where the net's
+// value is random). frac in [0,1]: 0 = pure net (purist-Zero, the steady state), 1 = pure
+// material heuristic (the G1 oracle's value). This is a SEARCH PRIOR (like Dirichlet root
+// noise), NOT external labels — no imitation, no Stockfish. Free with warmup_evaluator_free.
+BatchedChessEvaluator make_warmup_evaluator(const BatchedChessEvaluator *inner, float frac);
+void warmup_evaluator_free(BatchedChessEvaluator *w);
 
 #endif  // LILBRO_CHESS_SELFPLAY_H

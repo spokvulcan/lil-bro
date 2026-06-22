@@ -196,6 +196,76 @@ static void test_eval(void) {
     printf("   vs greedy: W/D/L = %d/%d/%d  score=%.3f\n\n", gw, gd, gl, sg);
 }
 
+// ---- 7. warmup value-prior wrapper: blends net value with a material heuristic ----
+// The G2 cold-start fix (ADR 0005 decision 8 fallback, measured-triggered). At cold start
+// the net's value is random, so MCTS can't sharpen the policy prior into a useful target
+// (loss_pol sticks at the ln(n_legal) entropy floor). The wrapper blends the net's value
+// with a material heuristic for the first warmup_iters, giving MCTS a signal to sharpen
+// against — a SEARCH PRIOR (like Dirichlet root noise), not external labels. Priors are
+// untouched (purist-Zero: the net's own policy stays the prior). Verified here with the
+// deterministic oracle standing in for the net, so the blend math is proven without the ANE.
+static void test_warmup_value_prior(void) {
+    printf("## warmup value-prior: blends net value with material heuristic; priors untouched\n");
+    // Use the oracle as the "net" (material value + uniform priors): blending it with the
+    // SAME material heuristic at frac=1.0 must reproduce the oracle value exactly; at frac=0.0
+    // it must pass the oracle value through unchanged; priors must always match the oracle's.
+    BatchedChessEvaluator inner = chess_oracle_batched_evaluator();
+    Position pos[4];
+    chess_startpos(&pos[0]);
+    // a few distinct positions: short random walks
+    uint64_t rr = 4242;
+    for (int b = 1; b < 4; b++) {
+        chess_startpos(&pos[b]);
+        int steps = b * 3;
+        for (int s = 0; s < steps; s++) { Move mv[MAX_MOVES]; int n = chess_legal_moves(&pos[b], mv);
+            if (n == 0) { chess_startpos(&pos[b]); break; } Undo u; chess_make(&pos[b], mv[sm_below(&rr, n)], &u); }
+    }
+    const Position *pp[4]; const Move *lp[4]; int nl[4]; float *prp[4]; float val[4];
+    static Move leg[4][MAX_MOVES]; static float pri[4][MAX_MOVES];
+    for (int b = 0; b < 4; b++) { nl[b] = chess_legal_moves(&pos[b], leg[b]); pp[b] = &pos[b]; lp[b] = leg[b]; prp[b] = pri[b]; }
+
+    // reference: the inner oracle's values + priors
+    float val_ref[4]; float pri_ref[4][MAX_MOVES]; float *prp_ref[4] = { pri_ref[0], pri_ref[1], pri_ref[2], pri_ref[3] };
+    inner.evaluate(inner.ctx, pp, 4, lp, nl, prp_ref, val_ref);
+
+    // frac = 0.0 -> value passes through (blend is a no-op)
+    BatchedChessEvaluator w0 = make_warmup_evaluator(&inner, 0.0f);
+    float val0[4]; float pri0[4][MAX_MOVES]; float *prp0[4] = { pri0[0], pri0[1], pri0[2], pri0[3] };
+    w0.evaluate(w0.ctx, pp, 4, lp, nl, prp0, val0);
+    for (int b = 0; b < 4; b++) {
+        CHECK(fabs(val0[b] - val_ref[b]) < 1e-5, "warmup frac=0: value changed (b=%d %.4f vs %.4f)", b, val0[b], val_ref[b]);
+        for (int a = 0; a < nl[b]; a++) CHECK(fabs(pri0[b][a] - pri_ref[b][a]) < 1e-6, "warmup frac=0: prior changed");
+    }
+
+    // frac = 1.0 -> value == pure material heuristic (0.9*tanh(material/5)); priors unchanged
+    BatchedChessEvaluator w1 = make_warmup_evaluator(&inner, 1.0f);
+    float val1[4]; float pri1[4][MAX_MOVES]; float *prp1[4] = { pri1[0], pri1[1], pri1[2], pri1[3] };
+    w1.evaluate(w1.ctx, pp, 4, lp, nl, prp1, val1);
+    for (int b = 0; b < 4; b++) {
+        float mat_v = 0.9f * tanhf((float)chess_material_diff(&pos[b]) / 5.0f);
+        CHECK(fabs(val1[b] - mat_v) < 1e-5, "warmup frac=1: value != material heuristic (b=%d %.4f vs %.4f)", b, val1[b], mat_v);
+        for (int a = 0; a < nl[b]; a++) CHECK(fabs(pri1[b][a] - pri_ref[b][a]) < 1e-6, "warmup frac=1: prior changed");
+    }
+
+    // frac = 0.5 -> value == 0.5*net + 0.5*material (the blend); priors unchanged
+    BatchedChessEvaluator wh = make_warmup_evaluator(&inner, 0.5f);
+    float valh[4]; float prih[4][MAX_MOVES]; float *prph[4] = { prih[0], prih[1], prih[2], prih[3] };
+    wh.evaluate(wh.ctx, pp, 4, lp, nl, prph, valh);
+    for (int b = 0; b < 4; b++) {
+        float mat_v = 0.9f * tanhf((float)chess_material_diff(&pos[b]) / 5.0f);
+        float expect = 0.5f * val_ref[b] + 0.5f * mat_v;
+        CHECK(fabs(valh[b] - expect) < 1e-5, "warmup frac=0.5: value != blend (b=%d %.4f vs %.4f)", b, valh[b], expect);
+        for (int a = 0; a < nl[b]; a++) CHECK(fabs(prih[b][a] - pri_ref[b][a]) < 1e-6, "warmup frac=0.5: prior changed");
+    }
+
+    // value stays in [-1, 1] for all frac (the [-0.9, 0.9] material range + [-1,1] net range)
+    CHECK(val0[0] >= -1.0001f && val0[0] <= 1.0001f, "warmup: value out of [-1,1]");
+    CHECK(val1[0] >= -1.0001f && val1[0] <= 1.0001f, "warmup: value out of [-1,1]");
+
+    warmup_evaluator_free(&w0); warmup_evaluator_free(&w1); warmup_evaluator_free(&wh);
+    printf("   ok (frac 0/0.5/1.0 verified; priors always = inner; values in [-1,1])\n\n");
+}
+
 int main(void) {
     chess_init();
     printf("# test_selfplay — oracle-driven TDD for the self-play orchestration (no ANE)\n\n");
@@ -204,6 +274,7 @@ int main(void) {
     test_generation();
     test_z_labeling();
     test_eval();
+    test_warmup_value_prior();
     if (g_fail) { printf("*** test_selfplay: FAILURES ***\n"); return 1; }
     printf("# test_selfplay: ALL TESTS PASSED\n");
     return 0;
