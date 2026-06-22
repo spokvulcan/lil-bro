@@ -20,6 +20,13 @@ train: FORCE train.m config.h io.h cpu_ops.h mil_dynamic.h $(MODEL_HDR)
 probe_chess: probe_chess.m config.h io.h mil_dynamic.h models/gen_r2_small.h
 	$(CC) $(CFLAGS) $(EXTRA) -include models/gen_r2_small.h -o probe_chess probe_chess.m
 
+# GPU/MPS tracer bullet (issue #18 frontier): measures MPSMatrixMultiplication
+# vs the ANE dispatch floor at the real chess matmul shapes. Standalone — no
+# config.h deps (dims are #defined in the probe). Links Metal + MPS frameworks.
+probe_mps: probe_mps.m
+	$(CC) $(CFLAGS) -framework Metal -framework MetalPerformanceShaders \
+	  -framework MetalPerformanceShadersGraph -o probe_mps probe_mps.m
+
 # Chess bitboard engine (build-step 1, ADR 0005, issue #15). Pure C, ZERO deps:
 # no model header, no ANE/Foundation/Accelerate frameworks. perft is the gate.
 CHESS_CFLAGS = -O2 -Wall -Wextra -std=c11 -isysroot $(shell xcrun --show-sdk-path)
