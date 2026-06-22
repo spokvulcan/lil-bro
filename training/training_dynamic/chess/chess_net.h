@@ -539,6 +539,7 @@ static void attn_cpu_backward_batched(const float *da, const float *Q, const flo
             }
             memset(dkt, 0, (size_t)tn*4);
             memset(dvt, 0, (size_t)tn*4);
+            memset(dqt, 0, (size_t)tn*4);
             for (int q = 0; q < seqp; q++) {
                 const float *qr = qt + (size_t)q*HD;
                 const float *dar = dat + (size_t)q*HD;
@@ -583,23 +584,21 @@ static void attn_cpu_backward_batched(const float *da, const float *Q, const flo
                     dp[j] = vaddvq_f32(vaddq_f32(a0, a1));
                 }
                 float g = 0; for (int j = 0; j <= q; j++) g += p[j]*dp[j];
-                // dqt[q] = sum_j dscore[j] * kt[j]  (NEON reduction into o0/o1);
+                // dqt[q] += dscore[j] * kt[j]  (NEON fmla, accumulates over j into q's row);
                 // dkt[j] += dscore[j] * qt[q]  (NEON fmla, accumulates across q)
-                float32x4_t o0 = vdupq_n_f32(0.0f), o1 = vdupq_n_f32(0.0f);
+                float *dqrr = dqt + (size_t)q*HD;
                 for (int j = 0; j <= q; j++) {
                     float dscore = p[j]*(dp[j]-g)*scale;
                     const float *kr = kt + (size_t)j*HD;
                     float *dkrr = dkt + (size_t)j*HD;
                     float32x4_t ds = vdupq_n_f32(dscore);
                     for (int d = 0; d < HD; d += 8) {
-                        o0 = vmlaq_f32(o0, ds, vld1q_f32(kr + d));
-                        o1 = vmlaq_f32(o1, ds, vld1q_f32(kr + d + 4));
+                        vst1q_f32(dqrr + d,     vmlaq_f32(vld1q_f32(dqrr + d),     ds, vld1q_f32(kr + d)));
+                        vst1q_f32(dqrr + d + 4, vmlaq_f32(vld1q_f32(dqrr + d + 4), ds, vld1q_f32(kr + d + 4)));
                         vst1q_f32(dkrr + d,     vmlaq_f32(vld1q_f32(dkrr + d),     ds, vld1q_f32(qr + d)));
                         vst1q_f32(dkrr + d + 4, vmlaq_f32(vld1q_f32(dkrr + d + 4), ds, vld1q_f32(qr + d + 4)));
                     }
                 }
-                vst1q_f32(dqt + (size_t)q*HD, o0);
-                vst1q_f32(dqt + (size_t)q*HD + 4, o1);
             }
             // scatter-add the per-(b,h) tiles back to the [HD, S] strided grads (disjoint b cols;
             // GQA: multiple h serially scatter-add to the same kvh region within a b -> correct)

@@ -29,6 +29,7 @@ training/training_dynamic/probe_autodiff
 training/training_dynamic/chess/perft
 training/training_dynamic/chess/test_chess
 training/training_dynamic/chess/test_heads
+training/training_dynamic/test_trunk_attn
 
 # Chess Gumbel-MCTS build artifacts (build-step 3, ADR 0005, issue #17)
 training/training_dynamic/chess/test_mcts
