@@ -47,6 +47,15 @@ legal-move generation, the game environment, the replay buffer — plus the exis
 (dW, optimizer, loss). "In parallel" = batching many games' MCTS leaf positions into one ANE
 forward.
 
+**GPU iteration path** (vs *ANE thesis path*):
+The MPSGraph fp32 forward+backward learner path used for fast iteration — ~10x faster than the
+ANE/CPU learner path, and the path all G2-learning-quality work runs on. The ANE forward path
+stays as a **non-default compile option** so the "ANE can train" thesis (ADR 0001/0004/0005)
+stays documented and buildable. The GPU port subsumes the backward NaN fix by construction
+(fp32 rsqrt vs the CPU `rmsnorm_bwd` `vvrsqrtf` overflow), recasting QK-norm/SwiGLU-clamp as
+V4-fidelity ablations on a stable base, not bug-fixes ([ADR 0006](../adr/0006-g2-learning-quality-gpu-path.md)).
+_Avoid_: "the GPU path" unqualified — it hides that the ANE thesis path is deliberately retained.
+
 **V4-inspired** (chess scope):
 The V4 ideas that transfer to a *small, short-context* net — **Muon** (the proven winner) and
 the cheap stabilizers (qk-norm / attn-sink / swiglu-clamp / partial-RoPE), plus a deliberate
