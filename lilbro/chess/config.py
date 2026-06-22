@@ -73,6 +73,10 @@ class ChessConfig:
     seed: int = 42               # deterministic RNG seed (-> --seed)
     ckpt: str = ""               # checkpoint path (-> --ckpt; default -> ane_<name>.ckpt)
 
+    # --- backend (GPU/MPS rewrite, Phase 2) ---
+    use_mps_graph: bool = False  # --mps-graph: route the whole trunk forward through one MPSGraph
+                                  # (5.3-6.0x vs ANE+CPU on M3 Max; eval-only — the learner stays on ANE)
+
     def __post_init__(self) -> None:
         if not self.ckpt:
             object.__setattr__(self, "ckpt", f"ane_chess_{self.name}.ckpt")
@@ -135,6 +139,8 @@ class ChessConfig:
             argv += ["--curriculum", "--curriculum-plies", str(self.curriculum_plies)]
         if self.adjudicate:
             argv.append("--adjudicate")
+        if self.use_mps_graph:
+            argv.append("--mps-graph")
         return argv
 
 

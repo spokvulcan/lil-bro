@@ -22,6 +22,7 @@ SPConfig sp_defaults(void) {
     c.bench_games = 256;
     c.profile = 0;
     c.use_mps = 0;
+    c.use_mps_graph = 0;
     c.seed = 42; c.ckpt = "ane_chess_g2_ckpt.bin"; c.resume = 0;
     return c;
 }
@@ -57,6 +58,7 @@ SPConfig sp_parse(int argc, char **argv, int *mode) {
         ARGI("--bench-games", bench_games);
         else if (!strcmp(argv[i], "--profile")) c.profile = 1;
         else if (!strcmp(argv[i], "--mps"))     c.use_mps = 1;
+        else if (!strcmp(argv[i], "--mps-graph")) c.use_mps_graph = 1;
     }
     if (c.B > 160) c.B = 160;   // round32(B)*96 must stay <= 16384; max packed B is 160
     if (c.bench_games < 1) c.bench_games = 1;
