@@ -27,11 +27,29 @@ occasional eval tool, not a continuous dependency. The proof of "genuinely learn
 *monotonic climb* of this curve.
 _Avoid_: implying the day-to-day metric is games-vs-Stockfish (that's the calibration, not the curve).
 
+**capacity ceiling**:
+The strength a *fixed-size* net asymptotes to — the point where self-anchored Elo stops climbing
+even as compute keeps coming. A fixed net does **not** gain capacity by being trained; it converges
+to this ceiling and stops. Always *measured* (Elo-slope → 0 at a fixed net size), never assumed. The
+only legitimate trigger for a growth-ladder rung.
+
+**growth ladder**:
+How "infinite learning" is operationalised: a cycle of *train-to-ceiling → grow capacity →
+train-to-new-ceiling*. The net is grown (net2net widen/deepen, or distil into a bigger student)
+**only** when a capacity ceiling is measured — never pre-emptively. Each rung is gated on evidence;
+"infinite" is the *limit of the ladder*, not a property of any single net or of the training loop.
+_Avoid_: "infinite learning" as a property of the loop — it is a property of the *ladder*, and only with a measured ceiling at each rung.
+
 **search-guided self-play**:
 Self-play where MCTS (Gumbel-AlphaZero, low-simulation) is the *policy-improvement operator*:
 the net plays itself, MCTS sharpens the raw policy into a stronger target, and training
 regresses the policy toward the search visit-distribution and the value toward the game
 outcome. Distinct from search-free policy-gradient self-play (the known-weak path, rejected).
+The operator's *strength* — the search budget actually spent — **bounds** the learning signal:
+a search no deeper than its own considered move-list (e.g. `sims ≤ considered`, where Sequential
+Halving never engages and the tree is a flat 1-ply re-ranking) is a **1-ply teacher**, no stronger
+than the net it teaches, so the flywheel barely turns
+([ADR 0007](../adr/0007-chess-train-for-real-before-redesign.md)).
 _Avoid_: "self-play" unqualified — it hides whether search is in the loop.
 
 **policy/value net**:

@@ -69,6 +69,11 @@ class ChessConfig:
                                  # policy guides a narrow/cheap eval search (decoupled from gen)
     eval_max_plies: int = 120    # per-eval-game ply cap (-> --eval-max-plies)
 
+    # --- self-anchored Elo (ADR 0007: the "infinite-learning" slope metric) ---
+    elo_every: int = 0           # snapshot cadence in iters (-> --elo-every); 0 = off. >0 saves
+                                 # <ckpt>.eloNNN every elo_every iters during --g2 for the round-robin.
+    elo_games: int = 32          # net-vs-net games per pairing in `--elo` (-> --elo-games); even
+
     # --- benchmark harness ---
     bench_games: int = 256        # fixed generated games for --bench (-> --bench-games)
 
@@ -90,9 +95,11 @@ class ChessConfig:
             raise ValueError(f"batch must be in [1,{MAX_BATCH}] (the 16384 ANE wall), got {self.batch}")
         for k in ("sims", "considered", "max_plies", "iters", "learner_batch", "learner_steps",
                   "replay_cap", "eval_games", "eval_sims", "eval_considered", "eval_max_plies",
-                  "bench_games"):
+                  "elo_games", "bench_games"):
             if getattr(self, k) <= 0:
                 raise ValueError(f"{k} must be positive, got {getattr(self, k)}")
+        if self.elo_every < 0:
+            raise ValueError(f"elo_every must be >= 0 (0 = off), got {self.elo_every}")
         # Sequential Halving needs sims >= considered for a non-degenerate schedule. The C
         # search clamps safely either way (mcts_seq_halving floors visits at 1), but a config
         # that asks for more considered actions than it can visit is a footgun — reject it.
@@ -142,6 +149,8 @@ class ChessConfig:
             "--eval-sims", str(self.eval_sims),
             "--eval-considered", str(self.eval_considered),
             "--eval-max-plies", str(self.eval_max_plies),
+            "--elo-every", str(self.elo_every),
+            "--elo-games", str(self.elo_games),
             "--bench-games", str(self.bench_games),
             "--seed", str(self.seed),
             "--ckpt", self.ckpt,
@@ -241,6 +250,33 @@ LADDER: dict[str, ChessConfig] = {
         curriculum=True, curriculum_plies=8, adjudicate=True, value_weight=1.5,
         bench_games=160,
         eval_games=8, eval_sims=1, eval_considered=1, eval_max_plies=20, eval_every=6,
+    ),
+    # ADR 0007 "train it for real" — the first run that FIXES THE DIAGNOSED BUGS, not a
+    # redesign. Three changes vs g2_diag, all "stop running a toy":
+    #   * STRONG TEACHER: gen sims 16->128 with considered=16. At sims<=considered Sequential
+    #     Halving never engages (phase 0 alone eats the budget) -> a 1-ply teacher no stronger
+    #     than the net it trains. 128 sims over 16 considered runs ~3 real SH phases and makes
+    #     mate-in-1 visible (G1: solved <=128). THE lever for faster learning + win conversion.
+    #     (Note: the old g2* presets AND g2_full all have considered==sims == the 1-ply bug.)
+    #   * REAL GAMES: max_plies 20->80 — reach the middlegame/endgame where conversion is
+    #     learned, not 10-move opening fragments (value signal was near-random from ply-20).
+    #   * HIGH REUSE: lsteps 60->150 — each (now ~32x costlier) game drives many more gradient
+    #     updates, amortizing the richer generation.
+    # The MEASUREMENT is un-crippled too: eval sims 8->128, max_plies 50->200, so a net that
+    # learned to convert can actually demonstrate it (the old eval was a 1-ply, 50-ply-capped
+    # search that couldn't). elo_every=8 snapshots the self-anchored Elo slope (the only metric
+    # that can measure "infinite learning"): after the run, `train_selfplay --elo --ckpt <ckpt>
+    # --mps-graph --eval-sims 128 --eval-considered 16 --eval-max-plies 200` prints the curve.
+    # iters / eval_every are a STARTING point for the 2-4h readable-slope budget — measure the
+    # per-iter wall-clock (add --profile) and rebalance (ADR 0007 "Open").
+    "run1": ChessConfig(
+        name="run1", batch=64, sims=128, considered=16, max_plies=80, iters=48,
+        learner_steps=150, learner_batch=96, replay_cap=80000, lr=5e-3, temp_moves=8,
+        curriculum=True, curriculum_plies=8, adjudicate=True, value_weight=1.5,
+        td_lambda=0.5, optimizer="muon", use_mps_graph=True,
+        eval_games=80, eval_sims=128, eval_considered=16, eval_max_plies=200, eval_every=8,
+        elo_every=8, elo_games=32,
+        bench_games=320,
     ),
     # Stronger, slower: more search + more iterations once the loop is proven to learn.
     "g2_full": ChessConfig(

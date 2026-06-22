@@ -28,14 +28,15 @@ REPO = Path(__file__).resolve().parents[2]
 TRAIN_DIR = REPO / "training" / "training_dynamic"
 TRAIN_BIN = TRAIN_DIR / "train_selfplay"
 
-_MODE_FLAG = {"g2": "--g2", "selfcheck": "--selfcheck", "bench": "--bench", "smoke": None}
+_MODE_FLAG = {"g2": "--g2", "selfcheck": "--selfcheck", "bench": "--bench", "elo": "--elo", "smoke": None}
 
 
 def selfplay_argv(cfg: ChessConfig, *, binary: str = "./train_selfplay",
                   mode: str = "g2", resume: bool = False) -> list[str]:
     """Map a ``ChessConfig`` + run mode to the exact ``train_selfplay`` argv. Pure and
     deterministic — the unit-testable seam. ``mode`` is one of ``g2`` (the gate),
-    ``selfcheck`` (batched-forward verification), ``bench`` (generation throughput), or
+    ``selfcheck`` (batched-forward verification), ``bench`` (generation throughput),
+    ``elo`` (self-anchored Elo round-robin over <ckpt>.eloNNN snapshots), or
     ``smoke`` (a short default run)."""
     if mode not in _MODE_FLAG:
         raise ValueError(f"mode must be one of {sorted(_MODE_FLAG)}, got {mode!r}")

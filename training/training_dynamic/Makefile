@@ -143,16 +143,24 @@ chess/test_selfplay: chess/test_selfplay.c chess/selfplay.c chess/selfplay.h che
 test_selfplay: chess/test_selfplay
 	./chess/test_selfplay
 
+# Self-anchored Elo solver gate (ADR 0007): Bradley-Terry MLE recovers a known Elo ladder
+# from a synthetic round-robin. Pure C, no ANE — the fast gate before the --elo round-robin.
+chess/test_elo: chess/test_elo.c chess/elo.c chess/elo.h
+	$(CC) $(CHESS_CFLAGS) -o chess/test_elo chess/test_elo.c chess/elo.c -lm
+
+test_elo: chess/test_elo
+	./chess/test_elo
+
 # Full self-play trainer (generation + replay + learner) on the one ANE client.
 # `make selfplay` builds; the run driver (lilbro/chess/) invokes ./train_selfplay --config ...
 # Links Metal + MPS frameworks for the optional --mps matmul backend (chess_net.h).
 train_selfplay: train_selfplay.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h \
-                chess/chess_net.h chess/selfplay.h chess/replay.h chess/mcts.h chess/chess.h models/chess_g0.h \
-                chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c
+                chess/chess_net.h chess/selfplay.h chess/replay.h chess/mcts.h chess/chess.h chess/elo.h models/chess_g0.h \
+                chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c chess/elo.c
 	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h \
 		-framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
 		-o train_selfplay train_selfplay.m \
-		chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c
+		chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c chess/elo.c
 
 # G2 gate: vectorized self-play whose win-rate climbs vs a fixed random-mover then a weak
 # baseline. `make g2 [G2ARGS=...]` runs the loop's built-in eval harness and exits 0/1.
@@ -163,8 +171,8 @@ g2: train_selfplay
 
 clean:
 	rm -f train probe_chess probe_mps probe_mps_graph probe_autodiff train_chess train_selfplay test_trunk_attn test_chess_optimizer \
-	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay chess/test_selfplay
+	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay chess/test_selfplay chess/test_elo
 
 FORCE:
 
-.PHONY: clean FORCE test_engine test_heads test_trunk_attn test_chess_optimizer g0 test_mcts g1 test_replay test_selfplay selfplay g2
+.PHONY: clean FORCE test_engine test_heads test_trunk_attn test_chess_optimizer g0 test_mcts g1 test_replay test_selfplay test_elo selfplay g2

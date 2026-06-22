@@ -35,6 +35,7 @@
 #include "chess/mcts.h"           // Gumbel-MCTS + the batched lockstep driver (#17/#18)
 #include "chess/replay.h"         // sliding-window replay buffer
 #include "chess/selfplay.h"       // generation + eval ladder + config (evaluator-agnostic)
+#include "chess/elo.h"            // self-anchored Elo: Bradley-Terry MLE (ADR 0007)
 #include <stdio.h>
 #include <string.h>
 
@@ -382,6 +383,78 @@ static void run_bench(NetEvalCtx *evctx, const BatchedChessEvaluator *bev, const
 }
 
 // ============================================================================
+// SELF-ANCHORED ELO (ADR 0007): round-robin the net's own past checkpoints (snapshotted
+// every cfg->elo_every iters during --g2 to <ckpt>.eloNNN) into a relative Elo curve. A
+// fixed greedy bot saturates ~1000 Elo; this measures the "infinite-learning" SLOPE — is
+// the latest net stronger than its past selves? Net-vs-net at the eval search budget
+// (selfplay.c match_net_vs_net), strength fit by Bradley-Terry MLE (chess/elo.c). Snapshot 0
+// (random init) is the anchor at 0 Elo, so a learning loop's curve climbs from 0.
+// ============================================================================
+static int run_elo(SPConfig *cfg) {
+    char path[1200];
+    int K = 0;   // discover contiguous snapshots <ckpt>.elo000, .elo001, ...
+    for (;; K++) {
+        snprintf(path, sizeof path, "%s.elo%03d", cfg->ckpt, K);
+        FILE *f = fopen(path, "rb"); if (!f) break; fclose(f);
+    }
+    if (K < 2) {
+        printf("## [elo] need >=2 snapshots at %s.eloNNN (found %d). Run --g2 with --elo-every>0 first.\n",
+               cfg->ckpt, K);
+        return 1;
+    }
+    int ng = cfg->elo_games & ~1; if (ng < 2) ng = 2;          // even: color-swapped pairs
+    int open_plies = cfg->curriculum_plies > 0 ? cfg->curriculum_plies : 8;
+    printf("## [elo] self-anchored round-robin: %d checkpoints, %d games/pair, eval_sims=%d considered=%d max_plies=%d open_plies=%d\n",
+           K, ng, cfg->eval_sims, cfg->eval_considered, cfg->eval_max_plies, open_plies);
+    fflush(stdout);
+
+    chess_net_init_rmstmp(roundup32(ng)*SEQ);                  // RMSNorm scratch for the match batch
+
+    ChessNet *nets = (ChessNet*)malloc((size_t)K*sizeof(ChessNet));
+    for (int i = 0; i < K; i++) {
+        chess_net_alloc(&nets[i], 0);
+        snprintf(path, sizeof path, "%s.elo%03d", cfg->ckpt, i);
+        if (!chess_net_load(&nets[i], path)) { printf("## [elo] FAILED to load %s\n", path); return 1; }
+        chess_net_build_fused(&nets[i]);
+    }
+    NetEvalCtx evA, evB;
+    net_eval_ctx_alloc(&evA, &nets[0], ng);
+    net_eval_ctx_alloc(&evB, &nets[0], ng);
+
+    double *wins  = (double*)calloc((size_t)K*K, sizeof(double));
+    double *games = (double*)calloc((size_t)K*K, sizeof(double));
+    for (int i = 0; i < K; i++) {
+        for (int j = i+1; j < K; j++) {
+            evA.net = &nets[i]; evB.net = &nets[j];
+            BatchedChessEvaluator bevA = { .ctx = &evA, .evaluate = net_eval_batched };
+            BatchedChessEvaluator bevB = { .ctx = &evB, .evaluate = net_eval_batched };
+            int Wa, Da, La;
+            uint64_t s = cfg->seed ^ ((uint64_t)(i+1)*0x9E3779B97F4A7C15ull)
+                                   ^ ((uint64_t)(j+1)*0xC2B2AE3D27D4EB4Full);
+            match_net_vs_net(&bevA, &bevB, cfg, ng, open_plies, s, &Wa, &Da, &La);
+            double n = (double)(Wa + Da + La);
+            wins[i*K+j] += Wa + 0.5*Da; games[i*K+j] += n;
+            wins[j*K+i] += La + 0.5*Da; games[j*K+i] += n;
+            printf("   [%2d vs %2d]  newer-A W/D/L = %d/%d/%d  (A score %.3f)\n",
+                   i, j, Wa, Da, La, n > 0 ? (Wa + 0.5*Da)/n : 0.0);
+            fflush(stdout);
+        }
+    }
+
+    double *elo = (double*)malloc((size_t)K*sizeof(double));
+    int it = chess_elo_fit(K, wins, games, /*anchor=*/0, elo, 1000, 1e-10);
+    printf("\n## [elo] self-anchored Elo curve (snapshot 0 = anchor 0; Bradley-Terry MLE, %d iters):\n", it);
+    for (int i = 0; i < K; i++)
+        printf("   snap %2d : Elo %+8.1f%s\n", i, elo[i], i == 0 ? "   (anchor)" : "");
+    printf("   => snap0 %+.1f -> snap%d %+.1f   (delta %+.1f Elo)\n", elo[0], K-1, elo[K-1], elo[K-1]-elo[0]);
+    printf("   => self-anchored Elo %s\n",
+           elo[K-1] > elo[0] + 1.0 ? "CLIMBS (latest stronger than oldest — the loop learns)"
+                                   : "does NOT climb (latest <= oldest)");
+    free(wins); free(games); free(elo); free(nets);
+    return 0;
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 int main(int argc, char **argv) {
@@ -418,7 +491,7 @@ int main(int argc, char **argv) {
 #endif
 
         printf("# chess self-play (%s) — DIM=%d HIDDEN=%d L=%d SEQ=%d  | B=%d sims=%d considered=%d\n",
-               mode == 3 ? "bench" : (mode == 2 ? "selfcheck" : (mode == 1 ? "G2" : "smoke")),
+               mode == 4 ? "elo" : (mode == 3 ? "bench" : (mode == 2 ? "selfcheck" : (mode == 1 ? "G2" : "smoke"))),
                DIM, HIDDEN, NLAYERS, SEQ, cfg.B, cfg.sims, cfg.considered);
         // Cold-start mitigation (ADR 0005 dec 8, MEASURED-triggered): adjudicate capped games
         // by material so the value head gets a decisive signal when weak self-play never reaches
@@ -433,6 +506,10 @@ int main(int argc, char **argv) {
                 cfg.warmup_iters, (double)cfg.warmup_frac, cfg.adjudicate, cfg.curriculum,
                 (double)cfg.td_lambda, chess_optimizer_name());
 
+        // --elo: self-anchored Elo round-robin over snapshot checkpoints (ADR 0007). Fully
+        // self-contained (loads its own nets), so dispatch before the training net is built.
+        if (mode == 4) return run_elo(&cfg);
+
         // ---- the ONE net + grads + optimizer registry (the single ANE client) ----
         ChessNet net, grads;
         chess_net_alloc(&net, 0); chess_net_alloc(&grads, 1);
@@ -440,7 +517,9 @@ int main(int argc, char **argv) {
         chess_net_register(&net, &grads);
         // pre-size the cpu_ops RMSNorm scratch for the widest batch we will run (it is lazily
         // sized to the first S it sees; the batched path must pre-size before any rmsnorm).
-        int maxB = roundup32(cfg.B > cfg.eval_games ? cfg.B : cfg.eval_games);
+        int maxB_pos = cfg.B; if (cfg.eval_games > maxB_pos) maxB_pos = cfg.eval_games;
+        if (cfg.elo_games > maxB_pos) maxB_pos = cfg.elo_games;
+        int maxB = roundup32(maxB_pos);
         int maxS = maxB*SEQ; if (cfg.learner_batch*SEQ > maxS) maxS = cfg.learner_batch*SEQ;
         chess_net_init_rmstmp(maxS);
 
@@ -468,7 +547,7 @@ int main(int argc, char **argv) {
         printf("# %-4s %-9s %-9s %-8s | %-26s | %-26s\n", "iter", "loss_pol", "loss_val", "buf",
                "vs-random  (W/D/L  score)", "vs-greedy  (W/D/L  score)");
 
-        double sc_rand[512], sc_greedy[512]; int npts = 0; int adam_t = 0; int diverged = 0;
+        double sc_rand[512], sc_greedy[512]; int npts = 0; int adam_t = 0; int diverged = 0; int elo_snaps = 0;
         int prof = cfg.profile;
         if (prof) g_learner_prof = 1;
         double tot_gen = 0, tot_learn = 0, tot_evalr = 0, tot_evalg = 0, tot_ckpt = 0;
@@ -528,6 +607,16 @@ int main(int argc, char **argv) {
             } else {
                 printf("  %-4d %-9.4f %-9.4f %-8d | gen W/D/L %ld/%ld/%ld  plies %ld\n",
                        it, lp, lv, replay_count(&rb), gs.wins_w, gs.draws, gs.wins_b, gs.plies);
+            }
+            // self-anchored Elo snapshot (ADR 0007): save <ckpt>.eloNNN every elo_every iters
+            // (incl. it=0 random-init anchor and the final iter) for the --elo round-robin. The
+            // index is contiguous from 0, so --elo's discovery loop finds them all.
+            if (cfg.elo_every > 0 && cfg.ckpt && cfg.ckpt[0] &&
+                (it == 0 || it == iters || it % cfg.elo_every == 0)) {
+                char snap[1200]; snprintf(snap, sizeof snap, "%s.elo%03d", cfg.ckpt, elo_snaps);
+                chess_net_save(&net, snap);
+                printf("    [elo] snapshot %d (iter %d) -> %s\n", elo_snaps, it, snap);
+                elo_snaps++;
             }
             if (prof && it > 0) {
                 printf("    t_gen=%.2fs t_learn=%.2fs [fwd=%.2f loss=%.2f bwd=%.2f emb=%.2f opt=%.2f fus=%.2f] t_evalr=%.2fs t_evalg=%.2fs t_ckpt=%.2fs\n",

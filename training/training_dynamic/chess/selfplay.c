@@ -26,6 +26,7 @@ SPConfig sp_defaults(void) {
     c.optimizer_muon = OPTIMIZER_IS_MUON;
     c.lr = 2e-3f; c.loss_scale = 256.0f; c.grad_clip = 1.0f; c.wd = 0.0f; c.value_weight = 1.0f;
     c.eval_games = 40; c.eval_every = 5; c.eval_sims = 32; c.eval_considered = 16; c.eval_max_plies = 120;
+    c.elo_every = 0; c.elo_games = 32;
     c.bench_games = 256;
     c.profile = 0;
     c.use_mps = 0;
@@ -37,11 +38,12 @@ SPConfig sp_defaults(void) {
 #define ARGF(name,field) else if (!strcmp(argv[i], name) && i+1<argc) c.field = (float)atof(argv[++i])
 #define ARGI(name,field) else if (!strcmp(argv[i], name) && i+1<argc) c.field = atoi(argv[++i])
 SPConfig sp_parse(int argc, char **argv, int *mode) {
-    SPConfig c = sp_defaults(); if (mode) *mode = 0;  // 0 smoke, 1 g2, 2 selfcheck, 3 bench
+    SPConfig c = sp_defaults(); if (mode) *mode = 0;  // 0 smoke, 1 g2, 2 selfcheck, 3 bench, 4 elo
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--g2"))        { if (mode) *mode = 1; }
         else if (!strcmp(argv[i], "--selfcheck")) { if (mode) *mode = 2; }
         else if (!strcmp(argv[i], "--bench"))     { if (mode) *mode = 3; }
+        else if (!strcmp(argv[i], "--elo"))       { if (mode) *mode = 4; }
         else if (!strcmp(argv[i], "--resume"))     c.resume = 1;
         else if (!strcmp(argv[i], "--curriculum")) c.curriculum = 1;
         else if (!strcmp(argv[i], "--adjudicate")) c.adjudicate = 1;
@@ -72,6 +74,7 @@ SPConfig sp_parse(int argc, char **argv, int *mode) {
         ARGI("--eval-games", eval_games); ARGI("--eval-every", eval_every);
         ARGI("--eval-sims", eval_sims); ARGI("--eval-considered", eval_considered);
         ARGI("--eval-max-plies", eval_max_plies);
+        ARGI("--elo-every", elo_every); ARGI("--elo-games", elo_games);
         ARGI("--bench-games", bench_games);
         else if (!strcmp(argv[i], "--profile")) c.profile = 1;
         else if (!strcmp(argv[i], "--mps"))     c.use_mps = 1;
@@ -389,6 +392,88 @@ double eval_vs_opponent(const BatchedChessEvaluator *bev, const SPConfig *cfg,
     for (int i = 0; i < n_games; i++) { if (g[i].result > 0) w++; else if (g[i].result < 0) l++; else d++; }
     if (W) *W = w; if (D) *D = d; if (Lo) *Lo = l;
     free(g); free(roots); free(cfgs); free(idx); free(res);
+    return ((double)w + 0.5*(double)d) / (double)n_games;
+}
+
+// ============================================================================
+// MATCH: net A vs net B (self-anchored Elo, ADR 0007). See selfplay.h for the contract.
+// Two evaluators; at each ply every active game has exactly one side to move, so we snapshot
+// each game's mover BEFORE applying any move this ply (else a game just moved by A would be
+// re-selected for B in the same ply and double-move), then run one batched search per side.
+// ============================================================================
+typedef struct { Position cur; int done; int a_white; int result; } MatchGame; // result: +1 A win, -1 A loss, 0 draw
+
+static int match_terminal(MatchGame *e) {
+    Move tmp[MAX_MOVES]; int nl = chess_legal_moves(&e->cur, tmp);
+    if (nl == 0) {
+        if (chess_in_check(&e->cur)) {                        // side-to-move is checkmated -> loses
+            int loser_white = (e->cur.side == WHITE);
+            e->result = (loser_white == e->a_white) ? -1 : +1;
+        } else e->result = 0;                                 // stalemate
+        return 1;
+    }
+    if (e->cur.halfmove >= 100) { e->result = 0; return 1; }  // 50-move draw
+    return 0;
+}
+
+double match_net_vs_net(const BatchedChessEvaluator *bevA, const BatchedChessEvaluator *bevB,
+                        const SPConfig *cfg, int n_games, int open_plies, uint64_t seed,
+                        int *Wa, int *Da, int *La) {
+    MatchGame *g = (MatchGame*)calloc(n_games, sizeof(MatchGame));
+    for (int i = 0; i < n_games; i++) {
+        chess_startpos(&g[i].cur);
+        g[i].a_white = (i % 2 == 0);   // color-swapped pairs: games 2k / 2k+1 share an opening
+        g[i].result = 0; g[i].done = 0;
+        // distinct random opening per color-swap PAIR (k=i/2): both halves replay the same
+        // uniform moves from the same seed -> identical opening, swapped colors (bias cancels).
+        uint64_t orng = seed ^ (0x09E3779B1ull + (uint64_t)(i / 2) * 2654435761u);
+        for (int k = 0; k < open_plies; k++) {
+            Move mv[MAX_MOVES]; int n = chess_legal_moves(&g[i].cur, mv);
+            if (n == 0) { chess_startpos(&g[i].cur); break; }
+            Undo u; chess_make(&g[i].cur, mv[sm_below(&orng, n)], &u);
+        }
+        g[i].done = match_terminal(&g[i]);   // a random opening could already be terminal
+    }
+    Position   *roots = (Position*)malloc((size_t)n_games*sizeof(Position));
+    MctsConfig *cfgs  = (MctsConfig*)malloc((size_t)n_games*sizeof(MctsConfig));
+    int        *idx   = (int*)malloc((size_t)n_games*sizeof(int));
+    int        *mover = (int*)malloc((size_t)n_games*sizeof(int));
+    MctsResult *res   = (MctsResult*)malloc((size_t)n_games*sizeof(MctsResult));
+
+    for (int ply = 0; ply < cfg->eval_max_plies; ply++) {
+        // snapshot whose turn it is this ply (0=A's evaluator, 1=B's, -1=done) BEFORE any move
+        for (int i = 0; i < n_games; i++) {
+            if (g[i].done) { mover[i] = -1; continue; }
+            mover[i] = ((g[i].cur.side == WHITE) == g[i].a_white) ? 0 : 1;
+        }
+        for (int side = 0; side < 2; side++) {
+            const BatchedChessEvaluator *bev = (side == 0) ? bevA : bevB;
+            int na = 0;
+            for (int i = 0; i < n_games; i++) {
+                if (mover[i] != side) continue;
+                roots[na] = g[i].cur;
+                cfgs[na] = mcts_default_config(cfg->eval_sims);
+                cfgs[na].max_considered = cfg->eval_considered;
+                cfgs[na].seed = seed + (uint64_t)ply*100003u*(uint64_t)n_games
+                                     + (uint64_t)i*100019u + (uint64_t)side*13u + 7u;
+                idx[na] = i; na++;
+            }
+            if (na == 0) continue;
+            mcts_search_batched(roots, na, bev, cfgs, res);
+            for (int k = 0; k < na; k++) {
+                int i = idx[k];
+                if (res[k].best_move == MOVE_NONE) { g[i].done = match_terminal(&g[i]); continue; }
+                Undo u; chess_make(&g[i].cur, res[k].best_move, &u);
+                g[i].done = match_terminal(&g[i]);
+            }
+        }
+        int any = 0; for (int i = 0; i < n_games; i++) if (!g[i].done) { any = 1; break; }
+        if (!any) break;
+    }
+    int w = 0, d = 0, l = 0;
+    for (int i = 0; i < n_games; i++) { if (g[i].result > 0) w++; else if (g[i].result < 0) l++; else d++; }
+    if (Wa) *Wa = w; if (Da) *Da = d; if (La) *La = l;
+    free(g); free(roots); free(cfgs); free(idx); free(mover); free(res);
     return ((double)w + 0.5*(double)d) / (double)n_games;
 }
 
