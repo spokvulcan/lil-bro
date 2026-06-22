@@ -2,29 +2,21 @@
 // policy (8x8x73, legal-masked) + WDL value heads + 2D rank+file posenc (RoPE off)
 // + the AlphaZero loss, trained ON THE ANE, with the G0 overfit gate.
 //
+// As of build-step 4 (#18) the trunk (ANE matmul + forward/backward + param registry)
+// lives in chess/chess_net.h, shared with the self-play learner — "the thing you train
+// is the thing you proved." This file is unchanged in BEHAVIOR (it drives the shared
+// trunk at B=1, byte-identical to the pre-#18 inline version); `make g0` re-verifies it.
+//
 // WHAT RUNS WHERE (the CPU/ANE split, ADR 0004 / [[ane-resident-training-cpu-floor]]):
 //   ANE (fp16): every trunk matmul — QKV/Wo/W1/W3/W2 forward AND the dx backward
-//     matmuls — via gen_dyn_matmul_mil(ic,oc,seq). That generic kernel IS the exact
-//     primitive train.m's woFwd / qBwd / wotBwd / ffnBwd kernels are built from
-//     (mil_dynamic.h lines 218/676/681/425), so this is the proven substrate,
-//     un-fused. G0 thus measures the real fp16 forward+backward path.
+//     matmuls — via gen_dyn_matmul_mil(ic,oc,seq), the proven substrate, un-fused.
 //   CPU (fp32): RMSNorm, attention softmax (attn_cpu_*, RoPE OFF), SiLU, dW (cblas),
 //     the embedding + 2D posenc, the policy/value heads, the AZ loss, AdamW — the
-//     irreducible CPU floor. Heads on CPU mirrors the LM classifier head (decision 5)
-//     and sidesteps the WDL=3-not-mult-of-32 ANE constraint.
-//
-// Trunk decomposition note (scope): v1/G0 uses separate matmul evals + CPU attention
-// (RoPE off by construction — the chess path never calls the RoPE kernel) for
-// correctness and per-kernel verifiability; the fused sdpaFwd/ffnFused kernels are a
-// later throughput step (G2+). Attention is causal here (reusing the FD-verified
-// attn_cpu core); bidirectional/2D-RoPE attention is a deferred ablation (ADR 0005
-// "Open"). Neither affects the G0 correctness gate.
+//     irreducible CPU floor.
 //
 // G0 GATE (the discipline — a MEASURED gate): `./train_chess --overfit` pins ONE
 // chess position -> (one-hot target policy, one-hot target value) and trains until
-// BOTH cross-entropies collapse to ~0. If they do, the new heads + their backward +
-// the fp16 trunk path are correct end-to-end. Exit 0 on pass, 1 on fail. Never
-// assert a backward is right because it "looks" right.
+// BOTH cross-entropies collapse to ~0. Exit 0 on pass, 1 on fail.
 //
 // Build: make train_chess   ·   Gate: make g0
 
@@ -32,214 +24,9 @@
 #include "cpu_ops.h"              // rmsnorm(_bwd), attn_cpu_*, adam_update, embed_*
 #include "chess/chess.h"          // engine + codec (#15): encode, legal moves/mask, move index
 #include "chess/chess_heads.h"    // NEW heads: posenc, policy, value, L2 (FD-gated)
+#include "chess/chess_net.h"      // shared trunk: ANE matmul, fwd/bwd, shapes, param registry
 #include <stdio.h>
 #include <string.h>
-
-// ---- chess shapes (from chess.h) -------------------------------------------
-#define NBOARD 64
-#define PLANES 73
-#define POL    CHESS_POLICY_SIZE  // 4672
-#define NWDL   3
-#define NREAL  CHESS_NUM_TOKENS   // 77
-#define NMISC  (SEQ - NBOARD)     // 32 (state tokens + padding)
-
-// ============================================================================
-// ANE matmul primitive: y[oc,seq] = W[ic,oc]^T @ x[ic,seq]  (W stored [IN,OUT]).
-// Cached per (ic,oc,seq) shape — chess uses only a few. A global CPU fallback
-// (cblas) lets --selfcheck run the identical trunk on CPU and compare cos.
-// ============================================================================
-typedef struct { int ic, oc, seq; Kern *k; } MMEntry;
-static MMEntry g_mm[16]; static int g_nmm = 0;
-static int g_cpu_mm = 0;   // 1 = use cblas instead of the ANE (selfcheck reference)
-
-static Kern *mm_kernel(int ic, int oc, int seq) {
-    for (int i = 0; i < g_nmm; i++)
-        if (g_mm[i].ic==ic && g_mm[i].oc==oc && g_mm[i].seq==seq) return g_mm[i].k;
-    Kern *k = compile_kern_mil_w(gen_dyn_matmul_mil(ic, oc, seq), @{}, ic*(seq+oc)*2, oc*seq*2);
-    if (!k) { fprintf(stderr, "[chess] matmul compile FAILED ic=%d oc=%d seq=%d\n", ic, oc, seq); abort(); }
-    g_mm[g_nmm++] = (MMEntry){ic, oc, seq, k};
-    return k;
-}
-static void ane_matmul(int ic, int oc, int seq, const float *x, const float *W, float *y) {
-    if (g_cpu_mm) {  // y[oc,seq] = W^T @ x = sum_i W[i,o] x[i,s]
-        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans, oc, seq, ic,
-                    1.0f, W, oc, x, seq, 0.0f, y, seq);
-        return;
-    }
-    Kern *k = mm_kernel(ic, oc, seq);
-    io_write_dyn(k->ioIn, x, ic, seq, W, oc);
-    ane_eval(k);
-    io_read_dyn(k->ioOut, y, oc, seq);
-}
-
-// transpose src[rows,cols] -> dst[cols,rows]
-static void transpose2d(float *dst, const float *src, int rows, int cols) {
-    for (int r = 0; r < rows; r++)
-        for (int c = 0; c < cols; c++) dst[(size_t)c*rows + r] = src[(size_t)r*cols + c];
-}
-// gW[IN,O] += x[IN,seq] @ dy[O,seq]^T   (gW[i,o] += sum_s x[i,s] dy[o,s])
-static void dW_acc(float *gW, const float *x, const float *dy, int IN, int O, int seq) {
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, IN, O, seq,
-                1.0f, x, seq, dy, seq, 1.0f, gW, O);
-}
-
-// ============================================================================
-// Net + per-layer activations / gradients (weights [IN,OUT] row-major).
-// ============================================================================
-typedef struct { float *Wq,*Wk,*Wv,*Wo,*W1,*W2,*W3,*rms_att,*rms_ffn; } CLayer;
-typedef struct { float *layer_in,*xnorm,*Q,*K,*V,*attn,*x2,*x2norm,*h1,*h3,*gate; } CActs;
-
-static float *fmalloc(size_t n) { return (float*)malloc(n*4); }
-static float *fcalloc(size_t n) { return (float*)calloc(n,4); }
-
-static void clayer_alloc(CLayer *w) {
-    w->Wq=fmalloc(DIM*Q_DIM); w->Wk=fmalloc(DIM*KV_DIM); w->Wv=fmalloc(DIM*KV_DIM);
-    w->Wo=fmalloc(Q_DIM*DIM); w->W1=fmalloc(DIM*HIDDEN); w->W2=fmalloc(HIDDEN*DIM);
-    w->W3=fmalloc(DIM*HIDDEN); w->rms_att=fmalloc(DIM); w->rms_ffn=fmalloc(DIM);
-}
-static void clayer_calloc(CLayer *g) {
-    g->Wq=fcalloc(DIM*Q_DIM); g->Wk=fcalloc(DIM*KV_DIM); g->Wv=fcalloc(DIM*KV_DIM);
-    g->Wo=fcalloc(Q_DIM*DIM); g->W1=fcalloc(DIM*HIDDEN); g->W2=fcalloc(HIDDEN*DIM);
-    g->W3=fcalloc(DIM*HIDDEN); g->rms_att=fcalloc(DIM); g->rms_ffn=fcalloc(DIM);
-}
-static void cacts_alloc(CActs *a) {
-    a->layer_in=fmalloc(DIM*SEQ); a->xnorm=fmalloc(DIM*SEQ);
-    a->Q=fmalloc(Q_DIM*SEQ); a->K=fmalloc(KV_DIM*SEQ); a->V=fmalloc(KV_DIM*SEQ);
-    a->attn=fmalloc(Q_DIM*SEQ); a->x2=fmalloc(DIM*SEQ); a->x2norm=fmalloc(DIM*SEQ);
-    a->h1=fmalloc(HIDDEN*SEQ); a->h3=fmalloc(HIDDEN*SEQ); a->gate=fmalloc(HIDDEN*SEQ);
-}
-
-// ---- forward: x_in[DIM,SEQ] (embed+posenc already summed) -> x_final[DIM,SEQ] ----
-static void chess_forward(CLayer *W, CActs *acts, const float *x_in,
-                          float *x_pre_final, float *x_final, const float *rms_final, float res_alpha) {
-    float *x = fmalloc(DIM*SEQ); memcpy(x, x_in, DIM*SEQ*4);
-    float *o = fmalloc(DIM*SEQ), *ffn = fmalloc(DIM*SEQ);
-    for (int L = 0; L < NLAYERS; L++) {
-        CActs *ac = &acts[L]; CLayer *w = &W[L];
-        memcpy(ac->layer_in, x, DIM*SEQ*4);
-        rmsnorm(ac->xnorm, x, w->rms_att, DIM, SEQ);
-        ane_matmul(DIM, Q_DIM, SEQ, ac->xnorm, w->Wq, ac->Q);
-        ane_matmul(DIM, KV_DIM, SEQ, ac->xnorm, w->Wk, ac->K);
-        ane_matmul(DIM, KV_DIM, SEQ, ac->xnorm, w->Wv, ac->V);
-        // RoPE OFF (2D posenc replaces it): attention straight on Q/K/V (causal CPU core).
-        attn_cpu_forward(ac->attn, ac->Q, ac->K, ac->V, NULL, NULL, NULL, SEQ);
-        ane_matmul(Q_DIM, DIM, SEQ, ac->attn, w->Wo, o);
-        for (int i = 0; i < DIM*SEQ; i++) ac->x2[i] = x[i] + res_alpha*o[i];
-        rmsnorm(ac->x2norm, ac->x2, w->rms_ffn, DIM, SEQ);
-        ane_matmul(DIM, HIDDEN, SEQ, ac->x2norm, w->W1, ac->h1);
-        ane_matmul(DIM, HIDDEN, SEQ, ac->x2norm, w->W3, ac->h3);
-        for (int i = 0; i < HIDDEN*SEQ; i++) {
-            float sig = 1.0f/(1.0f+expf(-ac->h1[i]));
-            ac->gate[i] = (ac->h1[i]*sig) * ac->h3[i];   // silu(h1)*h3
-        }
-        ane_matmul(HIDDEN, DIM, SEQ, ac->gate, w->W2, ffn);
-        for (int i = 0; i < DIM*SEQ; i++) x[i] = ac->x2[i] + res_alpha*ffn[i];
-    }
-    memcpy(x_pre_final, x, DIM*SEQ*4);
-    rmsnorm(x_final, x, rms_final, DIM, SEQ);
-    free(x); free(o); free(ffn);
-}
-
-// ---- backward: dx_final[DIM,SEQ] -> grads (accumulated), returns dy into embed/posenc ----
-static void chess_backward(CLayer *W, CLayer *G, CActs *acts, const float *dx_final,
-                           const float *x_pre_final, const float *rms_final, float *grms_final,
-                           float *dy_out, float res_alpha) {
-    float *dy = fmalloc(DIM*SEQ);
-    rmsnorm_bwd(dy, grms_final, dx_final, x_pre_final, rms_final, DIM, SEQ);  // grad wrt pre-final hidden
-
-    float *dx2=fmalloc(DIM*SEQ), *dffn=fmalloc(DIM*SEQ), *dgate=fmalloc(HIDDEN*SEQ);
-    float *dh1=fmalloc(HIDDEN*SEQ), *dh3=fmalloc(HIDDEN*SEQ), *dx2norm=fmalloc(DIM*SEQ);
-    float *tmp=fmalloc(DIM*SEQ), *tmpd=fmalloc(DIM*SEQ), *da=fmalloc(DIM*SEQ);
-    float *dop=fmalloc(DIM*SEQ), *dattn=fmalloc(Q_DIM*SEQ);
-    float *dQ=fmalloc(Q_DIM*SEQ), *dK=fmalloc(KV_DIM*SEQ), *dV=fmalloc(KV_DIM*SEQ), *dxn=fmalloc(DIM*SEQ);
-    // backward-weight transposes (recomputed each step; weights change each step)
-    float *W2t=fmalloc(DIM*HIDDEN), *W1t=fmalloc(HIDDEN*DIM), *W3t=fmalloc(HIDDEN*DIM);
-    float *Wot=fmalloc(DIM*Q_DIM), *Wqt=fmalloc(Q_DIM*DIM), *Wkt=fmalloc(KV_DIM*DIM), *Wvt=fmalloc(KV_DIM*DIM);
-
-    for (int L = NLAYERS-1; L >= 0; L--) {
-        CActs *ac = &acts[L]; CLayer *w = &W[L]; CLayer *g = &G[L];
-        // out = x2 + res_alpha*ffn  ->  dx2 = dy (so far), dffn = res_alpha*dy
-        memcpy(dx2, dy, DIM*SEQ*4);
-        for (int i = 0; i < DIM*SEQ; i++) dffn[i] = res_alpha*dy[i];
-        // FFN down: ffn = W2^T @ gate
-        transpose2d(W2t, w->W2, HIDDEN, DIM);                 // [DIM,HIDDEN]
-        ane_matmul(DIM, HIDDEN, SEQ, dffn, W2t, dgate);       // dgate = W2 @ dffn
-        dW_acc(g->W2, ac->gate, dffn, HIDDEN, DIM, SEQ);
-        // SiLU backward: gate = silu(h1)*h3
-        for (int i = 0; i < HIDDEN*SEQ; i++) {
-            float sig = 1.0f/(1.0f+expf(-ac->h1[i]));
-            float siluprime = sig*(1.0f + ac->h1[i]*(1.0f - sig));
-            dh3[i] = dgate[i]*(ac->h1[i]*sig);
-            dh1[i] = (dgate[i]*ac->h3[i])*siluprime;
-        }
-        // FFN up: h1=W1^T@x2norm, h3=W3^T@x2norm -> dx2norm = W1@dh1 + W3@dh3
-        transpose2d(W1t, w->W1, DIM, HIDDEN);                 // [HIDDEN,DIM]
-        transpose2d(W3t, w->W3, DIM, HIDDEN);
-        ane_matmul(HIDDEN, DIM, SEQ, dh1, W1t, dx2norm);
-        ane_matmul(HIDDEN, DIM, SEQ, dh3, W3t, tmp);
-        for (int i = 0; i < DIM*SEQ; i++) dx2norm[i] += tmp[i];
-        dW_acc(g->W1, ac->x2norm, dh1, DIM, HIDDEN, SEQ);
-        dW_acc(g->W3, ac->x2norm, dh3, DIM, HIDDEN, SEQ);
-        // RMSNorm2 backward, accumulate into dx2 (which already holds the residual dy)
-        rmsnorm_bwd(tmpd, g->rms_ffn, dx2norm, ac->x2, w->rms_ffn, DIM, SEQ);
-        for (int i = 0; i < DIM*SEQ; i++) dx2[i] += tmpd[i];
-        // x2 = layer_in + res_alpha*o -> da = dx2, do = res_alpha*dx2
-        memcpy(da, dx2, DIM*SEQ*4);
-        for (int i = 0; i < DIM*SEQ; i++) dop[i] = res_alpha*dx2[i];
-        // Wo: o = Wo^T @ attn -> dattn = Wo @ do
-        transpose2d(Wot, w->Wo, Q_DIM, DIM);                  // [DIM,Q_DIM]
-        ane_matmul(DIM, Q_DIM, SEQ, dop, Wot, dattn);
-        dW_acc(g->Wo, ac->attn, dop, Q_DIM, DIM, SEQ);
-        // attention backward (RoPE off -> no rope_backward) -> dQ,dK,dV
-        attn_cpu_backward(dattn, ac->Q, ac->K, ac->V, NULL, NULL, NULL,
-                          dQ, dK, dV, NULL, NULL, NULL, SEQ);
-        // QKV proj: Q=Wq^T@xnorm ... -> dxnorm = Wq@dQ + Wk@dK + Wv@dV
-        transpose2d(Wqt, w->Wq, DIM, Q_DIM);                  // [Q_DIM,DIM]
-        transpose2d(Wkt, w->Wk, DIM, KV_DIM);
-        transpose2d(Wvt, w->Wv, DIM, KV_DIM);
-        ane_matmul(Q_DIM, DIM, SEQ, dQ, Wqt, dxn);
-        ane_matmul(KV_DIM, DIM, SEQ, dK, Wkt, tmp); for (int i=0;i<DIM*SEQ;i++) dxn[i]+=tmp[i];
-        ane_matmul(KV_DIM, DIM, SEQ, dV, Wvt, tmp); for (int i=0;i<DIM*SEQ;i++) dxn[i]+=tmp[i];
-        dW_acc(g->Wq, ac->xnorm, dQ, DIM, Q_DIM, SEQ);
-        dW_acc(g->Wk, ac->xnorm, dK, DIM, KV_DIM, SEQ);
-        dW_acc(g->Wv, ac->xnorm, dV, DIM, KV_DIM, SEQ);
-        // RMSNorm1 backward, accumulate into da (the +layer_in residual)
-        rmsnorm_bwd(tmpd, g->rms_att, dxn, ac->layer_in, w->rms_att, DIM, SEQ);
-        for (int i = 0; i < DIM*SEQ; i++) da[i] += tmpd[i];
-        memcpy(dy, da, DIM*SEQ*4);   // grad wrt this layer's input -> next (earlier) layer
-    }
-    memcpy(dy_out, dy, DIM*SEQ*4);
-    free(dy);free(dx2);free(dffn);free(dgate);free(dh1);free(dh3);free(dx2norm);
-    free(tmp);free(tmpd);free(da);free(dop);free(dattn);free(dQ);free(dK);free(dV);free(dxn);
-    free(W2t);free(W1t);free(W3t);free(Wot);free(Wqt);free(Wkt);free(Wvt);
-}
-
-// ============================================================================
-// Param registry for the global grad-norm + clip + AdamW step.
-// ============================================================================
-typedef struct { float *w, *g; AdamState a; int n; } Param;
-static Param g_params[256]; static int g_nparams = 0;
-static void reg(float *w, float *g, int n) {
-    g_params[g_nparams].w=w; g_params[g_nparams].g=g;
-    g_params[g_nparams].a=adam_alloc(n); g_params[g_nparams].n=n; g_nparams++;
-}
-static void grads_zero(void) {
-    for (int i = 0; i < g_nparams; i++) memset(g_params[i].g, 0, (size_t)g_params[i].n*4);
-}
-// scale by gsc (unscale loss_scale), global-clip to `clip`, AdamW. Mirrors train.m.
-static void optimizer_step(float gsc, float clip, int t, float lr, float wd) {
-    for (int i = 0; i < g_nparams; i++)
-        vDSP_vsmul(g_params[i].g, 1, &gsc, g_params[i].g, 1, (vDSP_Length)g_params[i].n);
-    float nsq = 0;
-    for (int i = 0; i < g_nparams; i++) { float s; vDSP_dotpr(g_params[i].g,1,g_params[i].g,1,&s,(vDSP_Length)g_params[i].n); nsq += s; }
-    float norm = sqrtf(nsq);
-    if (clip > 0 && norm > clip) {
-        float cs = clip/norm;
-        for (int i = 0; i < g_nparams; i++) vDSP_vsmul(g_params[i].g,1,&cs,g_params[i].g,1,(vDSP_Length)g_params[i].n);
-    }
-    for (int i = 0; i < g_nparams; i++)
-        adam_update(g_params[i].w, g_params[i].g, &g_params[i].a, t, lr, 0.9f, 0.999f, 1e-8f, wd);
-}
 
 static float frand(void) { return (float)(2*drand48()-1); }
 
@@ -269,9 +56,9 @@ int main(int argc, char *argv[]) {
 
         float res_alpha = 1.0f/sqrtf(2.0f*NLAYERS);
 
-        // ---- allocate net + grads + acts ----
+        // ---- allocate net + grads + acts (B=1 trunk: acts sized for SEQ) ----
         CLayer W[NLAYERS], G[NLAYERS]; CActs acts[NLAYERS];
-        for (int L = 0; L < NLAYERS; L++) { clayer_alloc(&W[L]); clayer_calloc(&G[L]); cacts_alloc(&acts[L]); }
+        for (int L = 0; L < NLAYERS; L++) { clayer_alloc(&W[L]); clayer_calloc(&G[L]); cacts_alloc(&acts[L], SEQ); }
         float *rms_final=fmalloc(DIM), *grms_final=fcalloc(DIM);
         float *tok_emb=fmalloc((size_t)VOCAB*DIM), *g_tok=fcalloc((size_t)VOCAB*DIM);
         float *rank_emb=fmalloc(8*DIM), *g_rank=fcalloc(8*DIM);
@@ -337,9 +124,6 @@ int main(int argc, char *argv[]) {
         // SELF-CHECK: ANE matmul vs cblas, and ANE-trunk vs CPU-trunk.
         // ------------------------------------------------------------
         if (do_selfcheck) {
-            // ASSERTED substrate gate: a fp16 ANE path that disagreed with the CPU
-            // reference (or silently ran on stale/zero surfaces) would make any G0
-            // pass meaningless, so we track the worst cos and abort if it degrades.
             const double COS_MIN = 0.99;
             double worst_cos = 1.0, cosv;
             printf("## [selfcheck] ANE matmul vs cblas (cos; fp16 expected ~0.999+)\n");
@@ -362,21 +146,18 @@ int main(int argc, char *argv[]) {
             embed_lookup(x_in, tok_emb, tokens, DIM, SEQ);
             chess_posenc_forward(x_in, rank_emb, file_emb, misc_emb, DIM, SEQ, NBOARD);
             float *xf_cpu=fmalloc(DIM*SEQ);
-            g_cpu_mm=1; chess_forward(W, acts, x_in, x_pre, xf_cpu, rms_final, res_alpha);
-            g_cpu_mm=0; chess_forward(W, acts, x_in, x_pre, x_final, rms_final, res_alpha);
+            g_cpu_mm=1; chess_trunk_forward(W, acts, x_in, 1, x_pre, xf_cpu, rms_final, res_alpha, 1);
+            g_cpu_mm=0; chess_trunk_forward(W, acts, x_in, 1, x_pre, x_final, rms_final, res_alpha, 1);
             double dot=0,na=0,nc=0;
             for (int i=0;i<DIM*SEQ;i++){ dot+=(double)x_final[i]*xf_cpu[i]; na+=(double)x_final[i]*x_final[i]; nc+=(double)xf_cpu[i]*xf_cpu[i]; }
             cosv = dot/(sqrt(na)*sqrt(nc)+1e-30); if (cosv<worst_cos) worst_cos=cosv;
             printf("   full %d-layer trunk fwd: cos(ANE, CPU)=%.6f\n", NLAYERS, cosv);
             free(xf_cpu);
-            // BACKWARD substrate check: the dx-matmuls (the fp16 path G0 ultimately
-            // trusts) must match CPU too — never assume a backward is right because
-            // the forward is. Same saved acts (from the ANE forward above); a random
-            // upstream grad; compare the gradient that flows into the embedding.
+            // BACKWARD substrate check: the dx-matmuls must match CPU too.
             float *dxr=fmalloc(DIM*SEQ), *dyA=fmalloc(DIM*SEQ), *dyC=fmalloc(DIM*SEQ);
             for (int i=0;i<DIM*SEQ;i++) dxr[i]=0.1f*frand();
-            grads_zero(); g_cpu_mm=1; chess_backward(W,G,acts,dxr,x_pre,rms_final,grms_final,dyC,res_alpha);
-            grads_zero(); g_cpu_mm=0; chess_backward(W,G,acts,dxr,x_pre,rms_final,grms_final,dyA,res_alpha);
+            grads_zero(); g_cpu_mm=1; chess_trunk_backward(W,G,acts,dxr,1,x_pre,rms_final,grms_final,dyC,res_alpha);
+            grads_zero(); g_cpu_mm=0; chess_trunk_backward(W,G,acts,dxr,1,x_pre,rms_final,grms_final,dyA,res_alpha);
             grads_zero();   // leave grads clean for training
             dot=0;na=0;nc=0;
             for (int i=0;i<DIM*SEQ;i++){ dot+=(double)dyA[i]*dyC[i]; na+=(double)dyA[i]*dyA[i]; nc+=(double)dyC[i]*dyC[i]; }
@@ -402,22 +183,15 @@ int main(int argc, char *argv[]) {
             // forward
             embed_lookup(x_in, tok_emb, tokens, DIM, SEQ);
             chess_posenc_forward(x_in, rank_emb, file_emb, misc_emb, DIM, SEQ, NBOARD);
-            chess_forward(W, acts, x_in, x_pre, x_final, rms_final, res_alpha);
+            chess_trunk_forward(W, acts, x_in, 1, x_pre, x_final, rms_final, res_alpha, 1);
             // heads + AZ loss (CPU); dx_final accumulates policy + value gradients
             memset(dx_final, 0, DIM*SEQ*4);
             lp = chess_policy_loss(x_final, W_pol, DIM, SEQ, NBOARD, PLANES, legal_mask, tgt_pol, dx_final, g_pol);
             float *dxv=fcalloc(DIM*SEQ);
             lv = chess_value_loss(x_final, W_val, DIM, SEQ, NREAL, NWDL, tgt_val, dxv, g_val);
             for (int i=0;i<DIM*SEQ;i++) dx_final[i] += vw*dxv[i];
-            // scale g_val by the value weight (policy weight = 1)
             for (int i=0;i<DIM*NWDL;i++) g_val[i] *= vw;
             free(dxv);
-            // optional L2 on the trunk weight matrices (the standard AZ L2 target;
-            // norms/embeds/posenc/heads excluded, like AdamW no-decay). Reported
-            // separately (default 0 so the CEs reach ~0). The grad is added in
-            // loss_scale units (l2s) so the uniform 1/loss_scale unscale in the
-            // optimizer leaves the true 2*l2*w — same fp16 256x scaling the CE path
-            // gets; the returned penalty is divided back out for true-units reporting.
             float l2pen = 0, l2s = l2*loss_scale;
             if (l2 > 0) {
                 for (int L=0;L<NLAYERS;L++){
@@ -429,14 +203,14 @@ int main(int argc, char *argv[]) {
                     l2pen += chess_l2_penalty(W[L].W2,HIDDEN*DIM,l2s,G[L].W2);
                     l2pen += chess_l2_penalty(W[L].W3,DIM*HIDDEN,l2s,G[L].W3);
                 }
-                l2pen /= loss_scale;  // report the true penalty (grad stayed scaled)
+                l2pen /= loss_scale;
             }
             // loss-scaling: scale the grad entering the trunk + the head weight grads
             vDSP_vsmul(dx_final,1,&loss_scale,dx_final,1,(vDSP_Length)(DIM*SEQ));
             vDSP_vsmul(g_pol,1,&loss_scale,g_pol,1,(vDSP_Length)(DIM*PLANES));
             vDSP_vsmul(g_val,1,&loss_scale,g_val,1,(vDSP_Length)(DIM*NWDL));
             // trunk backward (ANE dx matmuls + CPU dW), then posenc + embed backward
-            chess_backward(W, G, acts, dx_final, x_pre, rms_final, grms_final, dy_in, res_alpha);
+            chess_trunk_backward(W, G, acts, dx_final, 1, x_pre, rms_final, grms_final, dy_in, res_alpha);
             chess_posenc_backward(dy_in, g_rank, g_file, g_misc, DIM, SEQ, NBOARD);
             embed_backward(g_tok, dy_in, tokens, DIM, SEQ);
             // optimizer: unscale (1/loss_scale), global-clip, AdamW

@@ -323,6 +323,63 @@ static int test_g1(void) {
     return fails;
 }
 
+// =============================================================================
+// Batched (vectorized) search == B independent sync searches (build-step 4 / #18)
+// =============================================================================
+//
+// The crux of #18's throughput: mcts_search_batched runs B games in lockstep so their
+// leaf evals batch into one ANE forward. Correctness of that lockstep driver is proven
+// HERE, on the CPU, against the untouched (G1-green) synchronous mcts_search: with the
+// SAME deterministic oracle and SAME per-game seeds, every game's result must be
+// bit-for-bit identical. A scheduling/descent divergence would change the visit
+// distribution — so exact visit-count equality is the strong assertion. (The net's fp16
+// batched-vs-single agreement is a separate, cosine gate in train_selfplay --selfcheck.)
+static void test_batched_equivalence(void) {
+    printf("[batched search == B independent sync searches (oracle, bit-for-bit)]\n");
+    static const char *fens[] = {
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",       // startpos
+        "r3k2r/ppp2ppp/8/3q4/4P3/8/PPP2PPP/R3K2R w KQkq - 0 1",          // value-only (hanging Q)
+        "6k1/5ppp/8/8/8/8/8/R6K w - - 0 1",                              // mate-in-1 (solver overlay)
+        "6k1/5ppp/8/8/8/7q/5PPP/R5K1 w - - 0 1",                         // mate-in-2 + Q distractor
+        "8/8/8/4k3/8/4K3/4P3/8 w - - 0 1",                               // K+P endgame (few moves)
+        "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3", // normal midgame
+        "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3", // checkmate (terminal root)
+        "7k/5Q2/5K2/8/8/8/8/8 b - - 0 1",                                // stalemate (terminal root)
+    };
+    const int B = (int)(sizeof(fens)/sizeof(fens[0]));
+    const int sims = 64;   // small, but exercises several SH phases + the round-robin tail
+    Position roots[16]; MctsConfig cfgs[16]; MctsResult sref[16], sbat[16];
+    for (int b = 0; b < B; b++) {
+        chess_from_fen(&roots[b], fens[b]);
+        cfgs[b] = mcts_default_config(sims);
+        cfgs[b].max_considered = 16;
+        cfgs[b].seed = 42ull + (uint64_t)b;          // each game its own Gumbel noise
+    }
+    ChessEvaluator ev = chess_oracle_evaluator();
+    for (int b = 0; b < B; b++) mcts_search(&roots[b], &ev, &cfgs[b], &sref[b]);   // references
+    BatchedChessEvaluator bev = chess_oracle_batched_evaluator();
+    mcts_search_batched(roots, B, &bev, cfgs, sbat);                                // under test
+
+    int all_ok = 1;
+    for (int b = 0; b < B; b++) {
+        MctsResult *a = &sref[b], *c = &sbat[b];
+        int ok = (a->best_move == c->best_move) && (a->n_legal == c->n_legal)
+              && (a->sims_done == c->sims_done);
+        for (int i = 0; i < a->n_legal && ok; i++) {
+            if (a->visits[i] != c->visits[i]) ok = 0;        // exact: a divergence shows here
+            if (fabsf(a->q[i] - c->q[i]) > 1e-6f) ok = 0;    // same ops, same order -> ~exact
+        }
+        static float pa[CHESS_POLICY_SIZE], pc[CHESS_POLICY_SIZE];
+        mcts_improved_policy(a, pa); mcts_improved_policy(c, pc);
+        float maxd = 0; for (int i = 0; i < CHESS_POLICY_SIZE; i++) { float d = fabsf(pa[i]-pc[i]); if (d > maxd) maxd = d; }
+        if (maxd > 1e-6f) ok = 0;
+        char nm[80]; snprintf(nm, sizeof nm, "  game %d (%d sims): identical to sync", b, a->sims_done);
+        check(ok, nm);
+        if (!ok) all_ok = 0;
+    }
+    check(all_ok, "all B games bit-for-bit identical to independent sync search");
+}
+
 // ---- measurement: budget sweep (documents the chosen G1 budget) ----
 static void sweep(void) {
     int grid[] = {16, 32, 64, 128, 256, 512, 1024};
@@ -360,6 +417,7 @@ int main(int argc, char **argv) {
     test_backup_sign();
     test_search_mate_in_2();
     test_policy_readout();
+    test_batched_equivalence();
     test_g1_robustness();
     printf("\n--- G1 gate ---\n");
     g_fail += test_g1();

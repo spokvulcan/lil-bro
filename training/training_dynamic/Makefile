@@ -43,7 +43,7 @@ test_heads: chess/test_heads_cpu.c chess/chess_heads.h
 # + AlphaZero loss on the ANE. The trunk matmuls run on the ANE via gen_dyn_matmul_mil
 # (the same primitive train.m's woFwd/qBwd/wotBwd use); heads + loss on the CPU floor.
 # `make g0` builds and runs the overfit gate (both losses -> ~0 == G0-green).
-train_chess: train_chess.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h chess/chess.h models/chess_g0.h $(CHESS_DEPS)
+train_chess: train_chess.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h chess/chess_net.h chess/chess.h models/chess_g0.h $(CHESS_DEPS)
 	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h -o train_chess train_chess.m chess/chess.c
 
 g0: train_chess
@@ -83,6 +83,16 @@ chess/test_replay: chess/test_replay.c chess/replay.c chess/replay.h $(CHESS_DEP
 test_replay: chess/test_replay
 	./chess/test_replay
 
+# Self-play orchestration TDD (oracle-driven, NO ANE): generation produces valid replay
+# samples with correct z-labeling (winner's plies +1, loser's -1, draws 0); the eval ladder's
+# W/D/L bookkeeping is right and a material+mate searcher beats a random-mover. Pure C — the
+# fast gate that proves the loop's logic before spending ANE time on a training run.
+chess/test_selfplay: chess/test_selfplay.c chess/selfplay.c chess/selfplay.h chess/replay.c chess/replay.h $(CHESS_MCTS_DEPS)
+	$(CC) $(CHESS_CFLAGS) -o chess/test_selfplay chess/test_selfplay.c chess/selfplay.c chess/mcts.c chess/replay.c chess/chess.c -lm
+
+test_selfplay: chess/test_selfplay
+	./chess/test_selfplay
+
 # Full self-play trainer (generation + replay + learner) on the one ANE client.
 # `make selfplay` builds; the run driver (lilbro/chess/) invokes ./train_selfplay --config ...
 train_selfplay: train_selfplay.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h \
@@ -100,8 +110,8 @@ g2: train_selfplay
 
 clean:
 	rm -f train probe_chess train_chess train_selfplay \
-	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay
+	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay chess/test_selfplay
 
 FORCE:
 
-.PHONY: clean FORCE test_engine test_heads g0 test_mcts g1 test_replay selfplay g2
+.PHONY: clean FORCE test_engine test_heads g0 test_mcts g1 test_replay test_selfplay selfplay g2

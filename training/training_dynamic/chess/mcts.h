@@ -91,6 +91,12 @@ typedef struct {
                               // undiscounted Gumbel-AZ (forced-mate distance is handled
                               // exactly by the solver proof, so the G1 gate is gamma-
                               // independent; #18 may set <1 as a play-quality knob).
+    float    root_dirichlet_alpha; // Purist-Zero root exploration noise (ADR 0005 dec 8):
+    float    root_dirichlet_frac;  // P(a) <- (1-frac)*P(a) + frac*Dir(alpha) at the root.
+                              // Both 0 (mcts_default_config) => OFF, so mcts_search / the
+                              // G1 + batched-equivalence gates are bit-identical. Self-play
+                              // (#18) turns it ON in mcts_search_batched only (root noise is
+                              // the cold-start exploration the deterministic G1 search omits).
     uint64_t seed;            // RNG seed for the Gumbel noise (determinism).
 } MctsConfig;
 
@@ -115,6 +121,65 @@ typedef struct {
 // terminal, out->n_legal==0 and out->best_move==MOVE_NONE.
 void mcts_search(const Position *root, const ChessEvaluator *ev,
                  const MctsConfig *cfg, MctsResult *out);
+
+// =============================================================================
+// Vectorized batched-leaf search (the crux of build-step 4 / issue #18)
+// =============================================================================
+//
+// The single-position contract above evaluates leaves ONE at a time — fine for the
+// G1 oracle, ruinous for the ANE net (per-eval dispatch is the bound; the throughput
+// probe shows batching B leaves into one forward is the never->days pivot, ~44x/pos).
+// So #18 layers a lockstep driver ABOVE the single-position search: B parallel games
+// step together, and every game's pending leaf eval — the root eval and each
+// simulation's fresh-leaf eval — collapses into ONE batched forward.
+//
+// BatchedChessEvaluator evaluates B NON-TERMINAL positions in one call. For game b in
+// [0,B): fill priors[b][0..n_legal[b]) (each >=0, summing to 1, prior for legal[b][i])
+// and write value[b] in [-1,1] from b's side-to-move. Every supplied position has
+// n_legal[b] >= 1 (terminals never reach the net — chess_terminal_value handles them).
+// ctx is the net handle. This is the batched twin of ChessEvaluator.evaluate; the #16
+// forward fills it via one seq=B*SEQ ANE forward + per-game legal-masked policy softmax
+// + WDL->W-L value.
+typedef struct BatchedChessEvaluator {
+    void *ctx;
+    void (*evaluate)(void *ctx, const Position *const *pos, int B,
+                     const Move *const *legal, const int *n_legal,
+                     float *const *priors, float *value);
+} BatchedChessEvaluator;
+
+// Optional coarse profiling for the throughput harness. Off by default; calling
+// mcts_profile_reset() enables counters until process exit. Timings are wall seconds.
+typedef struct {
+    long searches;
+    long sims;
+    long nodes;
+    long eval_calls;
+    long eval_positions;
+    double alloc_s;
+    double root_expand_s;
+    double root_eval_s;
+    double sim_cpu_s;
+    double leaf_eval_s;
+} MctsProfile;
+
+void mcts_profile_reset(void);
+MctsProfile mcts_profile_snapshot(void);
+
+// The G1 oracle wrapped as a batched evaluator (loops the single oracle per position).
+// Exposed so the equivalence gate can prove mcts_search_batched is bit-identical to B
+// independent mcts_search calls on the SAME deterministic oracle — i.e. the lockstep
+// driver itself is correct, independent of the net's fp16 noise.
+BatchedChessEvaluator chess_oracle_batched_evaluator(void);
+
+// Run Gumbel-AlphaZero MCTS over B parallel roots sharing ONE batched evaluator. Game b
+// runs EXACTLY mcts_search(roots[b], <equivalent single ev>, &cfgs[b]); the driver
+// locksteps the B searches so their pending leaf evals batch into bev->evaluate calls.
+// With a deterministic evaluator the result is bit-identical to B separate mcts_search
+// calls (proven by test_mcts --batched). cfgs[b].seed gives each game independent Gumbel
+// noise (self-play needs distinct games); outs[b] is filled exactly like mcts_search.
+// roots/cfgs/outs are B-long arrays. B must be >= 1.
+void mcts_search_batched(const Position *roots, int B, const BatchedChessEvaluator *bev,
+                         const MctsConfig *cfgs, MctsResult *outs);
 
 // =============================================================================
 // Improved-policy readout — the target the self-play loop (#18) trains toward.
