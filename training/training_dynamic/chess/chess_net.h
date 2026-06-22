@@ -23,6 +23,14 @@
 #include <string.h>
 #include <math.h>
 
+// MPS/Metal matmul backend (GPU/MPS rewrite, Phase 1 — the ane_matmul seam).
+// Guarded by __has_include so non-Metal builds (pure-C tests) stay clean.
+#if __has_include(<Metal/Metal.h>)
+#import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#define LILBRO_HAS_MPS 1
+#endif
+
 // ---- chess shapes (from chess.h / the model header) ------------------------
 #define NBOARD 64
 #define PLANES 73
@@ -41,6 +49,13 @@
 typedef struct { int ic, oc, seq; Kern *k; } MMEntry;
 static MMEntry g_mm[256]; static int g_nmm = 0;   // many (ic,oc,seq) shapes: B is bucketed
 static int g_cpu_mm = 0;
+
+#if LILBRO_HAS_MPS
+// Forward declarations: the MPS backend is defined after ane_matmul, but ane_matmul
+// dispatches to it when g_use_mps=1. Defined in the MPS section below.
+static int g_use_mps;
+static void mps_matmul(int ic, int oc, int seq, const float *x, const float *W, float *y);
+#endif
 
 // Optional trunk-forward sub-profiler (zero-overhead when g_trunk_prof==0). Splits each
 // ane_matmul into io (fp32<->fp16 convert + IOSurfaceLock, the CPU copy/dispatch tax) vs
@@ -104,6 +119,9 @@ static void ane_matmul(int ic, int oc, int seq, const float *x, const float *W, 
                     1.0f, W, oc, x, seq, 0.0f, y, seq);
         return;
     }
+#if LILBRO_HAS_MPS
+    if (g_use_mps) { mps_matmul(ic, oc, seq, x, W, y); return; }
+#endif
     Kern *k = mm_kernel(ic, oc, seq);
     uint64_t _tw = 0, _ta = 0;
     if (g_trunk_prof) _tw = mach_absolute_time();
@@ -114,6 +132,196 @@ static void ane_matmul(int ic, int oc, int seq, const float *x, const float *W, 
     io_read_dyn(k->ioOut, y, oc, seq);
     if (g_trunk_prof) g_trunk_io_s += tb_ms(mach_absolute_time() - _tw) * 1e-3;
 }
+
+// ============================================================================
+// MPS matmul backend: y[oc,seq] = W[ic,oc]^T @ x[ic,seq] via Metal/MPS.
+// Drop-in replacement for ane_matmul at the same seam. The ANE path pays
+// fp32->fp16 + IOSurfaceLock + ~0.2-0.4ms dispatch floor + IOSurfaceLock +
+// fp16->fp32 per eval (the ane+io = 40% of gen wall). MPS on Apple Silicon
+// unified memory skips ALL of that: zero-copy MTLBuffers (newBufferWithBytesNoCopy)
+// wrap existing page-aligned float* with NO copy, MPSDataTypeFloat32 needs NO
+// conversion, and MPSMatrixMultiplication encodes the matmul as a Metal compute
+// command. probe_mps measured ~2.3x faster per matmul vs ANE at B=64.
+//
+// Kernel cache: MPSMatrixMultiplication is init'd per (ic,oc,seq) — same key as
+// the ANE g_mm cache. Buffer cache: zero-copy MTLBuffers are cached by host ptr
+// (the trunk reuses the same CActs/CLayer buffers every forward, so a ptr-keyed
+// cache avoids re-creating MTLBuffers). Weights are persistent (optimizer writes
+// to the host ptr → automatically visible via shared memory). Activations change
+// every forward (CPU writes → GPU reads, GPU writes → CPU reads, same memory).
+// Requires page-aligned host memory — fmalloc/fcalloc use posix_memalign(4096).
+// ============================================================================
+#if LILBRO_HAS_MPS
+static id<MTLDevice>        g_mtl_dev   = nil;
+static id<MTLCommandQueue>  g_mtl_queue = nil;
+
+typedef struct { int ic, oc, seq; __strong MPSMatrixMultiplication *kern; } MpsKernEntry;
+static MpsKernEntry g_mps_kerns[256];
+static int g_nmps_kerns = 0;
+
+typedef struct { const void *ptr; size_t bytes; __strong id<MTLBuffer> buf; int zero_copy; } MpsBufEntry;
+static MpsBufEntry g_mps_bufs[128];
+static int g_nmps_bufs = 0;
+
+// MPSMatrix object cache: keyed by (W ptr, x ptr, y ptr, ic, oc, seq). The trunk
+// reuses the same host buffers every forward, so after the first forward every
+// matmul hits this cache and skips the 3x MPSMatrix alloc/init per call (which
+// was the measured 2.6x overhead vs the probe's cached path).
+typedef struct {
+    const void *pW, *pX, *pY; int ic, oc, seq;
+    __strong MPSMatrix *mW, *mX, *mY;
+} MpsMatEntry;
+static MpsMatEntry g_mps_mats[256];
+static int g_nmps_mats = 0;
+
+static void mps_init(void) {
+    if (g_mtl_dev) return;
+    g_mtl_dev = MTLCreateSystemDefaultDevice();
+    if (!g_mtl_dev) { fprintf(stderr, "[mps] MTLCreateSystemDefaultDevice FAILED — no Metal device\n"); return; }
+    g_mtl_queue = [g_mtl_dev newCommandQueue];
+    if (!g_mtl_queue) { fprintf(stderr, "[mps] newCommandQueue FAILED\n"); g_mtl_dev = nil; return; }
+    memset(g_mps_kerns, 0, sizeof(g_mps_kerns));
+    memset(g_mps_bufs, 0, sizeof(g_mps_bufs));
+    g_nmps_kerns = 0;
+    g_nmps_bufs = 0;
+}
+
+static MPSMatrixMultiplication *mps_kernel(int ic, int oc, int seq) {
+    for (int i = 0; i < g_nmps_kerns; i++)
+        if (g_mps_kerns[i].ic==ic && g_mps_kerns[i].oc==oc && g_mps_kerns[i].seq==seq)
+            return g_mps_kerns[i].kern;
+    if (g_nmps_kerns >= (int)(sizeof(g_mps_kerns)/sizeof(g_mps_kerns[0]))) {
+        fprintf(stderr, "[mps] kernel cache overflow (%d shapes)\n", g_nmps_kerns); abort();
+    }
+    // C = alpha * A^T @ B. A=W[ic,oc], B=x[ic,seq], C=y[oc,seq].
+    // M=oc (result rows), N=seq (result cols), K=ic (interior).
+    MPSMatrixMultiplication *k = [[MPSMatrixMultiplication alloc] initWithDevice:g_mtl_dev
+                transposeLeft:YES transposeRight:NO
+                resultRows:oc resultColumns:seq interiorColumns:ic
+                alpha:1.0f beta:0.0f];
+    if (!k) { fprintf(stderr, "[mps] MPSMatrixMultiplication init FAILED ic=%d oc=%d seq=%d\n", ic, oc, seq); abort(); }
+    g_mps_kerns[g_nmps_kerns] = (MpsKernEntry){ic, oc, seq, k};
+    g_nmps_kerns++;
+    return k;
+}
+
+// Get or create a zero-copy MTLBuffer for a host pointer. The trunk reuses the
+// same float* buffers every forward (CActs/CLayer), so this cache hits after the
+// first forward. Zero-copy: the MTLBuffer IS the host memory (shared mode) — no
+// copy, no coherency sync. Falls back to a managed buffer (copy) if the ptr
+// isn't page-aligned (posix_memalign in fmalloc should prevent this).
+// GROWTH: the same host buffer is used at different seq values (B=1 selfcheck
+// warmup seq=96, then B=64 bench seq=6144). The cache tracks the max bytes seen
+// per ptr and (re)creates the MTLBuffer when a larger request arrives. Zero-copy
+// recreation is free (same host ptr, larger length); managed recreation
+// reallocates. is_zero_copy is set to 1 for zero-copy, 0 for managed.
+static id<MTLBuffer> mps_get_buf(const void *ptr, size_t bytes, int *is_zero_copy) {
+    for (int i = 0; i < g_nmps_bufs; i++)
+        if (g_mps_bufs[i].ptr == ptr) {
+            if (g_mps_bufs[i].bytes >= bytes) {
+                *is_zero_copy = g_mps_bufs[i].zero_copy;
+                return g_mps_bufs[i].buf;
+            }
+            // Cached buffer too small — recreate at the larger size.
+            // Zero-copy: the host allocation is large enough (fmalloc sized for
+            // maxS), so we just wrap the same ptr with a larger length. Managed:
+            // drop the old buffer and allocate a bigger one.
+            size_t pg = 4096;
+            size_t buf_bytes = (bytes + pg - 1) & ~(pg - 1);
+            id<MTLBuffer> buf = nil;
+            int zc = 0;
+            if (((uintptr_t)ptr & (pg - 1)) == 0) {
+                buf = [g_mtl_dev newBufferWithBytesNoCopy:(void *)ptr length:buf_bytes
+                            options:MTLResourceStorageModeShared deallocator:nil];
+                if (buf) zc = 1;
+            }
+            if (!buf) {
+                buf = [g_mtl_dev newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+                if (!buf) { fprintf(stderr, "[mps] buffer realloc FAILED (%zu bytes)\n", buf_bytes); abort(); }
+            }
+            g_mps_bufs[i].buf = buf;
+            g_mps_bufs[i].bytes = bytes;
+            g_mps_bufs[i].zero_copy = zc;
+            *is_zero_copy = zc;
+            return buf;
+        }
+    if (g_nmps_bufs >= (int)(sizeof(g_mps_bufs)/sizeof(g_mps_bufs[0]))) {
+        fprintf(stderr, "[mps] buffer cache overflow (%d bufs)\n", g_nmps_bufs); abort();
+    }
+    // Round length up to page boundary (newBufferWithBytesNoCopy requires it).
+    size_t pg = 4096;
+    size_t buf_bytes = (bytes + pg - 1) & ~(pg - 1);
+    id<MTLBuffer> buf = nil;
+    int zc = 0;
+    // Try zero-copy first (requires page-aligned address).
+    if (((uintptr_t)ptr & (pg - 1)) == 0) {
+        buf = [g_mtl_dev newBufferWithBytesNoCopy:(void *)ptr length:buf_bytes
+                    options:MTLResourceStorageModeShared deallocator:nil];
+        if (buf) zc = 1;
+    }
+    if (!buf) {
+        // Fallback: managed buffer (allocates; caller copies in/out per call).
+        buf = [g_mtl_dev newBufferWithLength:buf_bytes options:MTLResourceStorageModeShared];
+        if (!buf) { fprintf(stderr, "[mps] buffer alloc FAILED (%zu bytes)\n", buf_bytes); abort(); }
+    }
+    g_mps_bufs[g_nmps_bufs] = (MpsBufEntry){ptr, bytes, buf, zc};
+    g_nmps_bufs++;
+    *is_zero_copy = zc;
+    return buf;
+}
+
+static void mps_matmul(int ic, int oc, int seq, const float *x, const float *W, float *y) {
+    @autoreleasepool {
+        MPSMatrixMultiplication *kern = mps_kernel(ic, oc, seq);
+        size_t bytesW = (size_t)ic * oc * 4;
+        size_t bytesX = (size_t)ic * seq * 4;
+        size_t bytesY = (size_t)oc * seq * 4;
+        int zcW, zcX, zcY;
+        id<MTLBuffer> bufW = mps_get_buf(W, bytesW, &zcW);
+        id<MTLBuffer> bufX = mps_get_buf(x, bytesX, &zcX);
+        id<MTLBuffer> bufY = mps_get_buf(y, bytesY, &zcY);
+        // Managed (non-zero-copy) inputs: copy current data in.
+        if (!zcW) memcpy(bufW.contents, W, bytesW);
+        if (!zcX) memcpy(bufX.contents, x, bytesX);
+
+        // Cache the MPSMatrix triple by (ptrs + shape). The trunk reuses the same
+        // host buffers, so this hits after the first forward and skips 3x alloc/init.
+        MPSMatrix *mW = nil, *mX = nil, *mY = nil;
+        for (int i = 0; i < g_nmps_mats; i++) {
+            if (g_mps_mats[i].pW==W && g_mps_mats[i].pX==x && g_mps_mats[i].pY==y &&
+                g_mps_mats[i].ic==ic && g_mps_mats[i].oc==oc && g_mps_mats[i].seq==seq) {
+                mW = g_mps_mats[i].mW; mX = g_mps_mats[i].mX; mY = g_mps_mats[i].mY;
+                break;
+            }
+        }
+        if (!mW) {
+            if (g_nmps_mats >= (int)(sizeof(g_mps_mats)/sizeof(g_mps_mats[0]))) {
+                fprintf(stderr, "[mps] MPSMatrix cache overflow (%d)\n", g_nmps_mats); abort();
+            }
+            MPSMatrixDescriptor *dW = [MPSMatrixDescriptor matrixDescriptorWithRows:ic columns:oc
+                                        rowBytes:(oc*4) dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *dX = [MPSMatrixDescriptor matrixDescriptorWithRows:ic columns:seq
+                                        rowBytes:(seq*4) dataType:MPSDataTypeFloat32];
+            MPSMatrixDescriptor *dY = [MPSMatrixDescriptor matrixDescriptorWithRows:oc columns:seq
+                                        rowBytes:(seq*4) dataType:MPSDataTypeFloat32];
+            mW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:dW];
+            mX = [[MPSMatrix alloc] initWithBuffer:bufX descriptor:dX];
+            mY = [[MPSMatrix alloc] initWithBuffer:bufY descriptor:dY];
+            g_mps_mats[g_nmps_mats] = (MpsMatEntry){W, x, y, ic, oc, seq, mW, mX, mY};
+            g_nmps_mats++;
+        }
+
+        uint64_t _t = 0;
+        if (g_trunk_prof) _t = mach_absolute_time();
+        id<MTLCommandBuffer> cb = [g_mtl_queue commandBuffer];
+        [kern encodeToCommandBuffer:cb leftMatrix:mW rightMatrix:mX resultMatrix:mY];
+        [cb commit]; [cb waitUntilCompleted];
+        if (g_trunk_prof) g_trunk_ane_s += tb_ms(mach_absolute_time() - _t) * 1e-3;
+        // Managed output: copy GPU result back to host. Zero-copy: already written.
+        if (!zcY) memcpy(y, bufY.contents, bytesY);
+    }
+}
+#endif // LILBRO_HAS_MPS
 
 // transpose src[rows,cols] -> dst[cols,rows]
 static void transpose2d(float *dst, const float *src, int rows, int cols) {
@@ -142,8 +350,18 @@ typedef struct { float *Wq,*Wk,*Wv,*Wo,*W1,*W2,*W3,*rms_att,*rms_ffn; float *Wqk
 // backward) works unchanged. [iter 6]
 typedef struct { float *layer_in,*xnorm,*qkv,*Q,*K,*V,*attn,*x2,*x2norm,*h13,*h1,*h3,*gate; } CActs;
 
-static float *fmalloc(size_t n) { return (float*)malloc(n*4); }
-static float *fcalloc(size_t n) { return (float*)calloc(n,4); }
+// Page-aligned alloc for MPS zero-copy (newBufferWithBytesNoCopy requires
+// page-aligned address + length). posix_memalign(4096) ensures all trunk
+// buffers (weights + activations) qualify. The extra bytes from length
+// rounding are zero and unused by the matmul.
+static float *fmalloc(size_t n) {
+    void *p = NULL; size_t bytes = ((n*4 + 4095) & ~4095);
+    if (posix_memalign(&p, 4096, bytes)) { fprintf(stderr, "[fmalloc] OOM (%zu)\n", bytes); abort(); }
+    return (float*)p;
+}
+static float *fcalloc(size_t n) {
+    float *p = fmalloc(n); memset(p, 0, n*4); return p;
+}
 
 static void clayer_alloc(CLayer *w) {
     w->Wq=fmalloc(DIM*Q_DIM); w->Wk=fmalloc(DIM*KV_DIM); w->Wv=fmalloc(DIM*KV_DIM);

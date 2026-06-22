@@ -21,6 +21,7 @@ SPConfig sp_defaults(void) {
     c.eval_games = 40; c.eval_every = 5; c.eval_sims = 32; c.eval_considered = 16; c.eval_max_plies = 120;
     c.bench_games = 256;
     c.profile = 0;
+    c.use_mps = 0;
     c.seed = 42; c.ckpt = "ane_chess_g2_ckpt.bin"; c.resume = 0;
     return c;
 }
@@ -55,6 +56,7 @@ SPConfig sp_parse(int argc, char **argv, int *mode) {
         ARGI("--eval-max-plies", eval_max_plies);
         ARGI("--bench-games", bench_games);
         else if (!strcmp(argv[i], "--profile")) c.profile = 1;
+        else if (!strcmp(argv[i], "--mps"))     c.use_mps = 1;
     }
     if (c.B > 160) c.B = 160;   // round32(B)*96 must stay <= 16384; max packed B is 160
     if (c.bench_games < 1) c.bench_games = 1;

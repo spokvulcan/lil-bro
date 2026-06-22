@@ -365,6 +365,13 @@ int main(int argc, char **argv) {
         chess_init();
         int mode; SPConfig cfg = sp_parse(argc, argv, &mode);
         g_res_alpha = 1.0f/sqrtf(2.0f*NLAYERS);
+#if LILBRO_HAS_MPS
+        if (cfg.use_mps) {
+            mps_init();
+            if (g_mtl_dev) { g_use_mps = 1; printf("# MPS: device=%s ( Metal matmul backend ENABLED )\n", [[g_mtl_dev name] UTF8String]); }
+            else { printf("# MPS: init FAILED — falling back to ANE\n"); }
+        }
+#endif
 
         printf("# chess self-play (%s) — DIM=%d HIDDEN=%d L=%d SEQ=%d  | B=%d sims=%d considered=%d\n",
                mode == 3 ? "bench" : (mode == 2 ? "selfcheck" : (mode == 1 ? "G2" : "smoke")),
