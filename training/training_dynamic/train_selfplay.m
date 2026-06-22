@@ -72,6 +72,8 @@ static void net_eval_profile_reset(NetEvalCtx *e) {
     e->prof_enabled = 1;
     e->prof_calls = e->prof_positions = 0;
     e->prof_encode_s = e->prof_embed_s = e->prof_trunk_s = e->prof_readout_s = 0.0;
+    g_trunk_io_s = 0.0; g_trunk_ane_s = 0.0; g_trunk_attn_s = 0.0;
+    g_trunk_rms_s = 0.0; g_trunk_silu_s = 0.0; g_trunk_softmax_s = 0.0; g_trunk_prof = 0;
 }
 
 static double mt_s(uint64_t t) { return tb_ms(t) * 1e-3; }
@@ -101,9 +103,20 @@ static void net_eval_batched(void *ctx, const Position *const *pos, int B,
     if (e->prof_enabled) { e->prof_embed_s += mt_s(mach_absolute_time() - t0); t0 = mach_absolute_time(); }
     chess_trunk_forward(e->net->W, e->acts, e->x_in, P, e->x_pre, e->x_final, e->net->rms_final, g_res_alpha, 0);
     if (e->prof_enabled) { e->prof_trunk_s += mt_s(mach_absolute_time() - t0); t0 = mach_absolute_time(); }
-    for (int b = 0; b < B; b++)
-        value[b] = chess_policy_value_readout(e->x_final + (size_t)b*SEQ, P*SEQ,
-                                              e->net->W_pol, e->net->W_val, legal[b], n_legal[b], priors[b]);
+    // Readout is per-position independent (policy legal-masked softmax + WDL value); parallelize
+    // over B. This is a SERIAL->PARALLEL win (full wall benefit, not /12 like the already-
+    // parallel trunk sections). Each b writes value[b]/priors[b] (disjoint), reads x_final[b].
+    // Bit-identical per b => checksum preserved. [iter 8]
+    {
+        int Bb = B; float *xfin = e->x_final; int Ps = P*SEQ;
+        const float *Wp = e->net->W_pol, *Wv = e->net->W_val;
+        const Move *const *lg = legal; const int *nl = n_legal; float *const *pr = priors; float *val = value;
+        dispatch_queue_t dq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+        dispatch_apply(Bb, dq, ^(size_t bb) {
+            int b = (int)bb;
+            val[b] = chess_policy_value_readout(xfin + (size_t)b*SEQ, Ps, Wp, Wv, lg[b], nl[b], pr[b]);
+        });
+    }
     if (e->prof_enabled) e->prof_readout_s += mt_s(mach_absolute_time() - t0);
 }
 
@@ -175,6 +188,7 @@ static void learner_step(Learner *L, ReplayBuffer *rb, const SPConfig *cfg, int 
     chess_trunk_backward(L->net->W, L->grads->W, L->acts, L->dx_final, K, L->x_pre, L->net->rms_final, L->grads->rms_final, L->dy_in, g_res_alpha);
     chess_embed_posenc_backward_batched(L->dy_in, K, L->grads->tok_emb, L->grads->rank_emb, L->grads->file_emb, L->grads->misc_emb, L->tokens);
     optimizer_step(1.0f/(ls*(float)K), cfg->grad_clip, adam_t, cfg->lr, cfg->wd);
+    chess_net_build_fused(L->net);   // keep fused forward weights in sync with the canonical ones [iter 6]
 
     *out_lp = (float)(lp / K); *out_lv = (float)(lv / K);
     free(batch);
@@ -256,6 +270,7 @@ static void run_bench(NetEvalCtx *evctx, const BatchedChessEvaluator *bev, const
 
     net_eval_profile_reset(evctx);
     mcts_profile_reset();
+    g_trunk_prof = 1;   // enable the ane_matmul io/ane sub-profiler for the timed run
     uint64_t t0 = mach_absolute_time();
     int batch = 0;
     while (gs.games < cfg->bench_games) {
@@ -297,10 +312,30 @@ static void run_bench(NetEvalCtx *evctx, const BatchedChessEvaluator *bev, const
     printf("eval_cost_s encode=%.3f embed=%.3f trunk=%.3f readout=%.3f\n",
            evctx->prof_encode_s, evctx->prof_embed_s, evctx->prof_trunk_s, evctx->prof_readout_s);
     printf("eval_cost_pct encode=%.1f embed=%.1f trunk=%.1f readout=%.1f\n",
-           wall_s > 0 ? 100.0*evctx->prof_encode_s/wall_s : 0.0,
-           wall_s > 0 ? 100.0*evctx->prof_embed_s/wall_s : 0.0,
-           wall_s > 0 ? 100.0*evctx->prof_trunk_s/wall_s : 0.0,
-           wall_s > 0 ? 100.0*evctx->prof_readout_s/wall_s : 0.0);
+            wall_s > 0 ? 100.0*evctx->prof_encode_s/wall_s : 0.0,
+            wall_s > 0 ? 100.0*evctx->prof_embed_s/wall_s : 0.0,
+            wall_s > 0 ? 100.0*evctx->prof_trunk_s/wall_s : 0.0,
+            wall_s > 0 ? 100.0*evctx->prof_readout_s/wall_s : 0.0);
+    // trunk sub-profile: io (fp16 convert + IOSurfaceLock) vs ane (ANE dispatch) vs cpu_ops
+    double t_io = g_trunk_io_s, t_ane = g_trunk_ane_s;
+    double t_attn = g_trunk_attn_s, t_softmax = g_trunk_softmax_s;
+    double t_attn_compute = t_attn - t_softmax;
+    double t_rms = g_trunk_rms_s, t_silu = g_trunk_silu_s;
+    double t_cpuops = evctx->prof_trunk_s - (t_io + t_ane);
+    double t_rest = t_cpuops - t_attn;   // rms + silu + residual + memcpy + dispatch overhead
+    double t_resid = t_rest - t_rms - t_silu;   // residual + memcpy + GCD overhead
+    if (t_io + t_ane > 0.0) {
+        printf("trunk_split_s io=%.3f ane=%.3f attn_comp=%.3f softmax=%.3f rms=%.3f silu=%.3f resid=%.3f (trunk=%.3f)\n",
+               t_io, t_ane, t_attn_compute, t_softmax, t_rms, t_silu, t_resid, evctx->prof_trunk_s);
+        printf("trunk_split_pct_of_wall io=%.1f ane=%.1f attn_comp=%.1f softmax=%.1f rms=%.1f silu=%.1f resid=%.1f\n",
+               wall_s > 0 ? 100.0*t_io/wall_s : 0.0,
+               wall_s > 0 ? 100.0*t_ane/wall_s : 0.0,
+               wall_s > 0 ? 100.0*t_attn_compute/wall_s : 0.0,
+               wall_s > 0 ? 100.0*t_softmax/wall_s : 0.0,
+               wall_s > 0 ? 100.0*t_rms/wall_s : 0.0,
+               wall_s > 0 ? 100.0*t_silu/wall_s : 0.0,
+               wall_s > 0 ? 100.0*t_resid/wall_s : 0.0);
+    }
     replay_free(&rb);
 }
 
@@ -337,6 +372,10 @@ int main(int argc, char **argv) {
             if (chess_net_load(&net, cfg.ckpt)) printf("# resumed from %s\n", cfg.ckpt);
             else printf("# --resume: no/!matching checkpoint at %s — starting from random init\n", cfg.ckpt);
         }
+        // Build the fused forward-only weights (QKV, W1/W3) from the canonical ones. Must run
+        // before ANY forward (selfcheck/bench/training) and is rebuilt after every optimizer
+        // step in the learner. Forward-only; checkpoint + backward use the canonical weights.
+        chess_net_build_fused(&net);
 
         if (mode == 2) return selfcheck(&net);   // --selfcheck
 

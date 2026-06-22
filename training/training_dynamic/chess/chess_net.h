@@ -42,6 +42,32 @@ typedef struct { int ic, oc, seq; Kern *k; } MMEntry;
 static MMEntry g_mm[256]; static int g_nmm = 0;   // many (ic,oc,seq) shapes: B is bucketed
 static int g_cpu_mm = 0;
 
+// Optional trunk-forward sub-profiler (zero-overhead when g_trunk_prof==0). Splits each
+// ane_matmul into io (fp32<->fp16 convert + IOSurfaceLock, the CPU copy/dispatch tax) vs
+// ane (the blocking evaluateWithQoS dispatch). Set by the bench; read after the run.
+// cpu_ops (attn/rms/silu/residual/memcpy) = prof_trunk_s - (g_trunk_io_s + g_trunk_ane_s).
+static int    g_trunk_prof = 0;
+static double g_trunk_io_s = 0.0, g_trunk_ane_s = 0.0;
+static double g_trunk_attn_s = 0.0;   // attn_cpu_forward_batched time (the suspected hot op)
+static double g_trunk_rms_s = 0.0, g_trunk_silu_s = 0.0, g_trunk_softmax_s = 0.0;
+
+// Parallel elementwise over N contiguous elements in ~12*8 GCD chunks. ELEMENTWISE BODIES
+// ONLY (no cross-element reduction): each element is computed once, in the same FP order as
+// the serial loop, just distributed across cores => bit-identical output, bench checksum
+// preserved. The seam used to parallelize the trunk's residual/SiLU/embed loops. [iter 3]
+static void chess_parallel_for(long N, void (^body)(long lo, long hi)) {
+    if (N <= 0) return;
+    long nc = N / 2048;                 // ~2048 elems/chunk: coarse enough to amortize dispatch
+    if (nc < 1) nc = 1;
+    if (nc > 96) nc = 96;               // cap: 12 P-cores * 8 for load balance
+    if (nc <= 1) { body(0, N); return; }
+    dispatch_queue_t dq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(nc, dq, ^(size_t ci) {
+        long lo = (long)ci * N / nc, hi = (long)(ci + 1) * N / nc;
+        body(lo, hi);
+    });
+}
+
 static Kern *mm_kernel(int ic, int oc, int seq) {
     for (int i = 0; i < g_nmm; i++)
         if (g_mm[i].ic==ic && g_mm[i].oc==oc && g_mm[i].seq==seq) return g_mm[i].k;
@@ -60,9 +86,14 @@ static void ane_matmul(int ic, int oc, int seq, const float *x, const float *W, 
         return;
     }
     Kern *k = mm_kernel(ic, oc, seq);
+    uint64_t _tw = 0, _ta = 0;
+    if (g_trunk_prof) _tw = mach_absolute_time();
     io_write_dyn(k->ioIn, x, ic, seq, W, oc);
+    if (g_trunk_prof) { g_trunk_io_s += tb_ms(mach_absolute_time() - _tw) * 1e-3; _ta = mach_absolute_time(); }
     ane_eval(k);
+    if (g_trunk_prof) { g_trunk_ane_s += tb_ms(mach_absolute_time() - _ta) * 1e-3; _tw = mach_absolute_time(); }
     io_read_dyn(k->ioOut, y, oc, seq);
+    if (g_trunk_prof) g_trunk_io_s += tb_ms(mach_absolute_time() - _tw) * 1e-3;
 }
 
 // transpose src[rows,cols] -> dst[cols,rows]
@@ -79,9 +110,18 @@ static void dW_acc(float *gW, const float *x, const float *dy, int IN, int O, in
 
 // ============================================================================
 // Net + per-layer activations / gradients (weights [IN,OUT] row-major).
+// CLayer.Wqkv/W13 are FUSED forward-only weights (QKV 3->1, W1/W3 2->1) that cut the
+// ANE eval count 14->8/forward; NULL until chess_net_build_fused, rebuilt after every
+// optimizer step. The canonical Wq/Wk/Wv/W1/W3 stay the source of truth (checkpoint +
+// optimizer + backward use THEM), so the fusion is forward-only and touches neither
+// the checkpoint format nor the backward. [iter 6]
 // ============================================================================
-typedef struct { float *Wq,*Wk,*Wv,*Wo,*W1,*W2,*W3,*rms_att,*rms_ffn; } CLayer;
-typedef struct { float *layer_in,*xnorm,*Q,*K,*V,*attn,*x2,*x2norm,*h1,*h3,*gate; } CActs;
+typedef struct { float *Wq,*Wk,*Wv,*Wo,*W1,*W2,*W3,*rms_att,*rms_ffn; float *Wqkv, *W13; } CLayer;
+// CActs.qkv/h13 are the fused activation storage: Q/K/V are contiguous row-slices of qkv
+// ([Q_DIM+2*KV_DIM, S]); h1/h3 are contiguous row-slices of h13 ([2*HIDDEN, S]). The Q/K/V/
+// h1/h3 pointers are set into them by cacts_alloc, so all existing indexing (attn, silu,
+// backward) works unchanged. [iter 6]
+typedef struct { float *layer_in,*xnorm,*qkv,*Q,*K,*V,*attn,*x2,*x2norm,*h13,*h1,*h3,*gate; } CActs;
 
 static float *fmalloc(size_t n) { return (float*)malloc(n*4); }
 static float *fcalloc(size_t n) { return (float*)calloc(n,4); }
@@ -90,18 +130,24 @@ static void clayer_alloc(CLayer *w) {
     w->Wq=fmalloc(DIM*Q_DIM); w->Wk=fmalloc(DIM*KV_DIM); w->Wv=fmalloc(DIM*KV_DIM);
     w->Wo=fmalloc(Q_DIM*DIM); w->W1=fmalloc(DIM*HIDDEN); w->W2=fmalloc(HIDDEN*DIM);
     w->W3=fmalloc(DIM*HIDDEN); w->rms_att=fmalloc(DIM); w->rms_ffn=fmalloc(DIM);
+    w->Wqkv=NULL; w->W13=NULL;
 }
 static void clayer_calloc(CLayer *g) {
     g->Wq=fcalloc(DIM*Q_DIM); g->Wk=fcalloc(DIM*KV_DIM); g->Wv=fcalloc(DIM*KV_DIM);
     g->Wo=fcalloc(Q_DIM*DIM); g->W1=fcalloc(DIM*HIDDEN); g->W2=fcalloc(HIDDEN*DIM);
     g->W3=fcalloc(DIM*HIDDEN); g->rms_att=fcalloc(DIM); g->rms_ffn=fcalloc(DIM);
+    g->Wqkv=NULL; g->W13=NULL;
 }
 // Activations sized for up to `maxS` packed tokens (= maxB*SEQ). B=1 path uses maxS=SEQ.
+// Q/K/V are slices of qkv; h1/h3 are slices of h13 (see CActs comment). [iter 6]
 static void cacts_alloc(CActs *a, int maxS) {
     a->layer_in=fmalloc((size_t)DIM*maxS); a->xnorm=fmalloc((size_t)DIM*maxS);
-    a->Q=fmalloc((size_t)Q_DIM*maxS); a->K=fmalloc((size_t)KV_DIM*maxS); a->V=fmalloc((size_t)KV_DIM*maxS);
+    a->qkv=fmalloc((size_t)(Q_DIM+2*KV_DIM)*maxS);
+    a->Q = a->qkv; a->K = a->qkv + (size_t)Q_DIM*maxS; a->V = a->qkv + (size_t)(Q_DIM+KV_DIM)*maxS;
     a->attn=fmalloc((size_t)Q_DIM*maxS); a->x2=fmalloc((size_t)DIM*maxS); a->x2norm=fmalloc((size_t)DIM*maxS);
-    a->h1=fmalloc((size_t)HIDDEN*maxS); a->h3=fmalloc((size_t)HIDDEN*maxS); a->gate=fmalloc((size_t)HIDDEN*maxS);
+    a->h13=fmalloc((size_t)2*HIDDEN*maxS);
+    a->h1 = a->h13; a->h3 = a->h13 + (size_t)HIDDEN*maxS;
+    a->gate=fmalloc((size_t)HIDDEN*maxS);
 }
 
 // Ensure the cpu_ops RMSNorm scratch is sized for `maxS` columns (it is lazily sized to
@@ -111,35 +157,115 @@ static void chess_net_init_rmstmp(int maxS) {
     g_rms_tmp = (float*)malloc((size_t)maxS*4);
 }
 
+// Parallel RMSNorm over S-column chunks. The per-column reduction over `d` (DIM) is serial
+// within each chunk and in the SAME order as the serial rmsnorm (vDSP_vadd accumulates row
+// by row), so every output column is bit-identical and the bench checksum is preserved.
+// Each chunk needs its own ss/tmp scratch (the serial rmsnorm's g_rms_tmp is shared => would
+// race across cores), hence the per-chunk malloc. Small S (B=1 selfcheck) falls back to the
+// serial rmsnorm unchanged. [iter 5]
+static void chess_rmsnorm_par(float *out, const float *x, const float *w, int d, int S) {
+    if (S < 2048) { rmsnorm(out, x, w, d, S); return; }
+    long nc = S / 512; if (nc < 1) nc = 1; if (nc > 24) nc = 24;
+    if (nc <= 1) { rmsnorm(out, x, w, d, S); return; }
+    dispatch_queue_t dq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(nc, dq, ^(size_t ci) {
+        long lo = (long)ci * S / nc, hi = (long)(ci + 1) * S / nc;
+        vDSP_Length cs = (vDSP_Length)(hi - lo);
+        float *ss = (float*)malloc((size_t)cs * 4), *tmp = (float*)malloc((size_t)cs * 4);
+        memset(ss, 0, (size_t)cs * 4);
+        for (int i = 0; i < d; i++) {
+            vDSP_vmul(x + (size_t)i*S + lo, 1, x + (size_t)i*S + lo, 1, tmp, 1, cs);
+            vDSP_vadd(tmp, 1, ss, 1, ss, 1, cs);
+        }
+        float invd = 1.0f / d, eps = 1e-5f;
+        vDSP_vsmsa(ss, 1, &invd, &eps, ss, 1, cs);
+        int n = (int)cs; vvrsqrtf(ss, ss, &n);   // ss -> rrms
+        for (int i = 0; i < d; i++) {
+            vDSP_vmul(x + (size_t)i*S + lo, 1, ss, 1, out + (size_t)i*S + lo, 1, cs);
+            vDSP_vsmul(out + (size_t)i*S + lo, 1, &w[i], out + (size_t)i*S + lo, 1, cs);
+        }
+        free(ss); free(tmp);
+    });
+}
+
 // ============================================================================
 // Batched causal attention (per-position, channel stride B*seqp). Chess v1 has no
 // attention-sink / qk-norm, so this is the plain causal core of attn_cpu_forward; for
 // B=1 it is byte-identical to attn_cpu_forward(...,NULL,NULL,NULL,SEQ). GQA-aware
 // (kv-head = h % KV_HEADS); chess_g0 is MHA so kv-head == head.
+//
+// PARALLEL + NEON [iter 2/4]: the B positions are independent (disjoint output regions,
+// read-only Q/K/V), so the b-loop runs over all P-cores via dispatch_apply. Per (b,h) the
+// strided [channel, S] Q/K/V slice (d-stride = S, hostile to NEON) is transposed once into
+// a contiguous [seqp, HD] tile; the O(seqp^2*HD) QK^T dot and the AV weighted sum then run
+// as 2-way-ILP NEON fmla over HD. The softmax stays scalar (small, separate cost).
+//
+// FP-order note: the NEON reductions (2 partial accumulators + horizontal sum) change the
+// per-(b,h) rounding vs the old serial scalar loop, so the bench CHECKSUM CHANGES. Run-to-
+// run determinism holds (NEON + a fixed tile order are deterministic), and the selfcheck
+// stays green because both the batched and single-position paths use this SAME function
+// (per-position results are identical regardless of B). [iter 4]
 // ============================================================================
 static void attn_cpu_forward_batched(float *attn_out, const float *Q, const float *K,
                                      const float *V, int B, int seqp) {
     int S = B*seqp;
     float scale = 1.0f/sqrtf((float)HD);
-    for (int b = 0; b < B; b++) {
+    dispatch_queue_t dq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(B, dq, ^(size_t bb) {
+        int b = (int)bb;
         int base = b*seqp;
+        size_t tn = (size_t)seqp * HD;
+        float *buf = (float*)malloc((4 * tn + (size_t)seqp) * 4);
+        float *qt = buf, *kt = buf + tn, *vt = buf + 2*tn, *ot = buf + 3*tn, *sc = buf + 4*tn;
         for (int h = 0; h < HEADS; h++) {
             int kvh = h % KV_HEADS;
+            // build contiguous [seqp, HD] tiles from the [HD, S] strided slice (scalar strided
+            // read; O(seqp*HD) << O(seqp^2*HD) compute, ~2% of the work).
+            for (int t = 0; t < seqp; t++) {
+                const float *qp = Q + (size_t)(h*HD)*S + base + t;
+                const float *kp = K + (size_t)(kvh*HD)*S + base + t;
+                const float *vp = V + (size_t)(kvh*HD)*S + base + t;
+                float *qo = qt + (size_t)t*HD, *ko = kt + (size_t)t*HD, *vo = vt + (size_t)t*HD;
+                for (int d = 0; d < HD; d++) { qo[d] = qp[(size_t)d*S]; ko[d] = kp[(size_t)d*S]; vo[d] = vp[(size_t)d*S]; }
+            }
             for (int q = 0; q < seqp; q++) {
-                float sc[SEQ]; float m = -1e30f;
+                const float *qr = qt + (size_t)q*HD;
+                float m = -1e30f;
                 for (int j = 0; j <= q; j++) {
-                    float dot = 0; for (int d = 0; d < HD; d++) dot += Q[(h*HD+d)*S+base+q]*K[(kvh*HD+d)*S+base+j];
-                    sc[j] = dot*scale; if (sc[j] > m) m = sc[j];
+                    const float *kr = kt + (size_t)j*HD;
+                    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+                    for (int d = 0; d < HD; d += 8) {
+                        a0 = vmlaq_f32(a0, vld1q_f32(qr + d),     vld1q_f32(kr + d));
+                        a1 = vmlaq_f32(a1, vld1q_f32(qr + d + 4), vld1q_f32(kr + d + 4));
+                    }
+                    float dot = vaddvq_f32(vaddq_f32(a0, a1));
+                    sc[j] = dot * scale; if (sc[j] > m) m = sc[j];
                 }
-                float Z = 0; for (int j = 0; j <= q; j++) { sc[j] = expf(sc[j]-m); Z += sc[j]; }
-                float inv = 1.0f/Z;
-                for (int d = 0; d < HD; d++) {
-                    float acc = 0; for (int j = 0; j <= q; j++) acc += sc[j]*V[(kvh*HD+d)*S+base+j];
-                    attn_out[(h*HD+d)*S+base+q] = acc*inv;
+                float Z = 0.0f;
+                { uint64_t _t = g_trunk_prof ? mach_absolute_time() : 0;
+                  for (int j = 0; j <= q; j++) { sc[j] = expf(sc[j] - m); Z += sc[j]; }
+                  if (g_trunk_prof) g_trunk_softmax_s += tb_ms(mach_absolute_time() - _t) * 1e-3; }
+                float inv = 1.0f / Z;
+                float *orc = ot + (size_t)q*HD;
+                for (int dd = 0; dd < HD; dd += 8) {
+                    float32x4_t o0 = vdupq_n_f32(0.0f), o1 = vdupq_n_f32(0.0f);
+                    for (int j = 0; j <= q; j++) {
+                        float32x4_t wv = vdupq_n_f32(sc[j] * inv);
+                        const float *vr = vt + (size_t)j*HD + dd;
+                        o0 = vmlaq_f32(o0, wv, vld1q_f32(vr));
+                        o1 = vmlaq_f32(o1, wv, vld1q_f32(vr + 4));
+                    }
+                    vst1q_f32(orc + dd, o0);
+                    vst1q_f32(orc + dd + 4, o1);
                 }
             }
+            // scatter [seqp, HD] tile back to the [HD, S] strided output
+            for (int q = 0; q < seqp; q++)
+                for (int d = 0; d < HD; d++)
+                    attn_out[(size_t)(h*HD + d)*S + base + q] = ot[(size_t)q*HD + d];
         }
-    }
+        free(buf);
+    });
 }
 // Backward of attn_cpu_forward_batched. da[Q_DIM,S] -> dQ[Q_DIM,S], dK/dV[KV_DIM,S]
 // (accumulated, GQA-reduced). Recomputes the softmax. B=1 == attn_cpu_backward (no knobs).
@@ -195,26 +321,56 @@ static void chess_trunk_forward(CLayer *W, CActs *acts, const float *x_in, int B
     for (int L = 0; L < NLAYERS; L++) {
         CActs *ac = save_acts ? &acts[L] : &acts[0];
         CLayer *w = &W[L];
-        memcpy(ac->layer_in, x, (size_t)DIM*S*4);
-        rmsnorm(ac->xnorm, x, w->rms_att, DIM, S);
-        ane_matmul(DIM, Q_DIM, S, ac->xnorm, w->Wq, ac->Q);
-        ane_matmul(DIM, KV_DIM, S, ac->xnorm, w->Wk, ac->K);
-        ane_matmul(DIM, KV_DIM, S, ac->xnorm, w->Wv, ac->V);
-        attn_cpu_forward_batched(ac->attn, ac->Q, ac->K, ac->V, B, SEQ);
-        ane_matmul(Q_DIM, DIM, S, ac->attn, w->Wo, o);
-        for (int i = 0; i < DIM*S; i++) ac->x2[i] = x[i] + res_alpha*o[i];
-        rmsnorm(ac->x2norm, ac->x2, w->rms_ffn, DIM, S);
-        ane_matmul(DIM, HIDDEN, S, ac->x2norm, w->W1, ac->h1);
-        ane_matmul(DIM, HIDDEN, S, ac->x2norm, w->W3, ac->h3);
-        for (int i = 0; i < HIDDEN*S; i++) {
-            float sig = 1.0f/(1.0f+expf(-ac->h1[i]));
-            ac->gate[i] = (ac->h1[i]*sig) * ac->h3[i];
+        if (save_acts) memcpy(ac->layer_in, x, (size_t)DIM*S*4);   // only the backward reads layer_in [iter 7]
+        { uint64_t _t = g_trunk_prof ? mach_absolute_time() : 0;
+          chess_rmsnorm_par(ac->xnorm, x, w->rms_att, DIM, S);
+          if (g_trunk_prof) g_trunk_rms_s += tb_ms(mach_absolute_time() - _t) * 1e-3; }
+        // Fused QKV vs separate: ADAPTIVE. The fused matmul (3 evals -> 1) wins when the ANE
+        // is dispatch-bound (small S, floor ~0.2ms/eval dominates); it is neutral-or-worse
+        // when compute-bound (large S, B=160: same FLOPs, bigger oc surfaces => more io). The
+        // probe puts the crossover near B~128 (S~12288). Both paths write the SAME ac->qkv
+        // buffer (Q/K/V are contiguous row-slices), so the output is bit-identical either way.
+        // [iter 6]
+        if (S <= 12288) {
+            ane_matmul(DIM, Q_DIM + 2*KV_DIM, S, ac->xnorm, w->Wqkv, ac->Q);
+        } else {
+            ane_matmul(DIM, Q_DIM,    S, ac->xnorm, w->Wq, ac->Q);
+            ane_matmul(DIM, KV_DIM,   S, ac->xnorm, w->Wk, ac->K);
+            ane_matmul(DIM, KV_DIM,   S, ac->xnorm, w->Wv, ac->V);
         }
+        {
+            uint64_t _ta = g_trunk_prof ? mach_absolute_time() : 0;
+            attn_cpu_forward_batched(ac->attn, ac->Q, ac->K, ac->V, B, SEQ);
+            if (g_trunk_prof) g_trunk_attn_s += tb_ms(mach_absolute_time() - _ta) * 1e-3;
+        }
+        ane_matmul(Q_DIM, DIM, S, ac->attn, w->Wo, o);
+        { float ra = res_alpha; float *x2 = ac->x2, *xx = x, *oo = o; long N = (long)DIM*S;
+          chess_parallel_for(N, ^(long lo, long hi){ for (long i = lo; i < hi; i++) x2[i] = xx[i] + ra*oo[i]; }); }
+        { uint64_t _t = g_trunk_prof ? mach_absolute_time() : 0;
+          chess_rmsnorm_par(ac->x2norm, ac->x2, w->rms_ffn, DIM, S);
+          if (g_trunk_prof) g_trunk_rms_s += tb_ms(mach_absolute_time() - _t) * 1e-3; }
+        // Fused W1/W3 vs separate: ADAPTIVE (same dispatch-bound vs compute-bound crossover
+        // as QKV above, S <= 12288). Both paths write the SAME ac->h13 buffer. [iter 6]
+        if (S <= 12288) {
+            ane_matmul(DIM, 2*HIDDEN, S, ac->x2norm, w->W13, ac->h1);
+        } else {
+            ane_matmul(DIM, HIDDEN, S, ac->x2norm, w->W1, ac->h1);
+            ane_matmul(DIM, HIDDEN, S, ac->x2norm, w->W3, ac->h3);
+        }
+        { float *h1 = ac->h1, *h3 = ac->h3, *gate = ac->gate; long N = (long)HIDDEN*S;
+          uint64_t _t = g_trunk_prof ? mach_absolute_time() : 0;
+          chess_parallel_for(N, ^(long lo, long hi){
+            for (long i = lo; i < hi; i++) { float sig = 1.0f/(1.0f+expf(-h1[i])); gate[i] = (h1[i]*sig)*h3[i]; }
+          });
+          if (g_trunk_prof) g_trunk_silu_s += tb_ms(mach_absolute_time() - _t) * 1e-3; }
         ane_matmul(HIDDEN, DIM, S, ac->gate, w->W2, ffn);
-        for (int i = 0; i < DIM*S; i++) x[i] = ac->x2[i] + res_alpha*ffn[i];
+        { float ra = res_alpha; float *xx = x, *x2 = ac->x2, *ff = ffn; long N = (long)DIM*S;
+          chess_parallel_for(N, ^(long lo, long hi){ for (long i = lo; i < hi; i++) xx[i] = x2[i] + ra*ff[i]; }); }
     }
-    memcpy(x_pre_final, x, (size_t)DIM*S*4);
-    rmsnorm(x_final, x, rms_final, DIM, S);
+    if (save_acts) memcpy(x_pre_final, x, (size_t)DIM*S*4);   // only the backward reads x_pre_final [iter 7]
+    { uint64_t _t = g_trunk_prof ? mach_absolute_time() : 0;
+      chess_rmsnorm_par(x_final, x, rms_final, DIM, S);
+      if (g_trunk_prof) g_trunk_rms_s += tb_ms(mach_absolute_time() - _t) * 1e-3; }
     free(x); free(o); free(ffn);
 }
 
@@ -286,12 +442,19 @@ static void chess_trunk_backward(CLayer *W, CLayer *G, CActs *acts, const float 
 // Batched embedding + 2D posenc input builder, and its backward (channel stride B*SEQ).
 // For B=1 these match embed_lookup + chess_posenc_forward / their backward.
 // tokens is B*SEQ uint16 (position b at [b*SEQ, (b+1)*SEQ)).
+//
+// FORWARD is parallelized over B (each b writes disjoint x_in columns, reads read-only
+// embeddings) => bit-identical, checksum preserved. BACKWARD stays serial: it accumulates
+// into shared d_tok/d_rank/d_file/d_misc (many positions share a token), so racing those
+// across cores would need atomics. Backward is learner-only, not the bench hot path. [iter 3]
 // ============================================================================
 static void chess_embed_posenc_batched(float *x_in, int B, const uint16_t *tokens,
                                        const float *tok_emb, const float *rank_emb,
                                        const float *file_emb, const float *misc_emb) {
     int S = B*SEQ;
-    for (int b = 0; b < B; b++) {
+    dispatch_queue_t dq = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_apply(B, dq, ^(size_t bb) {
+        int b = (int)bb;
         const uint16_t *tk = tokens + b*SEQ;
         for (int t = 0; t < SEQ; t++) {
             int tok = tk[t], col = b*SEQ + t;
@@ -301,7 +464,7 @@ static void chess_embed_posenc_batched(float *x_in, int B, const uint16_t *token
             else { int mi = t - NBOARD;
                 for (int d = 0; d < DIM; d++) x_in[d*S+col] += misc_emb[mi*DIM+d]; }
         }
-    }
+    });
 }
 static void chess_embed_posenc_backward_batched(const float *dx, int B, float *d_tok,
                                                 float *d_rank, float *d_file, float *d_misc,
@@ -387,6 +550,38 @@ static void chess_net_alloc(ChessNet *n, int zero) {
     n->misc_emb  = zero?fcalloc((size_t)NMISC*DIM):fmalloc((size_t)NMISC*DIM);
     n->W_pol     = zero?fcalloc((size_t)DIM*PLANES):fmalloc((size_t)DIM*PLANES);
     n->W_val     = zero?fcalloc((size_t)DIM*NWDL):fmalloc((size_t)DIM*NWDL);
+}
+
+// Build the FUSED forward-only weights from the canonical ones: Wqkv[DIM, Q_DIM+2*KV_DIM] =
+// [Wq | Wk | Wv] concatenated along the output-channel axis; W13[DIM, 2*HIDDEN] = [W1 | W3].
+// The fused matmul produces [Q; K; V] (resp. [h1; h3]) in ONE ANE eval, so Q/K/V (h1/h3) are
+// contiguous row-slices of the output -- exactly how CActs.qkv (h13) is laid out. Call once
+// after init/load (bench) and after every optimizer step (training); free with _free_fused.
+// Forward-only: the canonical weights remain the checkpoint/optimizer/backward source of
+// truth. [iter 6]
+static void chess_layer_build_fused(CLayer *w) {
+    int qkv_oc = Q_DIM + 2*KV_DIM;
+    if (!w->Wqkv) w->Wqkv = fmalloc((size_t)DIM*qkv_oc);
+    for (int i = 0; i < DIM; i++) {
+        memcpy(w->Wqkv + (size_t)i*qkv_oc,                 w->Wq + (size_t)i*Q_DIM,    (size_t)Q_DIM*4);
+        memcpy(w->Wqkv + (size_t)i*qkv_oc + Q_DIM,         w->Wk + (size_t)i*KV_DIM,   (size_t)KV_DIM*4);
+        memcpy(w->Wqkv + (size_t)i*qkv_oc + Q_DIM+KV_DIM,  w->Wv + (size_t)i*KV_DIM,   (size_t)KV_DIM*4);
+    }
+    int w13_oc = 2*HIDDEN;
+    if (!w->W13) w->W13 = fmalloc((size_t)DIM*w13_oc);
+    for (int i = 0; i < DIM; i++) {
+        memcpy(w->W13 + (size_t)i*w13_oc,           w->W1 + (size_t)i*HIDDEN, (size_t)HIDDEN*4);
+        memcpy(w->W13 + (size_t)i*w13_oc + HIDDEN,  w->W3 + (size_t)i*HIDDEN, (size_t)HIDDEN*4);
+    }
+}
+static void chess_net_build_fused(ChessNet *n) {
+    for (int L = 0; L < NLAYERS; L++) chess_layer_build_fused(&n->W[L]);
+}
+static void chess_net_free_fused(ChessNet *n) {
+    for (int L = 0; L < NLAYERS; L++) {
+        if (n->W[L].Wqkv) { free(n->W[L].Wqkv); n->W[L].Wqkv = NULL; }
+        if (n->W[L].W13)  { free(n->W[L].W13);  n->W[L].W13  = NULL; }
+    }
 }
 
 // Random init — mirrors train_chess.m's G0 init EXACTLY (same scales + drand48 order) so

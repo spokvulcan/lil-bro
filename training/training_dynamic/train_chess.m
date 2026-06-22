@@ -95,6 +95,10 @@ int main(int argc, char *argv[]) {
         reg(rank_emb,g_rank,8*DIM); reg(file_emb,g_file,8*DIM); reg(misc_emb,g_misc,NMISC*DIM);
         reg(W_pol,g_pol,DIM*PLANES); reg(W_val,g_val,DIM*NWDL);
 
+        // Build the fused forward-only weights (QKV, W1/W3) before any forward; rebuilt after
+        // every optimizer step below. [iter 6]
+        for (int L=0;L<NLAYERS;L++) chess_layer_build_fused(&W[L]);
+
         // ============================================================
         // Build the fixed G0 batch from the engine (ONE position).
         // ============================================================
@@ -216,6 +220,7 @@ int main(int argc, char *argv[]) {
             // optimizer: unscale (1/loss_scale), global-clip, AdamW
             adam_t++;
             optimizer_step(1.0f/loss_scale, grad_clip, adam_t, lr, wd);
+            for (int L=0;L<NLAYERS;L++) chess_layer_build_fused(&W[L]);   // keep fused fwd weights in sync [iter 6]
 
             if (step % 50 == 0 || step == steps-1) {
                 if (l2 > 0) printf("   step %-4d  loss_pol=%.5f  loss_val=%.5f  l2=%.5f\n", step, lp, lv, l2pen);

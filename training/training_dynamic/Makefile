@@ -96,7 +96,7 @@ test_selfplay: chess/test_selfplay
 # Full self-play trainer (generation + replay + learner) on the one ANE client.
 # `make selfplay` builds; the run driver (lilbro/chess/) invokes ./train_selfplay --config ...
 train_selfplay: train_selfplay.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h \
-                chess/selfplay.h chess/replay.h chess/mcts.h chess/chess.h models/chess_g0.h \
+                chess/chess_net.h chess/selfplay.h chess/replay.h chess/mcts.h chess/chess.h models/chess_g0.h \
                 chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c
 	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h -o train_selfplay train_selfplay.m \
 		chess/selfplay.c chess/replay.c chess/mcts.c chess/chess.c
