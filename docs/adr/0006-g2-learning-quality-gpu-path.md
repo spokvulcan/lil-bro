@@ -54,18 +54,20 @@ ANE/CPU learner path), V4 architecture fidelity, modern RL, and ambitious scalin
    The logging is path-agnostic and carries to the GPU learner unchanged. Uses the `diagnose`
    skill (reproduce → minimise → hypothesise → instrument → fix → regression-test).
 
-2. **GPU iteration path; ANE retained as non-default.** Port the learner
-   (forward+backward+heads+loss) from cblas-CPU to MPSGraph fp32 GPU. Keep the ANE forward path
-   as a **non-default compile option** — the "ANE can train" thesis (ADR 0001/0004/0005) stays
+2. **GPU iteration path; ANE retained as non-default.** Port the learner trunk
+   forward+backward from cblas-CPU to MPSGraph fp32 GPU, while keeping the chess-specific
+   heads, losses, embeddings, and optimizer on the CPU floor. Keep the ANE forward path as a
+   **non-default compile option** — the "ANE can train" thesis (ADR 0001/0004/0005) stays
    documented and buildable. The GPU port **subsumes the NaN fix by construction** (fp32 rsqrt,
    Apple-tested kernels) — the CPU `rmsnorm_bwd` `vvrsqrtf` overflow is left behind on the
    legacy cblas path. This recasts QK-norm + SwiGLU clamp as **V4-fidelity ablations on a
    stable base**, not bug-fixes. Consistent with today's architecture: the learner already
    bypasses the ANE under `--mps-graph` (`train_selfplay.m:404`).
 
-3. **Hybrid-autodiff GPU backward.** MPSGraph `gradientWithSourceTensor` for the standard trunk
-   (rmsnorm + matmul + scaled masked-softmax + SwiGLU — all standard ops); hand-written for the
-   chess-specific heads (legal-mask policy softmax, WDL value). The repo has **zero prior
+3. **Hybrid-autodiff GPU backward.** MPSGraph `gradientForPrimaryTensor:withTensors:` for the
+   standard trunk (rmsnorm + matmul + scaled masked-softmax + SwiGLU — all standard ops);
+   hand-written CPU code for the chess-specific heads (legal-mask policy softmax, WDL value).
+   The repo has **zero prior
    MPSGraph autodiff usage** (every graph is hand-written forward), so **build-step 0 is a 1-day
    autodiff spike** confirming the API handles the trunk op mix in fp32, grad-diff'd against the
    CPU `chess_trunk_backward` reference (the `train_chess.m:163-164` pattern) to fp32 cosine,
@@ -113,12 +115,12 @@ ANE/CPU learner path), V4 architecture fidelity, modern RL, and ambitious scalin
 ## Build order (probe-gated; step 0 is the autodiff spike)
 
 0. **Autodiff spike** *(first; gates the GPU backward method)* — MPSGraph
-   `gradientWithSourceTensor` on the trunk op mix in fp32; grad-diff vs CPU
+   `gradientForPrimaryTensor:withTensors:` on the trunk op mix in fp32; grad-diff vs CPU
    `chess_trunk_backward`; G0 overfit. Fallback: hand-written trunk backward.
 1. **Diagnosis pass** (decision 1) — 5 instruments on the current cblas learner; reads H1–H4.
    **Runs in parallel with step 0** (independent; the logging carries to the GPU learner).
-2. **GPU learner forward+backward+heads+loss** (decisions 2–3) — MPSGraph fp32 end-to-end;
-   **G0-green** on GPU.
+2. **GPU learner trunk forward+backward** (decisions 2–3) — MPSGraph fp32 trunk with CPU
+   heads/loss/embed/optimizer; **G0-green** on GPU.
 3. **G2 on GPU** — re-run 30-iter + 200-eval with the GPU learner + diagnosis logging. If green
    → the NaN was the blocker; proceed to V4 ablations. If not → the diagnosis tells us which of
    H2/H3/H4 remains.

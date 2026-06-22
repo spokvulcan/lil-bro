@@ -9,7 +9,7 @@
 // Mirrors test_heads_cpu.c's CHK pattern: run the analytic backward, central-
 // difference every input through the forward, assert max disagreement is tiny.
 //
-// Build: make test_attn   (see Makefile target; mirrors probe_autodiff's build).
+// Build: make test_trunk_attn   (see Makefile target; mirrors probe_autodiff's build).
 
 #include "mil_dynamic.h"
 #include "cpu_ops.h"
