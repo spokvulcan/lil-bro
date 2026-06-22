@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 // ============================================================================
 // Config
@@ -64,6 +65,11 @@ SPConfig sp_parse(int argc, char **argv, int *mode) {
     }
     if (c.B > 160) c.B = 160;   // round32(B)*96 must stay <= 16384; max packed B is 160
     if (c.bench_games < 1) c.bench_games = 1;
+    if (c.td_lambda < 0.0f || c.td_lambda > 1.0f) {
+        float raw = c.td_lambda;
+        c.td_lambda = raw < 0.0f ? 0.0f : 1.0f;
+        fprintf(stderr, "[config] --td-lambda %g out of [0,1]; clamped to %g\n", (double)raw, (double)c.td_lambda);
+    }
     return c;
 }
 
@@ -185,10 +191,12 @@ static uint64_t hash_sample(uint64_t h, const ReplaySample *s) {
     return hash_mix64(h, zb2);
 }
 
-void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
-                         const SPConfig *cfg, uint64_t base_seed, GenStats *st) {
+void play_selfplay_batch(const BatchedChessEvaluator *bev, const BatchedChessEvaluator *label_bev,
+                         ReplayBuffer *rb, const SPConfig *cfg, uint64_t base_seed, GenStats *st) {
     int B = cfg->B;
     Game *g = (Game*)calloc(B, sizeof(Game));
+    float *label_pri = label_bev ? (float*)malloc((size_t)B * MAX_MOVES * sizeof(float)) : NULL;
+    float *label_v_buf = label_bev ? (float*)malloc((size_t)B * sizeof(float)) : NULL;
     for (int b = 0; b < B; b++) {
         chess_startpos(&g[b].cur);
         g[b].plies = (ReplaySample*)malloc((size_t)cfg->max_plies * sizeof(ReplaySample));
@@ -235,13 +243,21 @@ void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
                 st->nodes += res[k].nodes_used;
             }
         }
+        if (label_bev) {
+            const Position *lpos[na]; const Move *lleg[na]; int lnleg[na]; float *lpri[na];
+            for (int k = 0; k < na; k++) {
+                lpos[k] = &roots[k]; lleg[k] = res[k].legal; lnleg[k] = res[k].n_legal;
+                lpri[k] = &label_pri[(size_t)k * MAX_MOVES];
+            }
+            label_bev->evaluate(label_bev->ctx, lpos, na, lleg, lnleg, lpri, label_v_buf);
+        }
         for (int k = 0; k < na; k++) {
             int b = active[k];
             // record the searched position as a training sample (z filled at game end)
             ReplaySample *smp = &g[b].plies[g[b].n_plies];
             build_sample(smp, &g[b].cur, &res[k], cfg, dense);
             g[b].side[g[b].n_plies] = g[b].cur.side;
-            g[b].leaf_v[g[b].n_plies] = res[k].root_value;
+            g[b].leaf_v[g[b].n_plies] = label_bev ? label_v_buf[k] : res[k].root_value;
             g[b].n_plies++;
             // select + apply a move. Search is never run on a terminal node (the seam
             // contract guarantees n_legal>=1), so select_move returns a real move; guard
@@ -287,6 +303,7 @@ void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
         free(g[b].plies); free(g[b].side); free(g[b].leaf_v);
     }
     free(g); free(dense); free(roots); free(cfgs); free(active); free(res);
+    free(label_pri); free(label_v_buf);
 }
 
 // ============================================================================

@@ -100,7 +100,7 @@ static void test_select_move(void) {
 static int run_generation(ReplayBuffer *rb, const SPConfig *cfg, uint64_t seed, GenStats *gs) {
     BatchedChessEvaluator bev = chess_oracle_batched_evaluator();
     *gs = (GenStats){0};
-    play_selfplay_batch(&bev, rb, cfg, seed, gs);
+    play_selfplay_batch(&bev, NULL, rb, cfg, seed, gs);
     return rb->count;
 }
 static void test_generation(void) {
@@ -264,6 +264,57 @@ static void test_nstep_relabel_integration(void) {
     replay_free(&rb2);
 }
 
+// A batched evaluator stub returning a fixed value + uniform priors (a label-value source
+// distinct from any search evaluator, to prove leaf_v is sourced from label_bev).
+static void const_eval(void *ctx, const Position *const *pos, int B,
+                       const Move *const *legal, const int *n_legal,
+                       float *const *priors, float *value) {
+    (void)pos; (void)legal;
+    float v = *(const float*)ctx;
+    for (int b = 0; b < B; b++) {
+        value[b] = v;
+        float p = n_legal[b] > 0 ? 1.0f / (float)n_legal[b] : 0.0f;
+        for (int i = 0; i < n_legal[b]; i++) priors[b][i] = p;
+    }
+}
+static BatchedChessEvaluator make_const_evaluator(float v) {
+    BatchedChessEvaluator out;
+    float *ctx = (float*)malloc(sizeof(float)); *ctx = v;
+    out.ctx = ctx; out.evaluate = const_eval;
+    return out;
+}
+
+// ---- 5d. n-step label separation: leaf_v from label_bev, not the (warmup) search evaluator -
+// The warmup wrapper blends the search value with a material heuristic; the TD label must use
+// the net's OWN value (label_bev), never the warmup-blended search value (the "search prior,
+// not labels" contract, selfplay.h). Fixed search bev (a warmup wrapper) + same seed =>
+// identical games; varying label_bev must change z_nstep at lam<1 (proves leaf_v is sourced
+// from label_bev). On the bug (leaf_v = root_value from the warmup search), z_nstep would be
+// identical across the two label_bev.
+static void test_nstep_label_separation(void) {
+    printf("## n-step label separation: leaf_v from label_bev, not the warmup search evaluator\n");
+    SPConfig cfg = sp_defaults();
+    cfg.td_lambda = 0.5f;
+    cfg.B = 1; cfg.sims = 16; cfg.considered = 16; cfg.max_plies = 40; cfg.replay_cap = 100000;
+    cfg.adjudicate = 1;
+    BatchedChessEvaluator inner = chess_oracle_batched_evaluator();
+    BatchedChessEvaluator warm = make_warmup_evaluator(&inner, 1.0f);
+    BatchedChessEvaluator labA = make_const_evaluator(0.3f);
+    BatchedChessEvaluator labB = make_const_evaluator(-0.3f);
+    ReplayBuffer ra; replay_init(&ra, cfg.replay_cap, 71);
+    GenStats ga; play_selfplay_batch(&warm, &labA, &ra, &cfg, 111, &ga);
+    ReplayBuffer rb; replay_init(&rb, cfg.replay_cap, 71);
+    GenStats gb; play_selfplay_batch(&warm, &labB, &rb, &cfg, 111, &gb);
+    int n = ra.count, differ = 0;
+    CHECK(rb.count == n, "n-step label-sep: game lengths differ across label_bev (%d vs %d)", n, rb.count);
+    for (int i = 0; i < n; i++)
+        if (fabsf(ra.buf[i].z_nstep - rb.buf[i].z_nstep) > 1e-5f) differ++;
+    CHECK(differ > 0, "n-step label-sep: z_nstep identical across label_bev -- leaf_v not sourced from label_bev");
+    printf("   warm search + 2 label_bev: %d samples, %d z_nstep differ (leaf_v = label_bev, not search)\n\n", n, differ);
+    replay_free(&ra); replay_free(&rb);
+    warmup_evaluator_free(&warm); free(labA.ctx); free(labB.ctx);
+}
+
 // ---- 6. eval ladder: W/D/L bookkeeping + a material+mate searcher beats a random-mover ---
 static void test_eval(void) {
     printf("## eval ladder: W/D/L sums to n_games; deterministic; oracle-search beats random\n");
@@ -365,6 +416,7 @@ int main(void) {
     test_z_labeling();
     test_nstep_relabel_math();
     test_nstep_relabel_integration();
+    test_nstep_label_separation();
     test_eval();
     test_warmup_value_prior();
     if (g_fail) { printf("*** test_selfplay: FAILURES ***\n"); return 1; }

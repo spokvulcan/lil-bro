@@ -110,8 +110,8 @@ void relabel_value_targets(ReplaySample *plies, const float *leaf_v, int n_plies
 // GENERATION: play cfg->B self-play games in lockstep (one mcts_search_batched per ply, so
 // all games' leaf evals batch into one bev->evaluate), recording every searched position as
 // a replay sample with the game-outcome z. Deterministic from base_seed + cfg. st may be NULL.
-void play_selfplay_batch(const BatchedChessEvaluator *bev, ReplayBuffer *rb,
-                         const SPConfig *cfg, uint64_t base_seed, GenStats *st);
+void play_selfplay_batch(const BatchedChessEvaluator *bev, const BatchedChessEvaluator *label_bev,
+                         ReplayBuffer *rb, const SPConfig *cfg, uint64_t base_seed, GenStats *st);
 
 // EVAL: play n_games net-vs-opponent games in lockstep, the net alternating colors, the
 // net's to-move searches batched. Returns the net's score (W + 0.5 D)/n_games and the raw
