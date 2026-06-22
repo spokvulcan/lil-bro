@@ -34,6 +34,19 @@ probe_mps_graph: probe_mps_graph.m
 	$(CC) $(CFLAGS) -framework Metal -framework MetalPerformanceShaders \
 	  -framework MetalPerformanceShadersGraph -o probe_mps_graph probe_mps_graph.m
 
+# Slice 0 autodiff spike (ADR 0006 build-step 0, issue #23): standalone probe that
+# builds the chess trunk as ONE MPSGraph + a scalar source and obtains the backward
+# via MPSGraph gradientForPrimaryTensor:withTensors:, then (a) grad-diffs the result
+# vs the CPU chess_trunk_backward to fp32 cosine and (b) runs a G0 overfit using the
+# autodiff trunk backward + the existing CPU heads/loss/optimizer. Gates the GPU
+# backward method (hybrid autodiff vs hand-written). Reuses the chess trunk/heads/net
+# headers, so it links the chess deps + Metal/MPS/MPSGraph like train_chess.
+probe_autodiff: probe_autodiff.m config.h io.h cpu_ops.h mil_dynamic.h chess/chess_heads.h \
+                chess/chess_net.h chess/chess.h models/chess_g0.h $(CHESS_DEPS)
+	$(CC) $(CFLAGS) $(EXTRA) -include models/chess_g0.h \
+		-framework Metal -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
+		-o probe_autodiff probe_autodiff.m chess/chess.c
+
 # Chess bitboard engine (build-step 1, ADR 0005, issue #15). Pure C, ZERO deps:
 # no model header, no ANE/Foundation/Accelerate frameworks. perft is the gate.
 CHESS_CFLAGS = -O2 -Wall -Wextra -std=c11 -isysroot $(shell xcrun --show-sdk-path)
@@ -128,7 +141,7 @@ g2: train_selfplay
 	./train_selfplay --g2 $(G2ARGS)
 
 clean:
-	rm -f train probe_chess probe_mps probe_mps_graph train_chess train_selfplay \
+	rm -f train probe_chess probe_mps probe_mps_graph probe_autodiff train_chess train_selfplay \
 	      chess/perft chess/test_chess chess/test_heads chess/test_mcts chess/test_replay chess/test_selfplay
 
 FORCE:
