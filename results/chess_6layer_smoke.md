@@ -2,7 +2,8 @@
 
 **Date:** 2026-06-22; **Machine:** Apple **M3 Max**; **Base commit:** `f4847f4`;
 **Path:** `--mps-graph` GPU learner (MPSGraph fp32 hybrid-autodiff trunk backward);
-**Status:** **G0 green, selfcheck green, 30-iter G2 numerically stable but G2 still red.**
+**Status:** **G0 green, selfcheck green, 30-iter G2 numerically stable; formal 200-game read
+confirms G2 still red.**
 
 This was a pre-#31 capacity/stability smoke, not a formal #31 closure read. #29/#30 remain formal
 G2-green ablations unless that scope is explicitly changed.
@@ -116,15 +117,64 @@ nonzero-NaN grad lines: 0
 per-line count: nan=0/3976960
 ```
 
+## Formal 200-game read
+
+After the cheap stability smoke completed, the same training shape was rerun with only eval volume
+and cadence changed. Source state for this rerun: `a9f3529` (committed 6-layer config plus MPS cache
+capacity fix).
+
+```bash
+cd /Users/owl/projects/lil-bro/training/training_dynamic
+make g2 G2ARGS='--B 64 --sims 16 --considered 16 \
+  --dir-alpha 0.3 --dir-frac 0.25 --temp 1.0 --temp-moves 8 --max-plies 20 \
+  --replay 80000 --lbatch 96 --lsteps 60 --iters 30 \
+  --opt muon --lr 0.005 --loss-scale 256.0 --clip 1.0 --wd 0.0 --vw 1.5 \
+  --td-lambda 0.5 --eval-games 200 --eval-every 5 --eval-sims 8 \
+  --eval-considered 8 --eval-max-plies 50 --bench-games 320 --seed 42 \
+  --ckpt /tmp/lilbro_6l_nstep_muon_g2.ckpt --curriculum --curriculum-plies 8 \
+  --adjudicate --mps-graph'
+```
+
+`make g2` again exited nonzero because the measured G2 thresholds were not met. The binary completed
+and printed a measured verdict.
+
+| iter | loss_pol | loss_val | vs random | vs greedy |
+|---:|---:|---:|---:|---:|
+| 0  | 0.0000 | 0.0000 | 0.537 | 0.325 |
+| 5  | 2.0305 | 0.2161 | 0.660 | 0.425 |
+| 10 | 2.1475 | 0.2723 | 0.680 | 0.458 |
+| 15 | 1.9683 | 0.2552 | 0.672 | 0.455 |
+| 20 | 1.9310 | 0.2451 | 0.647 | 0.460 |
+| 25 | 2.0612 | 0.3098 | 0.650 | 0.465 |
+| 30 | 2.1455 | 0.2411 | 0.630 | 0.448 |
+
+Verdict:
+
+```text
+vs random : start 0.537 -> end 0.630  (max 0.680)  climb=NO beats-random[>=0.85]=NO
+vs greedy : start 0.325 -> end 0.448  (max 0.465)  climb=yes beats-greedy[>0.50]=NO
+=> G2 NOT YET
+checkpoint: /tmp/lilbro_6l_nstep_muon_g2.ckpt
+```
+
+Gradient diagnostics:
+
+```text
+1800/1800 grad lines finite
+nonzero-NaN grad lines: 0
+per-line count: nan=0/3976960
+```
+
 ## Read
 
 - **Capacity/stability:** 6 layers are stable on the GPU learner for this 30-iter smoke after removing
-  the fixed MPS buffer-cache capacity limit. G0 is green, selfcheck is green, the run crosses the
-  warmup boundary at iter 20, and all 1800 learner steps have finite gradients.
-- **Learning quality:** the cheap eval curve climbs against both fixed opponents, but it does not meet
-  the G2 thresholds and should not be reported as G2-green.
-- **#31:** this supports spending a formal 200-game eval read if the next question is purely
-  "6-layer depth stability/curve at lower noise." It does **not** close #31 or remove the #29/#30
-  blocker semantics by itself.
-- **#35:** no NaN, divergence, or post-warmup instability was observed, so this smoke does not trigger
-  the mHC fallback on stability grounds.
+  the fixed MPS buffer-cache capacity limit. G0 is green, selfcheck is green, both G2 runs cross the
+  warmup boundary at iter 20, and both have all 1800 learner steps finite.
+- **Learning quality:** the 200-game read confirms the cheap smoke's direction only partially:
+  vs-random improves early but ends at 0.630 and is not counted as a climb by the binary; vs-greedy
+  climbs from 0.325 to 0.448, but stays below the `>0.50` gate. This should not be reported as
+  G2-green.
+- **#31:** 6-layer depth is stable enough to keep as a capacity result, but it does not close #31 or
+  remove the #29/#30 blocker semantics by itself.
+- **#35:** no NaN, divergence, or post-warmup instability was observed in either run, so this does not
+  trigger the mHC fallback on stability grounds.
